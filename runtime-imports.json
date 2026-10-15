@@ -1,0 +1,190 @@
+{
+  "schemaVersion": 1,
+  "scope": "Direct and delay-loaded PE imports of this optimized Windows x64 Release; dynamically loaded drivers and WIC codecs are not exhaustively enumerated.",
+  "uiLanguage": "zh-CN",
+  "checkedUtc": "2026-10-15T18:46:28.111808+00:00",
+  "executable": {
+    "path": "D:\\Desktop\\CompositorWin\\build\\rust\\release\\compositor.exe",
+    "length": 49099776,
+    "modifiedUtc": "2026-10-15T18:43:16.487646+00:00",
+    "sha256": "7a897f16c5a458da6cde6d2d6acb5d46927e7565bfc188b330c73424a2436a69"
+  },
+  "auditTool": {
+    "path": "D:\\DevTools\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\dumpbin.exe",
+    "bytes": 23376,
+    "sha256": "cfee7ed764b7b0866aae0be12f9c0ad2a7f5aecc4046ba2b7de26335827ca815",
+    "modifiedUtc": "2026-10-05T09:21:23.441679+00:00",
+    "versionEvidence": "Microsoft (R) COFF/PE Dumper Version 14.44.35229.0"
+  },
+  "manifestTool": {
+    "path": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\mt.exe",
+    "bytes": 1972584,
+    "sha256": "1b8a272d586a9ab53ac2ccd457a88bd0210d7d7ac3daea5b34743cc2afe73b26",
+    "modifiedUtc": "2026-01-26T22:18:44+00:00"
+  },
+  "pe": {
+    "format": "PE32+",
+    "machine": "x64",
+    "subsystem": "Windows GUI",
+    "highEntropyVirtualAddresses": true,
+    "dynamicBase": true,
+    "nxCompatible": true
+  },
+  "directImportDescriptorCount": 19,
+  "directImportDescriptors": [
+    "kernel32.dll",
+    "ntdll.dll",
+    "ole32.dll",
+    "oleaut32.dll",
+    "combase.dll",
+    "bcryptprimitives.dll",
+    "user32.dll",
+    "shell32.dll",
+    "shlwapi.dll",
+    "api-ms-win-core-synch-l1-2-0.dll",
+    "USER32.dll",
+    "KERNEL32.dll",
+    "ADVAPI32.dll",
+    "gdi32.dll",
+    "ws2_32.dll",
+    "opengl32.dll",
+    "imm32.dll",
+    "dwmapi.dll",
+    "uxtheme.dll"
+  ],
+  "delayImportDescriptorCount": 0,
+  "delayImportDescriptors": [],
+  "windows10ImportPolicy": {
+    "target": "Windows 10 22H2 x64 and Windows 11 x64",
+    "parsedNamedImportCount": 301,
+    "symbolEvidence": "dumpbin /IMPORTS hexadecimal hint followed by exact symbol name",
+    "forbiddenWindows11OnlyImports": [
+      "GetCurrentPackageInfo3",
+      "GetCurrentPackagePath2",
+      "GetKnownFolderPathEx",
+      "GetMachineTypeAttributes",
+      "GetWindowBand",
+      "SetWindowBand"
+    ],
+    "forbiddenImportsFound": [],
+    "passed": true
+  },
+  "caseInsensitiveDistinctDllCount": 17,
+  "caseInsensitiveDistinctDlls": [
+    "advapi32.dll",
+    "api-ms-win-core-synch-l1-2-0.dll",
+    "bcryptprimitives.dll",
+    "combase.dll",
+    "dwmapi.dll",
+    "gdi32.dll",
+    "imm32.dll",
+    "kernel32.dll",
+    "ntdll.dll",
+    "ole32.dll",
+    "oleaut32.dll",
+    "opengl32.dll",
+    "shell32.dll",
+    "shlwapi.dll",
+    "user32.dll",
+    "uxtheme.dll",
+    "ws2_32.dll"
+  ],
+  "staticCrtVerified": true,
+  "manifest": {
+    "windows10CompatibilityId": "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}",
+    "perMonitorV2": true,
+    "requestedExecutionLevel": "asInvoker",
+    "sha256": "add70813f8ae75abee452f0dea15ea258c98a755ce29401017d3e8d6f5f1980d"
+  },
+  "requirements": {
+    "targetWindows": "Windows 10/11 x64",
+    "graphics": "A graphics driver supporting Direct3D 12 or Vulkan; backend dependencies can load dynamically.",
+    "cRuntime": "The MSVC and Universal C runtimes are statically linked. No separate Visual C++ Redistributable installation is required.",
+    "runtimePolicy": "Direct and delay-loaded VCRUNTIME, MSVCP, MSVCR, CONCRT, UCRTBASE and api/ext-ms-win-crt DLL imports are rejected.",
+    "heic": "A compatible installed Windows HEIF WIC codec is needed to decode HEIC/HEIF.",
+    "separateOnnxRuntimeDllRequired": false,
+    "hostRuntimeVersionMeaning": "Observed installed host versions only; they are not declared minimum supported versions.",
+    "bundledSystemDlls": false
+  },
+  "buildValidation": "build/validation/github-0.0.1-20261015/unified/build-all-post-package.json",
+  "buildValidationLog": "build/validation/github-0.0.1-20261015/all.log",
+  "buildValidationRecordIdentity": {
+    "path": "D:\\Desktop\\CompositorWin\\build\\validation\\github-0.0.1-20261015\\unified\\build-all-post-package.json",
+    "bytes": 2233,
+    "sha256": "46f52d7cc1f720b92b1384dc8f418e6a668efa51eca537ca3492d56b8a9bf890",
+    "modifiedUtc": "2026-10-15T18:46:16.109529+00:00"
+  },
+  "buildValidationLogIdentity": {
+    "path": "D:\\Desktop\\CompositorWin\\build\\validation\\github-0.0.1-20261015\\all.log",
+    "bytes": 48866,
+    "sha256": "9908790852a017698fb8553c0ff52c4936bed65a9464a7e7ea72afd1da524d9b",
+    "modifiedUtc": "2026-10-15T18:30:01.975751+00:00"
+  },
+  "buildValidationVerification": {
+    "completedVerified": true,
+    "allFiveStepsPassed": true,
+    "recordedCommandsPresentInLog": true,
+    "executableMatchesCurrentValidatedTarget": true,
+    "targetMtimeNoLaterThanValidationEnd": true,
+    "mtimeToleranceSeconds": 1,
+    "validatedTargetExecutable": {
+      "path": "D:\\Desktop\\CompositorWin\\build\\rust\\release\\compositor.exe",
+      "bytes": 49099776,
+      "sha256": "7a897f16c5a458da6cde6d2d6acb5d46927e7565bfc188b330c73424a2436a69",
+      "modifiedUtc": "2026-10-15T18:43:16.487646+00:00"
+    },
+    "validationExecutableHashFields": [],
+    "hashMatchScope": "Selected EXE equals the current targetDirectory/release/compositor.exe by bytes and SHA256; target mtime is no later than validation completion plus one second.",
+    "limitations": [
+      "Legacy All records have no build-time EXE hash or cryptographic link to the text log. Current-target equality and mtime do not retroactively establish build-time hash or source-to-binary provenance."
+    ],
+    "executableAndValidationStableAcrossDumpbin": true
+  },
+  "previousChineseAudit": "runtime-imports.json",
+  "previousChineseAuditIdentity": {
+    "path": "D:\\Desktop\\CompositorWin\\runtime-imports.json",
+    "bytes": 36710,
+    "sha256": "478f24ffcd55c59ad7736886906785c339800639d07a70b8fd2f35584f050e81",
+    "modifiedUtc": "2026-10-15T18:32:09.728309+00:00"
+  },
+  "rawEvidence": {
+    "dependents": "Microsoft (R) COFF/PE Dumper Version 14.44.35229.0\r\nCopyright (C) Microsoft Corporation.  All rights reserved.\r\n\r\n\r\nDump of file D:\\Desktop\\CompositorWin\\build\\rust\\release\\compositor.exe\r\n\r\nFile Type: EXECUTABLE IMAGE\r\n\r\n  Image has the following dependencies:\r\n\r\n    kernel32.dll\r\n    ntdll.dll\r\n    ole32.dll\r\n    oleaut32.dll\r\n    combase.dll\r\n    bcryptprimitives.dll\r\n    user32.dll\r\n    shell32.dll\r\n    shlwapi.dll\r\n    api-ms-win-core-synch-l1-2-0.dll\r\n    USER32.dll\r\n    KERNEL32.dll\r\n    ADVAPI32.dll\r\n    gdi32.dll\r\n    ws2_32.dll\r\n    opengl32.dll\r\n    imm32.dll\r\n    dwmapi.dll\r\n    uxtheme.dll\r\n\r\n  Summary\r\n\r\n        6000 .data\r\n        1000 .fptable\r\n       EE000 .pdata\r\n      BE9000 .rdata\r\n       17000 .reloc\r\n       13000 .rsrc\r\n     21CF000 .text\r\n",
+    "headers": "Microsoft (R) COFF/PE Dumper Version 14.44.35229.0\r\nCopyright (C) Microsoft Corporation.  All rights reserved.\r\n\r\n\r\nDump of file D:\\Desktop\\CompositorWin\\build\\rust\\release\\compositor.exe\r\n\r\nPE signature found\r\n\r\nFile Type: EXECUTABLE IMAGE\r\n\r\nFILE HEADER VALUES\r\n            8664 machine (x64)\r\n               7 number of sections\r\n        6AD11EC4 time date stamp Fri Oct 16 02:43:16 2026\r\n               0 file pointer to symbol table\r\n               0 number of symbols\r\n              F0 size of optional header\r\n              22 characteristics\r\n                   Executable\r\n                   Application can handle large (>2GB) addresses\r\n\r\nOPTIONAL HEADER VALUES\r\n             20B magic # (PE32+)\r\n           14.44 linker version\r\n         21CEE00 size of code\r\n          D05400 size of initialized data\r\n               0 size of uninitialized data\r\n         20AEFB4 entry point (00000001420AEFB4) mainCRTStartup\r\n            1000 base of code\r\n       140000000 image base (0000000140000000 to 0000000142ED7FFF)\r\n            1000 section alignment\r\n             200 file alignment\r\n            6.00 operating system version\r\n            0.00 image version\r\n            6.00 subsystem version\r\n               0 Win32 version\r\n         2ED8000 size of image\r\n             400 size of headers\r\n               0 checksum\r\n               2 subsystem (Windows GUI)\r\n            8160 DLL characteristics\r\n                   High Entropy Virtual Addresses\r\n                   Dynamic base\r\n                   NX compatible\r\n                   Terminal Server Aware\r\n          100000 size of stack reserve\r\n            1000 size of stack commit\r\n          100000 size of heap reserve\r\n            1000 size of heap commit\r\n               0 loader flags\r\n              10 number of directories\r\n               0 [       0] RVA [size] of Export Directory\r\n         2DB68EC [     190] RVA [size] of Import Directory\r\n         2EAE000 [   12AE8] RVA [size] of Resource Directory\r\n         2DBF000 [   EDBB8] RVA [size] of Exception Directory\r\n               0 [       0] RVA [size] of Certificates Directory\r\n         2EC1000 [   169A4] RVA [size] of Base Relocation Directory\r\n         29C8810 [      54] RVA [size] of Debug Directory\r\n               0 [       0] RVA [size] of Architecture Directory\r\n               0 [       0] RVA [size] of Global Pointer Directory\r\n         29C8A00 [      28] RVA [size] of Thread Storage Directory\r\n         29C86D0 [     140] RVA [size] of Load Configuration Directory\r\n               0 [       0] RVA [size] of Bound Import Directory\r\n         21D0000 [     A00] RVA [size] of Import Address Table Directory\r\n               0 [       0] RVA [size] of Delay Import Directory\r\n               0 [       0] RVA [size] of COM Descriptor Directory\r\n               0 [       0] RVA [size] of Reserved Directory\r\n\r\n\r\nSECTION HEADER #1\r\n   .text name\r\n 21CED60 virtual size\r\n    1000 virtual address (0000000140001000 to 00000001421CFD5F)\r\n 21CEE00 size of raw data\r\n     400 file pointer to raw data (00000400 to 021CF1FF)\r\n       0 file pointer to relocation table\r\n       0 file pointer to line numbers\r\n       0 number of relocations\r\n       0 number of line numbers\r\n60000020 flags\r\n         Code\r\n         Execute Read\r\n\r\nSECTION HEADER #2\r\n  .rdata name\r\n  BE8C48 virtual size\r\n 21D0000 virtual address (00000001421D0000 to 0000000142DB8C47)\r\n  BE8E00 size of raw data\r\n 21CF200 file pointer to raw data (021CF200 to 02DB7FFF)\r\n       0 file pointer to relocation table\r\n       0 file pointer to line numbers\r\n       0 number of relocations\r\n       0 number of line numbers\r\n40000040 flags\r\n         Initialized Data\r\n         Read Only\r\n\r\n  Debug Directories\r\n\r\n        Time Type        Size      RVA  Pointer\r\n    -------- ------- -------- -------- --------\r\n    6AD11EC4 cv            27 029C8C90  29C7E90    Format: RSDS, {DC909033-6906-43DC-A57E-C93BE9BF607A}, 1, compositor.pdb\r\n    6AD11EC4 feat          14 029C8CB8  29C7EB8    Counts: Pre-VC++ 11.00=4, C/C++=286, /GS=286, /sdl=0, guardN=286\r\n    6AD11EC4 coffgrp      3F4 029C8CCC  29C7ECC\r\n\r\nSECTION HEADER #3\r\n   .data name\r\n    51E8 virtual size\r\n 2DB9000 virtual address (0000000142DB9000 to 0000000142DBE1E7)\r\n    4000 size of raw data\r\n 2DB8000 file pointer to raw data (02DB8000 to 02DBBFFF)\r\n       0 file pointer to relocation table\r\n       0 file pointer to line numbers\r\n       0 number of relocations\r\n       0 number of line numbers\r\nC0000040 flags\r\n         Initialized Data\r\n         Read Write\r\n\r\nSECTION HEADER #4\r\n  .pdata name\r\n   EDBB8 virtual size\r\n 2DBF000 virtual address (0000000142DBF000 to 0000000142EACBB7)\r\n   EDC00 size of raw data\r\n 2DBC000 file pointer to raw data (02DBC000 to 02EA9BFF)\r\n       0 file pointer to relocation table\r\n       0 file pointer to line numbers\r\n       0 number of relocations\r\n       0 number of line numbers\r\n40000040 flags\r\n         Initialized Data\r\n         Read Only\r\n\r\nSECTION HEADER #5\r\n.fptable name\r\n     100 virtual size\r\n 2EAD000 virtual address (0000000142EAD000 to 0000000142EAD0FF)\r\n     200 size of raw data\r\n 2EA9C00 file pointer to raw data (02EA9C00 to 02EA9DFF)\r\n       0 file pointer to relocation table\r\n       0 file pointer to line numbers\r\n       0 number of relocations\r\n       0 number of line numbers\r\nC0000040 flags\r\n         Initialized Data\r\n         Read Write\r\n\r\nSECTION HEADER #6\r\n   .rsrc name\r\n   12AE8 virtual size\r\n 2EAE000 virtual address (0000000142EAE000 to 0000000142EC0AE7)\r\n   12C00 size of raw data\r\n 2EA9E00 file pointer to raw data (02EA9E00 to 02EBC9FF)\r\n       0 file pointer to relocation table\r\n       0 file pointer to line numbers\r\n       0 number of relocations\r\n       0 number of line numbers\r\n40000040 flags\r\n         Initialized Data\r\n         Read Only\r\n\r\nSECTION HEADER #7\r\n  .reloc name\r\n   169A4 virtual size\r\n 2EC1000 virtual address (0000000142EC1000 to 0000000142ED79A3)\r\n   16A00 size of raw data\r\n 2EBCA00 file pointer to raw data (02EBCA00 to 02ED33FF)\r\n       0 file pointer to relocation table\r\n       0 file pointer to line numbers\r\n       0 number of relocations\r\n       0 number of line numbers\r\n42000040 flags\r\n         Initialized Data\r\n         Discardable\r\n         Read Only\r\n\r\n  Summary\r\n\r\n        6000 .data\r\n        1000 .fptable\r\n       EE000 .pdata\r\n      BE9000 .rdata\r\n       17000 .reloc\r\n       13000 .rsrc\r\n     21CF000 .text\r\n",
+    "imports": "Microsoft (R) COFF/PE Dumper Version 14.44.35229.0\r\nCopyright (C) Microsoft Corporation.  All rights reserved.\r\n\r\n\r\nDump of file D:\\Desktop\\CompositorWin\\build\\rust\\release\\compositor.exe\r\n\r\nFile Type: EXECUTABLE IMAGE\r\n\r\n  Section contains the following imports:\r\n\r\n    kernel32.dll\r\n             1421D04C8 Import Address Table\r\n             142DB7010 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 GetFileType\r\n                           0 GetFullPathNameW\r\n                           0 LoadLibraryExA\r\n                           0 EncodePointer\r\n                           0 SetLastError\r\n                           0 SetFileTime\r\n                           0 GetProcessHeap\r\n                           0 DuplicateHandle\r\n                           0 GetFileInformationByHandle\r\n                           0 HeapFree\r\n                           0 GetModuleHandleExW\r\n                           0 GetWindowsDirectoryW\r\n                           0 GetSystemDirectoryW\r\n                           0 ReadConsoleW\r\n                           0 WriteConsoleW\r\n                           0 GetConsoleOutputCP\r\n                           0 GetConsoleMode\r\n                           0 GetStdHandle\r\n                           0 HeapAlloc\r\n                           0 FreeLibrary\r\n                           0 GetFileAttributesW\r\n                           0 GetSystemInfo\r\n                           0 DeleteFileW\r\n                           0 GetFinalPathNameByHandleW\r\n                           0 SetThreadErrorMode\r\n                           0 LoadLibraryExW\r\n                           0 GetLastError\r\n                           0 SetStdHandle\r\n                           0 GetProcAddress\r\n                           0 GlobalFree\r\n                           0 GetModuleFileNameW\r\n                           0 CopyFileExW\r\n                           0 MoveFileExW\r\n                           0 FlushFileBuffers\r\n                           0 SetFileInformationByHandle\r\n                           0 GetFileInformationByHandleEx\r\n                           0 SetFilePointerEx\r\n                           0 SetHandleInformation\r\n                           0 FindClose\r\n                           0 FindNextFileW\r\n                           0 GetSystemTimeAsFileTime\r\n                           0 FormatMessageW\r\n                           0 Sleep\r\n                           0 FindFirstFileExW\r\n                           0 GetModuleHandleA\r\n                           0 AttachConsole\r\n                           0 GlobalMemoryStatusEx\r\n                           0 CloseHandle\r\n                           0 GetSystemTimePreciseAsFileTime\r\n\r\n    ntdll.dll\r\n             1421D0658 Import Address Table\r\n             142DB71A0 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 RtlNtStatusToDosError\r\n                          79 NtReadFile\r\n                          43 NtOpenFile\r\n                         12C NtCreateNamedPipeFile\r\n                          A0 NtWriteFile\r\n\r\n    ole32.dll\r\n             1421D0688 Import Address Table\r\n             142DB71D0 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 CoCreateInstance\r\n                          F4 OleInitialize\r\n                           0 CoUninitialize\r\n                           0 CoInitializeEx\r\n                         114 RevokeDragDrop\r\n                         112 RegisterDragDrop\r\n                           0 PropVariantClear\r\n\r\n    oleaut32.dll\r\n             1421D06C8 Import Address Table\r\n             142DB7210 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 SysFreeString\r\n                           0 SysStringLen\r\n                           0 GetErrorInfo\r\n\r\n    combase.dll\r\n             1421D0428 Import Address Table\r\n             142DB6F70 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 CoTaskMemFree\r\n\r\n    bcryptprimitives.dll\r\n             1421D0418 Import Address Table\r\n             142DB6F60 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 ProcessPrng\r\n\r\n    user32.dll\r\n             1421D0760 Import Address Table\r\n             142DB72A8 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 GetWindowPlacement\r\n                           0 SetWindowDisplayAffinity\r\n                           0 SetWindowPlacement\r\n                           0 GetForegroundWindow\r\n                           0 MapVirtualKeyW\r\n                           0 SetWindowTextW\r\n                           0 SetCursorPos\r\n                           0 SendInput\r\n                           0 GetWindowTextW\r\n                           0 SetForegroundWindow\r\n                           0 GetWindowTextLengthW\r\n                           0 LoadCursorW\r\n                           0 SetCursor\r\n                           0 GetClassNameW\r\n                           0 DestroyIcon\r\n                           0 CreateIcon\r\n                           0 SetWindowPos\r\n                           0 CreateIconFromResourceEx\r\n                           0 DefWindowProcW\r\n                           0 SendMessageW\r\n                           0 GetSystemMetrics\r\n                           0 RegisterWindowMessageA\r\n                           0 GetActiveWindow\r\n                           0 SystemParametersInfoA\r\n                           0 ShowWindow\r\n                           0 GetSystemMenu\r\n                           0 EnableMenuItem\r\n                           0 PostMessageW\r\n                           0 SetWindowLongW\r\n                           0 DestroyCursor\r\n                           0 GetCursorPos\r\n                           0 SystemParametersInfoW\r\n                           0 ReleaseCapture\r\n                           0 GetKeyboardState\r\n                           0 GetAsyncKeyState\r\n                           0 GetWindowRect\r\n                           0 GetKeyState\r\n                           0 IsProcessDPIAware\r\n                           0 MapVirtualKeyExW\r\n                           0 GetKeyboardLayout\r\n                           0 FlashWindowEx\r\n                           0 GetClientRect\r\n                           0 GetRawInputData\r\n                           0 MsgWaitForMultipleObjectsEx\r\n                           0 CreateWindowExW\r\n                           0 SetWindowLongPtrW\r\n                           0 ToUnicodeEx\r\n                           0 AdjustWindowRectEx\r\n                           0 GetWindowLongW\r\n                           0 RegisterRawInputDevices\r\n                           0 GetWindowLongPtrW\r\n                           0 PeekMessageW\r\n                           0 TranslateMessage\r\n                           0 DispatchMessageW\r\n                           0 DestroyWindow\r\n                           0 ShowCursor\r\n                           0 ClipCursor\r\n                           0 GetClipCursor\r\n                           0 TrackMouseEvent\r\n                           0 SetCapture\r\n                           0 IsIconic\r\n                           0 GetMenu\r\n\r\n    shell32.dll\r\n             1421D0728 Import Address Table\r\n             142DB7270 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 SHCreateItemFromParsingName\r\n                           0 DragFinish\r\n                           0 DragQueryFileW\r\n                           0 SHGetKnownFolderPath\r\n\r\n    shlwapi.dll\r\n             1421D0750 Import Address Table\r\n             142DB7298 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 AssocQueryStringW\r\n\r\n    api-ms-win-core-synch-l1-2-0.dll\r\n             1421D03F8 Import Address Table\r\n             142DB6F40 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                           0 WakeByAddressAll\r\n                           0 WaitOnAddress\r\n                           0 WakeByAddressSingle\r\n\r\n    USER32.dll\r\n             1421D0320 Import Address Table\r\n             142DB6E68 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                         2AA OpenClipboard\r\n                         3F7 ValidateRect\r\n                          53 CloseTouchInputHandle\r\n                         1E0 GetTouchInputInfo\r\n                         29D MonitorFromRect\r\n                         31E ScreenToClient\r\n                         30A RegisterTouchWindow\r\n                         131 GetClassInfoExW\r\n                          29 ChangeDisplaySettingsExW\r\n                         29E MonitorFromWindow\r\n                         231 InvalidateRgn\r\n                         2EA RedrawWindow\r\n                         105 EnumDisplayMonitors\r\n                         195 GetMonitorInfoW\r\n                         29C MonitorFromPoint\r\n                         14B GetDC\r\n                         311 ReleaseDC\r\n                          4E ClientToScreen\r\n                         2EE RegisterClassExW\r\n                         142 GetClipboardSequenceNumber\r\n                         13D GetClipboardData\r\n                         2F1 RegisterClipboardFormatW\r\n                         33A SetClipboardData\r\n                          ED EmptyClipboard\r\n                          50 CloseClipboard\r\n                         23C IsClipboardFormatAvailable\r\n\r\n    KERNEL32.dll\r\n             1421D0030 Import Address Table\r\n             142DB6B78 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                         397 InitializeCriticalSectionEx\r\n                         1C4 FlsGetValue\r\n                         308 GetStringTypeW\r\n                         55A SetEnvironmentVariableW\r\n                         1EA GetCPInfo\r\n                         2C6 GetOEMCP\r\n                         1DB GetACP\r\n                         3BE IsValidCodePage\r\n                         1FF GetCommandLineA\r\n                         5D8 TerminateProcess\r\n                         660 WriteFile\r\n                         5EB TlsFree\r\n                         5EC TlsGetValue\r\n                         5EA TlsAlloc\r\n                         396 InitializeCriticalSectionAndSpinCount\r\n                         12F DeleteCriticalSection\r\n                         3F0 LeaveCriticalSection\r\n                         157 EnterCriticalSection\r\n                         498 RaiseException\r\n                         513 RtlPcToFileHeader\r\n                         517 RtlUnwindEx\r\n                         3B8 IsProcessorFeaturePresent\r\n                         301 GetStartupInfoW\r\n                         5B8 SetUnhandledExceptionFilter\r\n                         5FB UnhandledExceptionFilter\r\n                         3B0 IsDebuggerPresent\r\n                         39A InitializeSListHead\r\n                          B3 CompareStringW\r\n                         3E4 LCMapStringW\r\n                         385 HeapSize\r\n                         5EE TlsSetValue\r\n                         5AB SetThreadStackGuarantee\r\n                          D6 CreateEventA\r\n                         4F9 RemoveVectoredExceptionHandler\r\n                         267 GetExitCodeProcess\r\n                         623 WaitForMultipleObjects\r\n                         5C1 SetWaitableTimer\r\n                         11D CreateWaitableTimerExW\r\n                         200 GetCommandLineW\r\n                         102 CreateProcessW\r\n                         1D3 FreeEnvironmentStringsW\r\n                         262 GetEnvironmentStringsW\r\n                          B2 CompareStringOrdinal\r\n                         4A9 ReadFile\r\n                         2C7 GetOverlappedResult\r\n                          88 CancelIo\r\n                          D9 CreateEventW\r\n                         186 ExitProcess\r\n                          D4 CreateDirectoryW\r\n                          E6 CreateFileW\r\n                         481 QueryPerformanceCounter\r\n                         482 QueryPerformanceFrequency\r\n                         661 WriteFileEx\r\n                         4AA ReadFileEx\r\n                         5CB SleepEx\r\n                         264 GetEnvironmentVariableW\r\n                         1C3 FlsFree\r\n                         1C6 FlsSetValue\r\n                         3BA IsThreadAFiber\r\n                         1C2 FlsAlloc\r\n                         2A5 GetModuleHandleW\r\n                          F3 CreateMutexA\r\n                         68E lstrlenW\r\n                         3F4 LoadLibraryA\r\n                         626 WaitForSingleObjectEx\r\n                         23A GetCurrentDirectoryW\r\n                         518 RtlVirtualUnwind\r\n                         511 RtlLookupFunctionEntry\r\n                         509 RtlCaptureContext\r\n                         61A VirtualProtect\r\n                         241 GetCurrentProcess\r\n                         412 MapViewOfFile\r\n                          E3 CreateFileMappingW\r\n                         3F7 LoadLibraryW\r\n                         5FE UnmapViewOfFile\r\n                         64C WideCharToMultiByte\r\n                         246 GetCurrentThreadId\r\n                         34E GetUserPreferredUILanguages\r\n                         10F CreateThread\r\n                         625 WaitForSingleObject\r\n                          F6 CreateMutexW\r\n                         4E6 ReleaseMutex\r\n                         18A ExpandEnvironmentStringsW\r\n                         373 GlobalSize\r\n                         423 MultiByteToWideChar\r\n                         376 GlobalUnlock\r\n                         36F GlobalLock\r\n                         364 GlobalAlloc\r\n                         245 GetCurrentThread\r\n                          14 AddVectoredExceptionHandler\r\n                         383 HeapReAlloc\r\n                         242 GetCurrentProcessId\r\n                         5D3 SwitchToThread\r\n\r\n    ADVAPI32.dll\r\n             1421D0000 Import Address Table\r\n             142DB6B48 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                         175 ImpersonateAnonymousToken\r\n                         286 RegOpenKeyExW\r\n                         277 RegEnumValueW\r\n                         255 RegCloseKey\r\n                         2BB RevertToSelf\r\n\r\n    gdi32.dll\r\n             1421D0450 Import Address Table\r\n             142DB6F98 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                         233 SetPixelFormat\r\n                         24B SwapBuffers\r\n                          47 CreateRectRgn\r\n                         189 GetDeviceCaps\r\n                          16 ChoosePixelFormat\r\n                          FE DescribePixelFormat\r\n                          FD DeleteObject\r\n\r\n    ws2_32.dll\r\n             1421D0968 Import Address Table\r\n             142DB74B0 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                          8D getsockopt\r\n                          9A select\r\n                          80 connect\r\n                          8C getsockname\r\n                          94 ioctlsocket\r\n                          81 freeaddrinfo\r\n                          95 listen\r\n                          57 WSAStartup\r\n                          82 getaddrinfo\r\n                          7D accept\r\n                          9B send\r\n                          7F closesocket\r\n                          2E WSAGetLastError\r\n                          98 recv\r\n                          56 WSASocketW\r\n                          25 WSADuplicateSocketW\r\n                          9D setsockopt\r\n                          7E bind\r\n\r\n    opengl32.dll\r\n             1421D06E8 Import Address Table\r\n             142DB7230 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                         151 wglCreateContext\r\n                         156 wglGetCurrentDC\r\n                         15C wglShareLists\r\n                         158 wglGetProcAddress\r\n                         159 wglMakeCurrent\r\n                         155 wglGetCurrentContext\r\n                         153 wglDeleteContext\r\n\r\n    imm32.dll\r\n             1421D0490 Import Address Table\r\n             142DB6FD8 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                          47 ImmSetCompositionWindow\r\n                          42 ImmSetCandidateWindow\r\n                          3F ImmReleaseContext\r\n                           1 ImmAssociateContextEx\r\n                          1D ImmGetContext\r\n                          1B ImmGetCompositionStringW\r\n\r\n    dwmapi.dll\r\n             1421D0438 Import Address Table\r\n             142DB6F80 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                          19 DwmSetWindowAttribute\r\n                           3 DwmEnableBlurBehindWindow\r\n\r\n    uxtheme.dll\r\n             1421D0958 Import Address Table\r\n             142DB74A0 Import Name Table\r\n                     0 time date stamp\r\n                     0 Index of first forwarder reference\r\n\r\n                          4A SetWindowTheme\r\n\r\n  Summary\r\n\r\n        6000 .data\r\n        1000 .fptable\r\n       EE000 .pdata\r\n      BE9000 .rdata\r\n       17000 .reloc\r\n       13000 .rsrc\r\n     21CF000 .text\r\n",
+    "vcruntime140Imports": "Microsoft (R) COFF/PE Dumper Version 14.44.35229.0\r\nCopyright (C) Microsoft Corporation.  All rights reserved.\r\n\r\n\r\nDump of file D:\\Desktop\\CompositorWin\\build\\rust\\release\\compositor.exe\r\n\r\nFile Type: EXECUTABLE IMAGE\r\n\r\n  Section contains the following imports:\r\n\r\n  Summary\r\n\r\n        6000 .data\r\n        1000 .fptable\r\n       EE000 .pdata\r\n      BE9000 .rdata\r\n       17000 .reloc\r\n       13000 .rsrc\r\n     21CF000 .text\r\n",
+    "manifest": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n  <assemblyIdentity version=\"0.0.1.0\" processorArchitecture=\"amd64\" name=\"Compositor.Windows\" type=\"win32\"></assemblyIdentity>\n  <description>Compositor Windows image editor</description>\n  <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n    <security>\n      <requestedPrivileges>\n        <requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\"></requestedExecutionLevel>\n      </requestedPrivileges>\n    </security>\n  </trustInfo>\n  <compatibility xmlns=\"urn:schemas-microsoft-com:compatibility.v1\">\n    <application>\n      <supportedOS Id=\"{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}\"></supportedOS>\n      <supportedOS Id=\"{1f676c76-80e1-4239-95bb-83d0f6d0da78}\"></supportedOS>\n      <supportedOS Id=\"{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}\"></supportedOS>\n      <supportedOS Id=\"{35138b9a-5d96-4fbd-8e2d-a2440225f93a}\"></supportedOS>\n    </application>\n  </compatibility>\n  <application xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n    <windowsSettings>\n      <dpiAware xmlns=\"http://schemas.microsoft.com/SMI/2005/WindowsSettings\">true</dpiAware>\n      <dpiAwareness xmlns=\"http://schemas.microsoft.com/SMI/2016/WindowsSettings\">PerMonitorV2</dpiAwareness>\n    </windowsSettings>\n  </application>\n</assembly>"
+  },
+  "rawEvidenceFiles": {
+    "dependents": {
+      "path": "D:\\Desktop\\CompositorWin\\build\\validation\\github-0.0.1-20261015\\runtime-audit-package-20261016\\pe-dependents.txt",
+      "bytes": 772,
+      "sha256": "014ebc409d8521de1f03e79bfd4bf4da688cc73c9b42f2f517dbcec971166fbb",
+      "modifiedUtc": "2026-10-15T18:46:27.870284+00:00"
+    },
+    "headers": {
+      "path": "D:\\Desktop\\CompositorWin\\build\\validation\\github-0.0.1-20261015\\runtime-audit-package-20261016\\pe-headers.txt",
+      "bytes": 6368,
+      "sha256": "a4cd2e489cc328916e3f315f2935e165ebcdfec01a12e42c1d25a8bcebb57a0e",
+      "modifiedUtc": "2026-10-15T18:46:27.917440+00:00"
+    },
+    "imports": {
+      "path": "D:\\Desktop\\CompositorWin\\build\\validation\\github-0.0.1-20261015\\runtime-audit-package-20261016\\pe-imports.txt",
+      "bytes": 18278,
+      "sha256": "255b24a12a21281bc23cbd2e348bb6bf55b59762267533b1c8c427a833f36bbb",
+      "modifiedUtc": "2026-10-15T18:46:27.952060+00:00"
+    },
+    "vcruntime140Imports": {
+      "path": "D:\\Desktop\\CompositorWin\\build\\validation\\github-0.0.1-20261015\\runtime-audit-package-20261016\\pe-vcruntime140Imports.txt",
+      "bytes": 426,
+      "sha256": "71bc1ea3a4cf4081d0980601a0be2e1fe0ce05bd31b9602f2a3d4f990e47ee53",
+      "modifiedUtc": "2026-10-15T18:46:27.988352+00:00"
+    },
+    "manifest": {
+      "path": "D:\\Desktop\\CompositorWin\\build\\validation\\github-0.0.1-20261015\\runtime-audit-package-20261016\\app-manifest.xml",
+      "bytes": 1346,
+      "sha256": "add70813f8ae75abee452f0dea15ea258c98a755ce29401017d3e8d6f5f1980d",
+      "modifiedUtc": "2026-10-15T18:46:28.104735+00:00"
+    }
+  },
+  "evidenceDirectory": "D:\\Desktop\\CompositorWin\\build\\validation\\github-0.0.1-20261015\\runtime-audit-package-20261016"
+}

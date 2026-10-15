@@ -1,0 +1,62 @@
+[package]
+name = "compositor-windows"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+description = "Compositor desktop image editor for Windows"
+
+[[example]]
+name = "prepare-model"
+path = "prepare-model.rs"
+
+[lib]
+name = "compositor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "compositor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+log = { version = "0.4", default-features = false, features = ["release_max_level_info"] }
+tracing = { version = "0.1", default-features = false, features = ["release_max_level_info"] }
+eframe = { version = "0.33", default-features = false, features = ["wgpu", "glow", "x11", "wayland", "default_fonts", "persistence"] }
+egui-wgpu = { version = "0.33", default-features = false }
+wgpu = { version = "27", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12", "vulkan"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif", "webp"] }
+rayon = "1"
+rfd = "0.15"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+rawloader = "0.37"
+resvg = "0.45"
+cosmic-text = "0.14"
+sha2 = "0.10"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+arboard = "3.6"
+moxcms = "0.8"
+tract-onnx = { version = "0.23.8", default-features = false }
+tract-nnef = { version = "=0.23.8", default-features = false }
+tract-linalg = { version = "=0.23.8", default-features = false, features = ["multithread-mm"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Imaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
