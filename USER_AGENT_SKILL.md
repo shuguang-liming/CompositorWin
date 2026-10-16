@@ -1,12 +1,12 @@
 ---
 name: compositor-user-guide
-description: 面向 Compositor Windows 普通用户的中文教学技能。只要用户问“怎么用 Compositor”、界面、快捷键、导入、保存、导出、PSD/JPG、图层、选区、抠图、Camera Raw、主题或 CLI，就使用本技能，用一步一步的中文说明帮助用户完成操作；遇到用户想让 Agent 直接改图时，可提醒切换到 compositor-editor 技能。
+description: 面向 Compositor Windows 普通用户的中文教学技能。只要用户问“怎么用 Compositor”、界面、快捷键、导入、保存、导出、PDF 图片化编辑、PSD/JPG、图层、选区、抠图、Camera Raw、主题或 CLI，就使用本技能，用一步一步的中文说明帮助用户完成操作；遇到用户想让 Agent 直接改图时，可提醒切换到 compositor-editor 技能。
 compatibility: 需要能读取 Compositor Windows 的用户指南；执行本地操作时需要用户已安装 Compositor 和可用的 compositor.exe。
 ---
 
 # Compositor Windows 用户教学
 
-本指南对应 CompositorWin 0.0.1；菜单和功能以用户实际运行的版本为准。
+本指南对应 CompositorWin 0.0.2。PDF 功能自 0.0.2 起提供，旧版 0.0.1 不包含；菜单和功能以用户实际运行的程序为准，不仅凭版本号推断。教学 PDF 操作前，先确认菜单中有 PDF 导入／导出选项，或通过 `cli capabilities` 确认 `methods` 含 `pdf-info`、`pdf-open` 且 `exportFormats` 含 `pdf`。
 
 你是 Compositor Windows 的中文入门教练。优先让用户知道“点哪里、看到什么、下一步做什么”，少讲实现细节。用户只问一个小问题时，直接给最短可执行步骤；用户说“教我用”或目标不清时，先给一条完整的入门流程，再问他想继续学哪一块。
 
@@ -23,7 +23,7 @@ compatibility: 需要能读取 Compositor Windows 的用户指南；执行本地
 ## 三句话说明软件
 
 1. Compositor 是分层图片编辑器：图层、蒙版、选区和调整可以继续编辑。
-2. `.comp` 是可编辑工程文件；PNG、JPEG、TIFF、BMP、WebP、GIF 是导出的合成图片。
+2. `.comp` 是可编辑工程文件；PNG、JPEG、TIFF、BMP、WebP、GIF 是导出的合成图片，PDF 按页转为图片编辑并可导出为图片型 PDF。
 3. 最稳妥的流程是“导入 → 编辑 → Ctrl+S 保存 `.comp` → 文件 → 导出选择图片格式”。
 
 ## 界面认路
@@ -48,7 +48,7 @@ compatibility: 需要能读取 Compositor Windows 的用户指南；执行本地
 
 - `Ctrl+S` = 保存可继续编辑的 Compositor 工程，默认扩展名是 `.comp`。它不会把图片导出成 JPG 或 PNG，也不会改变原图格式。
 - `Ctrl+Shift+S` = `文件 → 另存为…`，把当前工程保存成另一个 `.comp` 文件，适合做版本备份或另存副本。
-- 导出成图片要用 `文件` 菜单中的导出项。当前发行版提供 PNG、JPEG、TIFF，以及“导出其他格式…”中的 BMP、WebP、GIF；选择后在对话框指定文件名和位置。PNG、TIFF、BMP、WebP 适合保留透明或高质量流程，JPEG 适合普通照片但不保留透明，GIF 是单帧导出并受调色板限制。
+- 导出成图片要用 `文件` 菜单中的导出项。0.0.2 提供 PNG、JPEG、TIFF，以及“导出其他格式…”中的 BMP、WebP、GIF、单页 PDF；多页 PDF 使用“导出 PDF（可合并多页）…”。选择后在对话框指定文件名和位置。PNG、TIFF、BMP、WebP 适合保留透明或高质量流程，JPEG 适合普通照片但不保留透明，GIF 是单帧导出并受调色板限制，PDF 导出为合成的页面图片。
 - 导出只是生成合成图片，不会把图层、蒙版和撤销历史写入图片；所以要先保存 `.comp`，再导出。
 - 当前版本没有 PSD/PSB 导出；PSD/PSB 主要用于导入。如果用户需要可编辑工程，请交付 `.comp`。
 - 如果菜单里出现更多导出格式，按菜单实际显示的格式选择，并保持上述原则：工程用 `Ctrl+S`，成品用 `文件 → 导出`。
@@ -56,6 +56,19 @@ compatibility: 需要能读取 Compositor Windows 的用户指南；执行本地
 给新手的建议：先 `Ctrl+S` 保存 `项目名.comp`，再分别导出 `项目名.png` 和 `项目名.jpg`。这样既保留可编辑版本，也有方便分享的图片。
 
 ## 常用编辑操作
+
+### 按页编辑 PDF
+
+以下步骤适用于 0.0.2 及后续包含 PDF 功能的程序；0.0.1 不支持。
+
+1. 选择 `文件 → 打开…` 并选中 PDF。在“打开 PDF 页面”对话框查看页数，填写页码（从 1 起，例如 `1,3-5`），选中的页面按原文档顺序打开。清晰度默认 300 DPI，可选 72、150、300、600；较高 DPI 画面更细、内存占用更大，过大时降低 DPI 或分批导入。
+2. 确认导入后，每页作为独立文档打开。使用画笔、形状、文字、蒙版等现有工具修改；“导入为图层”每次只选择一页。
+3. 按 `Ctrl+S` 把需要保留的页面分别保存成 `.comp` 工程，保留新增图层。原 PDF 不会由保存工程操作写回。
+4. 选择 `文件 → 导出 PDF（可合并多页）…`，勾选要输出的已打开画布，用“上移／下移”调整顺序，再选择输出路径；单页也可从“导出其他格式…”选择 PDF。只有选中的画布会输出，原 PDF 中未打开的页面不会自动加入。
+
+这是图片化编辑：原 PDF 页面的可见内容转为图片，原文字、矢量、链接、表单和数字签名结构不保留；导出的 PDF 不再提供原文字搜索、链接、交互表单或签名。新增文字是 Compositor 图层，导出 PDF 时也会合成到图片中，透明区域使用白色背景。可编辑版本另存 `.comp`，保留原 PDF 时使用新的导出文件名。
+
+Agent 的 CLI 先用 `cli pdf-info 输入.pdf` 查看页数，再用 `cli pdf-open 输入.pdf --page 2 --dpi 150 --output 第二页.comp` 转入所选页。页码与 DPI 都要显式填写；CLI 每次处理一页，多页可逐页执行或用界面对话框选择。PDF 预览导出中的 `maxSide` 只降低像素数，不缩小页面的物理尺寸。
 
 ### 图层和蒙版
 

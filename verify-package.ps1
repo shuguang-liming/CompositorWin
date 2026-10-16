@@ -64,7 +64,7 @@ try {
     }
 } finally { $archive.Dispose() }
 if ($checked.Count -ne $expected.Count) { throw 'The ZIP omits packaged files.' }
-$python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+$python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $licenseResult = & $python -B -X utf8 (Join-Path $root 'generate-open-source-licenses.py') --check --verify-exe (Join-Path $packageRoot 'compositor.exe') --verify-package-index (Join-Path $packageRoot 'LICENSES.md')
 if ($LASTEXITCODE -ne 0) { throw 'Embedded license original-text or package index verification failed.' }
 $licenseSummary = ($licenseResult -join [Environment]::NewLine) | ConvertFrom-Json

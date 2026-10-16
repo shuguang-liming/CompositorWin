@@ -1,21 +1,91 @@
+<p align="center">
+  <img src="assets/app-icon-128.png" width="88" height="88" alt="Compositor 应用图标">
+</p>
+
+<h1 align="center">CompositorWin</h1>
+
+<p align="center"><strong>从图层开始，完成你的下一张作品。</strong></p>
+<p align="center">面向 Windows 的中文图像编辑器 · 绘画与合成 · 照片处理 · 本地 AI Agent 操作</p>
+
+<p align="center">
+  <img src="assets/readme-windows.svg" alt="Windows 10 22H2 / Windows 11 x64">
+  <img src="assets/readme-rust.svg" alt="使用 Rust 开发">
+  <img src="assets/readme-local.svg" alt="图像在本地编辑">
+  <a href="LICENSES.md"><img src="assets/readme-license.svg" alt="主程序 MIT 许可证；第三方组件分别适用各自许可证"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/shuguang-liming/CompositorWin/releases/latest"><strong>下载 Windows 版</strong></a>
+  · <a href="#使用">快速开始</a>
+  · <a href="#cli-与-ai-agent">AI Agent 与 CLI</a>
+  · <a href="#开发">从源码构建</a>
+  · <a href="https://github.com/shuguang-liming/CompositorWin/issues">反馈问题</a>
+</p>
+
+---
+
+<p align="center">
+  <img src="assets/readme-pdf.png" width="1100" alt="CompositorWin 中文界面：PDF 多页导入、画笔修改与按页序导出">
+</p>
+
+## 为图像创作准备的工具
+
+将图片放进画布，用图层和蒙版组合内容，继续绘画、排字、调色，再导出成品。需要重复操作时，同一个 EXE 也能通过 CLI 和 AI Agent 完成编辑。
+
+| 你想做的事 | CompositorWin 提供的工具 |
+|:---|:---|
+| 把素材组合成一张作品 | 图层、蒙版、混合模式，保留可继续编辑的 `.comp` 工程 |
+| 在画面上绘画、标注与排版 | 画笔、选区、文字、形状，以及撤销与重做 |
+| 调整照片的观感 | Camera Raw、调色与滤镜，预览后应用 |
+| 抠出主体，继续修边 | 内置 U²-Netp 离线主体分割，生成可编辑蒙版 |
+| 修改 PDF 页面或合并成册 | 按页转为图片，使用绘图工具修改，再选择页序导出 PDF |
+| 把重复步骤交给 Agent | CLI、JSONL 会话与当前窗口编辑，附操作技能和中文教学技能 |
+| 换一个舒服的工作环境 | 简体中文界面、跟随系统的日夜模式、可导入与导出的自定义主题 |
+
+## 下载与文件格式
+
+| 选择 | 获取方式 |
+|:---|:---|
+| **安装版** | [下载 Setup EXE](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.2/Compositor-Windows-0.0.2-Setup-x64.exe) · 当前用户安装，支持覆盖升级与卸载 |
+| **便携版** | [下载 ZIP](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.2/Compositor-Windows-0.0.2-x64.zip) · 解压后运行 `compositor.exe` |
+| **源代码** | [查看发布记录](https://github.com/shuguang-liming/CompositorWin/releases) · [构建说明](#开发) |
+
+当前版本为 **0.0.2**。PDF 页面图片化编辑自本版起提供；旧版 0.0.1 不包含此功能。
+
+| 格式 | 打开 / 导入 | 保存 / 导出 |
+|:---|:---|:---|
+| `.comp` 工程 | 单文件工程，兼容旧版目录工程 | 单文件，保留图层、蒙版与可编辑文字 |
+| PNG、JPEG、TIFF、BMP、WebP、GIF | 支持 | 合成图像；JPEG 不保留透明，GIF 为单帧 |
+| PSD / PSB | 主要支持 8-bit RGB，复杂内容可能转换或栅格化 | 暂不支持 |
+| SVG | 栅格化导入 | 暂不支持矢量导出 |
+| PDF | 选择页码与 DPI，每页转为独立图片文档 | 当前页或按指定顺序合并的多页图片型 PDF |
+| 相机 RAW | 取决于相机数据库 | 通过普通图片格式导出处理结果 |
+| HEIC / HEIF | 需要兼容的 Windows 编解码器，部分文件需要 HEVC | 暂不支持 |
+
+**运行环境：**Windows 10 22H2 / Windows 11 x64。正式包无需另装 Visual C++ 运行库；优先使用 Direct3D 12 / Vulkan，初始化失败时尝试 OpenGL 界面与 CPU 合成。当前回归验证在 Windows 11 完成，Windows 10 22H2 仍缺少实机验证，具体显卡驱动与格式限制见下方指南。
+
+---
+
 <!-- USER-GUIDE-BEGIN -->
 # Compositor Windows 简体中文版
 
-当前版本：**0.0.1**。本次重新从 0.0.1 编号，文末保留此前 1.0.x 的更新记录。
+当前版本：**0.0.2**。本版增加 PDF 页面图片化编辑与导出，文末保留此前 1.0.x 的更新记录。
+
+PDF 编辑与导出需要 0.0.2 及后续包含该功能的程序。如果菜单中没有 PDF 相关选项，请先确认运行的是新版 `compositor.exe`。
 
 支持图层、蒙版、绘画、选区、文字、形状、调色和滤镜的桌面图像编辑器，使用 Rust、egui 和 wgpu。
 
 ## 使用
 
-可以运行 `Compositor-Windows-Setup-x64.exe` 安装，也可以解压发行 ZIP，直接双击 `compositor.exe`。需要 Windows 10 22H2/Windows 11 x64。程序优先使用 Direct3D 12 或 Vulkan；如果旧驱动无法创建 WGPU 设备，会自动切换 OpenGL 界面和 CPU 合成，避免启动后立即退出。正式发行程序静态链接 MSVC 和 Universal C 运行库，无需另行安装 Visual C++ 运行库。普通使用无需 Rust、Python 或独立 ONNX Runtime。
+可以运行 `Compositor-Windows-0.0.2-Setup-x64.exe` 安装，也可以解压发行 ZIP，直接双击 `compositor.exe`。需要 Windows 10 22H2/Windows 11 x64。程序优先使用 Direct3D 12 或 Vulkan；如果旧驱动无法创建 WGPU 设备，会自动切换 OpenGL 界面和 CPU 合成，避免启动后立即退出。正式发行程序静态链接 MSVC 和 Universal C 运行库，无需另行安装 Visual C++ 运行库。普通使用无需 Rust、Python 或独立 ONNX Runtime。
 
 安装版仅安装到当前用户的 `%LOCALAPPDATA%\Programs\Compositor`，无需管理员权限，并提供桌面、开始菜单快捷方式。在 Windows“设置 → 应用”中卸载 Compositor，或运行安装目录里的卸载器。卸载只处理安装器登记的本软件文件、快捷方式和注册项；用户的 `.comp` 工程、设置及额外文件保留，其他目录不作清理。
 
 发生启动、显卡初始化或图片读取异常时，可查看程序目录下的 `preferences/diagnostics.log`。日志仅保存在本地，限制文件大小，不会自动上传；可能包含图片路径、尺寸和显卡信息，分享前可先检查内容。
 
-如果已安装此前的 1.0.x 版本，请先保存工程并卸载旧版，再安装 0.0.1；卸载会保留用户工程、设置和自行添加的文件。安装器会拒绝将较高版本号直接覆盖为较低版本号。
+如果已安装此前的 1.0.x 版本，请先保存工程并卸载旧版，再安装 0.0.2；卸载会保留用户工程、设置和自行添加的文件。安装器会拒绝将较高版本号直接覆盖为较低版本号。
 
-更新安装版时，先保存工程并关闭 Compositor，再双击新版 `Compositor-Windows-Setup-x64.exe`。安装器识别已有版本，在原位置升级，保留工程、设置和自行添加的文件；同版可重新安装，旧版安装包会拒绝降级。如果程序文件正在使用或被修改，会在覆盖前停止，按提示处理后重新运行新版安装包。升级完成后使用新的卸载器。便携版更新时解压新版 ZIP，保留自己的工程和 `preferences` 设置。
+更新安装版时，先保存工程并关闭 Compositor，再双击新版安装 EXE。安装器识别已有版本，在原位置升级，保留工程、设置和自行添加的文件；同版可重新安装，旧版安装包会拒绝降级。如果程序文件正在使用或被修改，会在覆盖前停止，按提示处理后重新运行新版安装包。升级完成后使用新的卸载器。便携版更新时解压新版 ZIP，保留自己的工程和 `preferences` 设置。
 
 1. 从欢迎页或“文件”菜单新建画布、打开项目或导入图片。
 2. 在图层面板选择图层或蒙版，再用工具栏编辑。选区工具的 `Shift` 添加选区，`Alt` 减去选区。
@@ -30,6 +100,18 @@
 
 主体选择与移除背景使用内嵌 U²-Netp 离线模型，通过可编辑蒙版保留原始像素。细发丝、毛发、半透明对象和复杂主体可能需要手工修正。界面参考原 macOS 项目；字体、RAW、主体分割与部分视觉效果存在平台差异。大图及多图层受可用内存限制，请及时保存。
 
+## PDF 页面图片化编辑
+
+页面会先转为图片，再使用现有绘图工具编辑。
+
+1. 选择“文件 → 打开…”并选中 PDF，也可以把 PDF 拖进软件。在“打开 PDF 页面”对话框填写页码，例如 `1,3-5`。页码从 1 开始，选中的页面按原文档顺序打开。
+2. 选择清晰度：默认 **300 DPI**，还可选择 72、150 或 600 DPI。日常查看可用 150 DPI，需要文字与细线细节可用 300 DPI；较高 DPI 和更多页面会占用更多内存，页面过大时降低 DPI 或分批打开。
+3. 点击“打开页面”。每页成为一个独立标签页，可以用画笔、文字、形状、图层和蒙版修改。要把一页叠到现有画布上，使用“文件 → 导入为图层…”，每次选择一页。
+4. 按 `Ctrl+S` 将需要继续编辑的页面分别保存为 `.comp` 工程。保存工程不会写回原 PDF，也不会自动把所有标签页存进一个工程。
+5. 选择“文件 → 导出 PDF（可合并多页）…”，勾选要输出的已打开画布，用“上移／下移”调整顺序，再选择保存位置。既可导出一页，也可把多页或普通图片画布合成一个 PDF；只导出当前页时也可在“导出其他格式…”中选择 PDF。
+
+导出为**图片型 PDF**，透明区域使用白色背景。原页面的可见内容转为像素；原有文字、矢量、链接、表单与数字签名结构不保留，导出后不再具有原 PDF 的文字搜索、链接或表单功能。新增文字可以在 `.comp` 工程中继续编辑，导出 PDF 时合并为页面图片。需要保留原件时，请使用新的导出文件名。
+
 ## 自定义主题与 AI 制作
 
 打开“视图 → 主题设置…”或右上角“主题 → 主题设置…”。在这里可导入、导出主题，并选择“使用原版主题”或“使用自定义主题”。自定义主题只修改软件界面配色，不修改图片、导出颜色、字号或布局。每个主题都包含日间和夜间两套配色，右上角的“跟随系统／日间模式／夜间模式”仍决定实际使用哪套。
@@ -41,6 +123,10 @@
 5. 不满意时可重新导入调整后的文件，或点击“使用原版主题”；原版切换会保留已导入的自定义主题，随时可切回。“导出主题…”导出当前正在使用的主题，方便分享、备份或继续修改。
 
 可直接复制给 AI 的提示词：
+
+<details>
+<summary><strong>展开 AI 提示词、完整主题模板与字段说明</strong></summary>
+
 
 ```text
 请为 Compositor Windows 制作自定义主题。我会在本提示词后粘贴从软件导出的 theme.json。
@@ -109,6 +195,8 @@ dark 和 light 分别为夜间和日间配色。每套中 text 对 shell、text 
 
 导入会拒绝未知版本或字段、缺失字段、错误颜色、非 UTF-8、超过 64 KiB 或主文字对比度不足的文件。按界面提示修正，再重新导入；可以把错误提示与原 JSON 一起交给 AI。照片区域仍需要中性环境时，让 AI 降低 `canvas` 和棋盘格的饱和度。需要多个风格时，让 AI 分次生成完整 JSON，分别保存；软件一次使用一份自定义主题。
 
+</details>
+
 ## CLI 与 AI Agent
 
 同一个 `compositor.exe` 内置本地 CLI，可由脚本和 AI Agent 新建画布、导入素材、编辑图层、离线抠图、保存工程和导出图片。离线命令与 `serve` 不启动窗口或 GPU，`live` 可直接编辑已打开的窗口；无需远程模型或 API key。操作名称、参数和支持格式用 `cli capabilities`（别名 `cli schema`）查询。
@@ -117,17 +205,25 @@ dark 和 light 分别为夜间和日间配色。每套中 text 对 shell、text 
 |---|---|
 | `cli capabilities` | 返回协议、命令与编辑操作参数清单及示例 |
 | `cli fonts` | 查询本机文字可用字体名称 |
+| `cli pdf-info INPUT.pdf` | 查看 PDF 页数与页面尺寸 |
+| `cli pdf-open INPUT.pdf --page 2 --dpi 150 --output page2.comp` | 将指定页转为可编辑工程 |
 | `cli inspect INPUT` | 检查项目或图片，读取图层 ID 与指纹 |
 | `cli new --width 1920 --height 1080 --output work.comp` | 创建分层工程 |
 | `cli apply INPUT --output work.comp --operations @operations.json` | 批量编辑，整批成功才保存 |
-| `cli export INPUT --output image.png` | 按扩展名导出 PNG、JPEG、TIFF、BMP、WebP 或 GIF |
+| `cli export INPUT --output image.png` | 按扩展名导出图片或单页 `.pdf` |
 | `cli serve` | 通过 JSONL 持续编辑，支持撤销和重做 |
 | `cli live inspect` | 检查当前窗口的文档，包括未保存修改 |
 | `cli live METHOD --params @params.json` | 编辑当前窗口、撤销、重做、保存或导出 |
 | `cli skill install` | 安装内嵌的 `compositor-editor` 技能 |
 | `cli skill show` | 查看完整技能原文 |
 
+PDF 命令先通过 `cli capabilities` 确认程序支持：`methods` 含 `pdf-info`、`pdf-open`，`exportFormats` 含 `pdf`。CLI 每次打开一页，必须显式给出从 1 起的 `--page` 和 72–600 的整数 `--dpi`；直接对 PDF 执行 `inspect`、`apply` 或 `export` 时也需这两个参数。多页可逐页处理；选择页面、调整页序并合并导出使用上方界面流程。`live` 仅操作已打开的文档，PDF 需先在界面导入。
+
 `operations.json` 是 UTF-8 JSON 数组，例如导入素材后生成主体蒙版：
+
+<details>
+<summary><strong>展开命令示例、JSON 协议与 Agent 技能安装说明</strong></summary>
+
 
 ```json
 [
@@ -164,7 +260,7 @@ print(cli("skill", "install"))
 
 Python 仅用于这个调用示例，其他语言也可直接启动进程。控制输出统一为 UTF-8 JSON，成功含 `protocolVersion`、`ok: true`、`result`，失败含 `ok: false`、`error.code` 与 `error.message`；`skill show` 输出 Markdown 原文。日志写入 stderr。
 
-`cli serve` 每行接受 `{ "id": 1, "method": "open", "params": { "path": "work.comp" } }`，每行返回一个响应并回显 `id`。方法包括 `capabilities`、`fonts`、`open`、`new`、`inspect`、`apply`、`undo`、`redo`、`save`、`export`、`close`；`apply` 接受 `params.operations` 数组及可选 `expectedRevision`，`save` 使用 `params.path` 与 `params.overwrite`，`export` 使用 `path`、可选 `maxSide`、`quality` 和 `matte`。会话编辑先保存在内存，调用 `save` 才写盘；选区与撤销历史不写入 `.comp`。
+`cli serve` 每行接受 `{ "id": 1, "method": "open", "params": { "path": "work.comp" } }`，每行返回一个响应并回显 `id`。方法包括 `capabilities`、`fonts`、`pdf-info`、`pdf-open`、`open`、`new`、`inspect`、`apply`、`undo`、`redo`、`save`、`export`、`close`。`open` 或 `pdf-open` 读取 PDF 时使用 `{"path":"input.pdf","page":2,"dpi":150}`。`apply` 接受 `params.operations` 数组及可选 `expectedRevision`，`save` 使用 `params.path` 与 `params.overwrite`，`export` 使用 `path`、可选 `maxSide`、`quality` 和 `matte`。会话编辑先保存在内存，调用 `save` 才写盘；选区与撤销历史不写入 `.comp`。
 
 直接操作当前窗口时，先运行 `cli live capabilities` 获取会话，再用 `cli live inspect` 读取 `sessionId`、`revision` 与 `serial`。`live` 支持 `inspect`、`apply`、`undo`、`redo`、`save`、`export`；编辑参数包含 `operations` 数组，并带上 `sessionId`、`expectedRevision`、`expectedSerial`，保护读取后又发生的界面变更。保存与导出使用 `path`，导出预览可加 `maxSide:1024`；一次 `apply` 作为一个撤销步骤。
 
@@ -174,9 +270,11 @@ Python 仅用于这个调用示例，其他语言也可直接启动进程。控�
 
 让 Codex 刷新技能列表或打开新聊天后，使用 `$compositor-editor`，例如“把这张图抠掉背景，保存可编辑工程并导出透明 PNG”或“直接把当前窗口图层的透明度调低”。Agent 会先发现能力，再执行编辑、导出预览并检查结果。离线保存会触发已打开 `.comp` 的外部重载，有未保存修改时会请求确认；`live` 直接更新界面文档。
 
+</details>
+
 ### 让 AI 教你使用软件
 
-发行包根目录的 [`USER_AGENT_SKILL.md`](USER_AGENT_SKILL.md) 是面向普通用户的中文教学技能。它专门回答界面、快捷键、导入、保存、导出、图层、蒙版、抠图、Camera Raw、主题和 CLI 的使用问题，不会把工程文件和导出图片混为一谈。
+发行包根目录的 [`USER_AGENT_SKILL.md`](USER_AGENT_SKILL.md) 是面向普通用户的中文教学技能。它专门回答界面、快捷键、导入、保存、导出、PDF 图片化编辑、图层、蒙版、抠图、Camera Raw、主题和 CLI 的使用问题，会先检查实际程序是否支持所需功能。
 
 把这个文件复制到你使用的 Agent 技能目录，并放在名为 `compositor-user-guide` 的文件夹中：
 
@@ -192,6 +290,9 @@ Python 仅用于这个调用示例，其他语言也可直接启动进程。控�
 - “我只想学习操作，不要替我修改文件。”
 
 `Ctrl+S` 只保存可继续编辑的 `.comp` 工程；需要图片成品时使用 `文件 → 导出 PNG…`、`文件 → 导出 JPEG…`、`文件 → 导出 TIFF…` 或 `文件 → 导出其他格式…`。PNG、TIFF、BMP、WebP 可用于透明或高质量流程，JPEG 不保留透明，GIF 是单帧导出并受调色板限制。技能文档会以当前版本菜单实际列出的格式为准；如果后续版本增加格式，按导出菜单中的选项选择即可。
+
+<details>
+<summary><strong>展开此前 1.0.x 版本的更新记录</strong></summary>
 
 ## 1.0.5 更新说明
 
@@ -215,8 +316,16 @@ Python 仅用于这个调用示例，其他语言也可直接启动进程。控�
 - 自定义主题直接应用并保存在设置中，重启和覆盖升级保留；继续支持跟随系统及手动日夜切换。
 - 加入主题格式、文件大小和主文字对比度检查，错误主题在应用前给出提示。
 
+</details>
+
 应用保留原项目 [robbietilton/Compositor](https://github.com/robbietilton/Compositor) 的版权和 MIT 许可。在软件中打开“帮助 → 开源软件许可证”，点击组件名称可在线查看许可证，点击“随附原文”可离线阅读原始版权和许可；应用、模型、依赖和字体仍分别适用各自许可证。发行包的 [LICENSES.md](LICENSES.md) 提供简短入口说明，完整原文保存在软件内。
 <!-- USER-GUIDE-END -->
+
+## 致谢与开源许可
+
+Windows 版基于 [robbietilton/Compositor](https://github.com/robbietilton/Compositor) 的设计与项目工作，使用 Rust、egui 与 wgpu 实现。保留原作者 **Wonder Assembly LLC** 的版权及 MIT 许可；U²-Netp 模型、字体与第三方依赖分别遵循各自许可证。
+
+完整版权与许可原文统一在 [LICENSES.md](LICENSES.md)。软件内可打开 **帮助 → 开源软件许可证**，通过在线链接查看各组件许可，也可按需展开随附原文。
 
 ## 开发
 
@@ -238,7 +347,7 @@ New-Item -ItemType Directory -Force build/validation/current | Out-Null
 python -B -X utf8 audit-runtime.py
 .\build.ps1 -Action Package -Offline -Jobs 1 -PackageName Compositor-Windows-next
 .\verify-package.ps1 -PackageName Compositor-Windows-next
-.\package-installer.ps1 -CompilerPath 'D:\Tools\nsis-3.11\makensis.exe' -PackageName Compositor-Windows-next
+.\package-installer.ps1 -CompilerPath 'D:\Tools\nsis-3.11\makensis.exe' -PackageName Compositor-Windows-next -InstallerName Compositor-Windows-next-Setup-x64.exe
 ```
 
 发行包写入 `dist/`，已存在的同名包会保留。打包从本 README 提取使用说明，校验软件内压缩保存的完整许可原文，并生成简短的 `LICENSES.md` 入口说明；在线许可证在“帮助 → 开源软件许可证”中查看。安装包使用官方 NSIS 3.11 便携编译器；上方路径替换为本机 `makensis.exe`，不需要把编译器分发给用户。先验证便携包，再生成 `dist/Compositor-Windows-Setup-x64.exe`。安装脚本固定当前用户目录，卸载按登记文件验证归属后逐个移除，保留修改后的文件和用户数据。

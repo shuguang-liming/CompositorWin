@@ -91,6 +91,7 @@ impl EditorApp {
             && self.pending_io == 0
             && self.dialog.is_none()
             && self.color_picker.is_none()
+            && !self.pdf_ui.is_open()
             && !egui::Popup::is_any_open(ui.ctx());
         if ready
             && Document::valid_size(self.new_size[0], self.new_size[1])

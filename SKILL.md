@@ -1,11 +1,11 @@
 ---
 name: compositor-editor
-description: 用 Compositor Windows 的本地 CLI 新建或编辑分层图片、导入素材、离线抠图、保存 .comp 工程并导出图像。用户要求由 Agent 操作 Compositor 或编辑 .comp 项目时使用。
+description: 用 Compositor Windows 的本地 CLI 新建或编辑分层图片、按页图片化编辑 PDF、导入素材、离线抠图、保存 .comp 工程并导出图像或图片型 PDF。用户要求由 Agent 操作 Compositor 或编辑 .comp 项目时使用。
 ---
 
 # Compositor 图像编辑
 
-本技能对应 CompositorWin 0.0.1；操作前仍通过 `cli capabilities` 查询实际程序的能力。
+本技能对应 CompositorWin 0.0.2。PDF 功能自 0.0.2 起提供，旧版 0.0.1 不包含；操作前通过 `cli capabilities` 查询实际程序的能力，不仅凭版本号推断功能。
 
 使用 `compositor.exe cli` 操作本地图片与 `.comp` 工程。离线命令与 `serve` 无需启动窗口或 GPU；`live` 操作用户已经打开的界面文档，包括未保存内容。根据用户目标选择方式，完成编辑并交付工程与所需导出图。
 
@@ -45,7 +45,27 @@ capabilities = cli("capabilities")
 
 - 新建：`cli("new", "--width", 1920, "--height", 1080, "--output", project_path)`。
 - 编辑：按参数清单构造 JSON 操作数组，写入 UTF-8 文件，再执行 `cli("apply", input_path, "--output", project_path, "--operations", "@" + str(operations_file))`。需要保护读取后版本时附加 `--expected-fingerprint` 与检查得到的指纹。一批操作整体成功才保存；失败后读取错误，修正再执行。
-- 导出：`cli("export", project_path, "--output", output_path)`，根据扩展名选择 PNG、JPEG、TIFF、BMP、GIF 或 WebP。PNG、TIFF、BMP、WebP 可保留透明，JPEG 不保留透明，GIF 为单帧并受调色板限制；支持时用 `--max-side` 生成检查用缩略图、用 `--quality` 设置 JPEG 质量。
+- 导出：`cli("export", project_path, "--output", output_path)`，根据扩展名选择 PNG、JPEG、TIFF、BMP、GIF、WebP 或 PDF。PNG、TIFF、BMP、WebP 可保留透明，JPEG 不保留透明，GIF 为单帧并受调色板限制；PDF 是当前文档的单页合成图片。用 `--max-side` 生成检查用缩略图、用 `--quality` 设置 JPEG 质量。PDF 缩略导出降低像素数，保持文档的物理页面尺寸。
+
+## PDF 图片化编辑
+
+先检查 `capabilities["methods"]` 是否含 `pdf-info`、`pdf-open`，以及 `capabilities["exportFormats"]` 是否含 `pdf`；缺少时说明需要包含 PDF 功能的程序，不对旧版发送这些命令。
+
+先执行 `cli("pdf-info", pdf_path)`，读取 `pageCount` 与各页从 1 起的 `page`、`widthPoints`、`heightPoints`。PDF 的 points 单位为 1/72 英寸。打开时必须明确选择一页和 DPI（整数 72–600），例如：
+
+```python
+cli("pdf-open", pdf_path, "--page", 2, "--dpi", 150,
+    "--output", page_project_path)
+cli("apply", page_project_path, "--operations", "@" + str(operations_file),
+    "--output", edited_project_path)
+cli("export", edited_project_path, "--output", output_pdf)
+```
+
+`pdf-open` 另存所选页为 `.comp`。`inspect`、`apply`、`export` 直接读取 PDF 时同样要求 `--page` 和 `--dpi`。`serve` 的 `open` 或 `pdf-open` 接受 `{"path":"input.pdf","page":2,"dpi":150}`；可先调用 `pdf-info` 获取页数。未指定页码会报错并保留原会话，绝不默认丢弃其余页面。逐页执行可处理多页 PDF；这些 CLI 导出命令每次生成一个文档页面。PDF 页面转图片后的像素尺寸取决于 DPI，较高 DPI 使用更多内存。
+
+页面的可见内容会转为图片，原文字、矢量、链接、表单和数字签名结构不保留；图片型 PDF 导出不会恢复文字搜索、链接、交互表单或原签名。使用现有画笔、图层、蒙版、文字等工具修改像素或叠加内容，并另存 `.comp` 保留新增图层。PDF 导出的透明区域使用白色背景。
+
+需要直接在界面处理多页时，使用 `文件 → 打开…` 的 PDF 导入对话框选择页码与 DPI；界面默认 300 DPI，可选 72、150、300、600，每页打开为独立文档。`Ctrl+S` 将当前页保存为 `.comp` 工程，不写回原 PDF。通过 `文件 → 导出 PDF（可合并多页）…` 勾选已打开画布，用“上移／下移”调整顺序，生成图片型多页 PDF；原 PDF 中未打开的页面不会自动附加到输出。`live` 只控制已经打开的文档，不负责打开 PDF；可在完成界面导入后按下述 guard 规则编辑、导出当前页。普通图片作为图层导入的批处理操作不接受 PDF 页码；PDF 请选择专用导入流程。
 
 新建后按 capabilities 的导入操作添加素材；编辑已有工程先检查再修改。移除背景使用本机离线主体分割操作，保留原始图层像素和可编辑蒙版。无需远程模型、API key 或上传图片。需要接入用户自选视觉模型时，先确认该接口已实现，勿把本地分割说成远程 AI 调用。
 

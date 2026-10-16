@@ -139,7 +139,7 @@ try {
         if (-not $guide.Success) { throw 'The README user guide section is missing.' }
         [System.IO.File]::WriteAllText((Join-Path $releaseDirectory 'README.md'), $guide.Groups[1].Value + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
         # Full original notices ship inside the EXE; keep one small discoverable entry file.
-        $python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+        $python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
         & $python -B -X utf8 (Join-Path $projectRoot 'generate-open-source-licenses.py') --check --verify-exe (Join-Path $releaseDirectory 'compositor.exe') --write-package-index (Join-Path $releaseDirectory 'LICENSES.md')
         if ($LASTEXITCODE -ne 0) { throw 'Embedded license original-text verification or package index generation failed.' }
         . (Join-Path $projectRoot 'project.ps1')

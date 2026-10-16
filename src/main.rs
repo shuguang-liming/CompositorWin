@@ -53,6 +53,49 @@ fn run_gui(
     restore_maximized: std::rc::Rc<std::cell::Cell<bool>>,
     application_created: std::rc::Rc<std::cell::Cell<bool>>,
 ) -> eframe::Result {
+    catch_gui_startup(renderer, &application_created, || {
+        run_gui_inner(
+            renderer,
+            wgpu_options,
+            restore_maximized,
+            application_created.clone(),
+        )
+    })
+}
+
+fn catch_gui_startup(
+    renderer: eframe::Renderer,
+    application_created: &std::cell::Cell<bool>,
+    run: impl FnOnce() -> eframe::Result,
+) -> eframe::Result {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(payload) => {
+            if should_retry_with_glow(renderer, true, application_created.get()) {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic payload");
+                log::error!("WGPU initialization panicked before editor creation: {message}");
+                Err(eframe::Error::AppCreation(
+                    std::io::Error::other(format!("WGPU startup panic: {message}")).into(),
+                ))
+            } else {
+                // A live editor may contain unsaved documents. Only startup
+                // failures qualify for the existing one-time renderer retry.
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+}
+
+fn run_gui_inner(
+    renderer: eframe::Renderer,
+    wgpu_options: egui_wgpu::WgpuConfiguration,
+    restore_maximized: std::rc::Rc<std::cell::Cell<bool>>,
+    application_created: std::rc::Rc<std::cell::Cell<bool>>,
+) -> eframe::Result {
     let requested_maximized = restore_maximized.clone();
     let options = eframe::NativeOptions {
         renderer,
@@ -162,7 +205,21 @@ fn probe_wgpu_inner(configuration: &egui_wgpu::WgpuConfiguration) -> bool {
 }
 
 fn compatible_wgpu_options() -> egui_wgpu::WgpuConfiguration {
-    let mut configuration = egui_wgpu::WgpuConfiguration::default();
+    let defaults = egui_wgpu::WgpuConfiguration::default();
+    let default_on_surface_error = defaults.on_surface_error.clone();
+    let mut configuration = egui_wgpu::WgpuConfiguration {
+        on_surface_error: Arc::new(move |error| {
+            if error == wgpu::SurfaceError::Lost {
+                // Reconfigure the existing window without replacing the editor
+                // or its unsaved documents. Preserve eframe's other policies.
+                log::warn!("Window surface lost; reconfiguring the existing surface");
+                egui_wgpu::SurfaceErrorAction::RecreateSurface
+            } else {
+                default_on_surface_error(error)
+            }
+        }),
+        ..defaults
+    };
     if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut configuration.wgpu_setup {
         let compiled_backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
         let requested_backends = setup.instance_descriptor.backends;
@@ -235,6 +292,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_panic_reaches_fallback_but_live_editor_and_glow_panics_propagate() {
+        let created = std::cell::Cell::new(false);
+        let result = catch_gui_startup(eframe::Renderer::Wgpu, &created, || {
+            panic!("adapter startup")
+        });
+        assert!(matches!(result, Err(eframe::Error::AppCreation(_))));
+        for (renderer, app_created) in [
+            (eframe::Renderer::Wgpu, true),
+            (eframe::Renderer::Glow, false),
+        ] {
+            created.set(app_created);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                catch_gui_startup(renderer, &created, || panic!("preserved panic"))
+            }));
+            assert!(panic.is_err());
+        }
+    }
+
+    #[test]
     fn graphics_fallback_only_retries_a_failed_wgpu_startup() {
         assert!(should_retry_with_glow(eframe::Renderer::Wgpu, true, false));
         assert!(!should_retry_with_glow(
@@ -244,6 +320,23 @@ mod tests {
         ));
         assert!(!should_retry_with_glow(eframe::Renderer::Wgpu, true, true));
         assert!(!should_retry_with_glow(eframe::Renderer::Glow, true, false));
+    }
+
+    #[test]
+    fn lost_window_surface_requests_reconfiguration_without_restarting_the_editor() {
+        let configuration = compatible_wgpu_options();
+        for _ in 0..2 {
+            assert!(matches!(
+                (configuration.on_surface_error)(wgpu::SurfaceError::Lost),
+                egui_wgpu::SurfaceErrorAction::RecreateSurface
+            ));
+        }
+        for error in [wgpu::SurfaceError::Timeout, wgpu::SurfaceError::Outdated] {
+            assert!(matches!(
+                (configuration.on_surface_error)(error),
+                egui_wgpu::SurfaceErrorAction::SkipFrame
+            ));
+        }
     }
 
     #[test]

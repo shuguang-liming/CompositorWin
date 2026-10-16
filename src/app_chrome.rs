@@ -63,16 +63,17 @@ impl EditorApp {
     }
 
     pub(super) fn command_available(&self, command: Command) -> bool {
-        !self.is_welcome()
-            || matches!(
-                command,
-                Command::New
-                    | Command::Open
-                    | Command::Import
-                    | Command::Close
-                    | Command::Shortcuts
-                    | Command::Paste
-            )
+        !self.pdf_ui.is_open()
+            && (!self.is_welcome()
+                || matches!(
+                    command,
+                    Command::New
+                        | Command::Open
+                        | Command::Import
+                        | Command::Close
+                        | Command::Shortcuts
+                        | Command::Paste
+                ))
     }
 
     fn project_tab_title(&self, index: usize) -> String {
@@ -85,6 +86,7 @@ impl EditorApp {
             .as_ref()
             .and_then(|path| path.file_stem())
             .map(|name| name.to_string_lossy().into_owned())
+            .or_else(|| session.display_name.clone())
             .unwrap_or_else(|| "未命名".into())
     }
 

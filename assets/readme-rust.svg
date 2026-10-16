@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="122" height="26" role="img" aria-label="Built with Rust">
+  <title>Built with Rust</title>
+  <rect width="122" height="26" rx="6" fill="#f3ebe6"/>
+  <circle cx="16" cy="13" r="5" fill="none" stroke="#925637" stroke-width="1.5"/>
+  <text x="28" y="17" fill="#654b3d" font-family="Segoe UI,Arial,sans-serif" font-size="11" font-weight="600">Built with Rust</text>
+</svg>

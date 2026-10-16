@@ -25,6 +25,7 @@ pub mod matte;
 pub mod model;
 pub mod open_source_licenses;
 pub mod palette;
+pub mod pdf_io;
 pub mod pixels;
 pub mod preview;
 pub mod project;

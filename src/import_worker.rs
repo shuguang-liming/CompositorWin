@@ -8,6 +8,16 @@ use std::{path::PathBuf, sync::mpsc};
 use uuid::Uuid;
 
 pub(super) enum ImportTask {
+    PdfInfo {
+        path: PathBuf,
+        target: Option<Uuid>,
+    },
+    PdfPages {
+        path: PathBuf,
+        target: Option<Uuid>,
+        indices: Vec<u32>,
+        dpi: u32,
+    },
     Open {
         path: PathBuf,
         target: Option<Uuid>,
@@ -27,6 +37,29 @@ pub(super) enum ImportTask {
 impl ImportTask {
     fn execute(self) -> Worker {
         match self {
+            Self::PdfInfo { path, target } => {
+                let result = crate::pdf_io::info(&path).map_err(|e| format!("{e:#}"));
+                Worker::PdfInfo {
+                    path,
+                    target,
+                    result,
+                }
+            }
+            Self::PdfPages {
+                path,
+                target,
+                indices,
+                dpi,
+            } => {
+                let result =
+                    crate::pdf_io::render_pages(&path, &indices, dpi).map_err(|e| format!("{e:#}"));
+                Worker::PdfOpen {
+                    path,
+                    target,
+                    dpi,
+                    result,
+                }
+            }
             Self::Open { path, target } => {
                 let result = diagnostics::import(&path);
                 Worker::Open {

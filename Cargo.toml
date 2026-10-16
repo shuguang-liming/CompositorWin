@@ -1,6 +1,6 @@
 [package]
 name = "compositor-windows"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT"
 description = "Compositor desktop image editor for Windows"
@@ -45,7 +45,7 @@ tract-linalg = { version = "=0.23.8", default-features = false, features = ["mul
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
-windows = { version = "0.62", features = ["Win32_Graphics_Imaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Imaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_WinRT", "Foundation", "Data_Pdf", "Storage", "Storage_Streams", "Graphics_Imaging", "UI"] }
 
 [dev-dependencies]
 tempfile = "3"

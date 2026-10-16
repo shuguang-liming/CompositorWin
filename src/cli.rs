@@ -3,8 +3,8 @@ use crate::{
     automation::{Engine, Operation},
     history::History,
     image_io,
-    model::Document,
-    project, render,
+    model::{Document, Layer, Raster},
+    pdf_io, project, render,
 };
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -178,6 +178,7 @@ struct OpenDocument {
     source: Option<PathBuf>,
     fingerprint: Option<String>,
     warnings: Vec<String>,
+    pdf_size: Option<(u32, u32, f64, pdf_io::PdfPageSize)>,
 }
 #[derive(Default)]
 struct Session {
@@ -188,6 +189,8 @@ struct Session {
 #[serde(deny_unknown_fields)]
 struct OpenParams {
     path: PathBuf,
+    page: Option<u32>,
+    dpi: Option<u32>,
     #[serde(default)]
     discard: bool,
 }
@@ -246,6 +249,69 @@ struct CloseParams {
     discard: bool,
 }
 
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+fn pdf_info(path: &Path) -> Result<Value> {
+    let path = absolute(path)?;
+    let information = pdf_io::info(&path)?;
+    Ok(json!({"path":path,"pageCount":information.pages.len(),
+        "pages":information.pages.iter().enumerate().map(|(index, size)| json!({
+            "page":index + 1,"widthPoints":size.width_points,"heightPoints":size.height_points
+        })).collect::<Vec<_>>(),
+        "editing":"rasterized_pages","pageNumbering":"one_based",
+        "message":"PDF 按页转为图片编辑；打开时须明确 page 与 dpi，不保留原文字、矢量、表单或签名结构。"}))
+}
+
+fn import_for_session(
+    p: &OpenParams,
+) -> Result<(image_io::ImportResult, Option<pdf_io::PdfPageSize>)> {
+    if !is_pdf(&p.path) {
+        ensure!(
+            p.page.is_none() && p.dpi.is_none(),
+            "page 和 dpi 仅用于 PDF 输入"
+        );
+        return image_io::import(&p.path).map(|imported| (imported, None));
+    }
+    let information = pdf_io::info(&p.path)?;
+    let count = information.pages.len();
+    let page = p.page.ok_or_else(|| error("pdf_page_required", format!(
+        "此 PDF 共 {count} 页；请明确 page（从 1 起）与 dpi（72–600）。使用 pdf-info 查看页面；多页请逐页导入，或使用界面导入对话框。"
+    )))?;
+    ensure!(
+        page > 0 && page as usize <= count,
+        "PDF 页码须在 1–{count} 之间"
+    );
+    let dpi = p
+        .dpi
+        .ok_or_else(|| error("pdf_dpi_required", "PDF 需要明确 dpi（72–600，例如 150）"))?;
+    ensure!((72..=600).contains(&dpi), "PDF dpi 须在 72–600 之间");
+    let rendered = pdf_io::render_pages(&p.path, &[page - 1], dpi)?
+        .into_iter()
+        .next()
+        .context("PDF 页面未返回图像")?;
+    let mut document = Document::new(rendered.raster.width, rendered.raster.height);
+    document.resolution = f64::from(dpi);
+    let name = format!(
+        "{} · 第 {page} 页",
+        p.path.file_stem().unwrap_or_default().to_string_lossy()
+    );
+    let layer = Layer::raster(name, rendered.raster);
+    document.active_layer_id = Some(layer.id);
+    document.layers = vec![layer];
+    Ok((
+        image_io::ImportResult {
+            document,
+            conversions: vec![format!(
+                "PDF 共 {count} 页；仅将明确选择的第 {page} 页按 {dpi} DPI 转为图片。其余页面未导入；原文字、矢量、表单与签名结构不保留，请逐页处理并另存 .comp 工程。"
+            )],
+        },
+        Some(rendered.size),
+    ))
+}
+
 impl Session {
     fn check_replace(&self, discard: bool) -> Result<()> {
         if !discard
@@ -289,22 +355,47 @@ impl Session {
                 empty_params(params)?;
                 Ok(capabilities())
             }
-            "open" => {
+            "pdf-info" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    path: PathBuf,
+                }
+                let p: Params = serde_json::from_value(params)?;
+                pdf_info(&p.path)
+            }
+            "open" | "pdf-open" => {
                 let p: OpenParams = serde_json::from_value(params)?;
+                ensure!(
+                    method != "pdf-open" || is_pdf(&p.path),
+                    "pdf-open 需要 PDF 输入路径"
+                );
                 self.check_replace(p.discard)?;
                 let path = absolute(&p.path)?;
                 let before = fingerprint(&path)?;
-                let imported = image_io::import(&path)?;
+                let (imported, page_size) = import_for_session(&OpenParams {
+                    path: path.clone(),
+                    ..p
+                })?;
                 ensure!(
                     before == fingerprint(&path)?,
                     "读取期间源文件发生变化，请重试"
                 );
+                let pdf_size = page_size.map(|size| {
+                    (
+                        imported.document.width,
+                        imported.document.height,
+                        imported.document.resolution,
+                        size,
+                    )
+                });
                 self.opened = Some(OpenDocument {
                     document: imported.document,
                     history: History::default(),
                     source: Some(path),
                     fingerprint: Some(before),
                     warnings: imported.conversions,
+                    pdf_size,
                 });
                 self.inspect()
             }
@@ -327,6 +418,7 @@ impl Session {
                     source: None,
                     fingerprint: None,
                     warnings: vec![],
+                    pdf_size: None,
                 });
                 self.inspect()
             }
@@ -408,7 +500,15 @@ impl Session {
             }
             "export" => {
                 let p: ExportParams = serde_json::from_value(params)?;
-                export(&self.opened()?.document, p)
+                let state = self.opened()?;
+                let physical_size = state
+                    .pdf_size
+                    .filter(|(width, height, resolution, _)| {
+                        (*width, *height) == (state.document.width, state.document.height)
+                            && *resolution == state.document.resolution
+                    })
+                    .map(|(_, _, _, size)| size);
+                export(&state.document, p, physical_size)
             }
             "close" => {
                 let p: CloseParams = serde_json::from_value(params)?;
@@ -431,7 +531,11 @@ fn empty_params(params: Value) -> Result<()> {
     );
     Ok(())
 }
-fn export(doc: &Document, p: ExportParams) -> Result<Value> {
+fn export(
+    doc: &Document,
+    p: ExportParams,
+    physical_size: Option<pdf_io::PdfPageSize>,
+) -> Result<Value> {
     if p.path.exists() && !p.overwrite {
         return Err(error(
             "already_exists",
@@ -452,8 +556,11 @@ fn export(doc: &Document, p: ExportParams) -> Result<Value> {
         .unwrap_or("")
         .to_ascii_lowercase();
     ensure!(
-        ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"].contains(&format.as_str()),
-        "导出格式支持 PNG、JPEG、TIFF、BMP、GIF、WebP"
+        [
+            "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp", "pdf"
+        ]
+        .contains(&format.as_str()),
+        "导出格式支持 PNG、JPEG、TIFF、BMP、GIF、WebP、PDF"
     );
     let raster = p.max_side.map_or_else(
         || render::render_document(doc),
@@ -462,33 +569,64 @@ fn export(doc: &Document, p: ExportParams) -> Result<Value> {
     if let Some(parent) = p.path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    image_io::export_raster(
+    export_document_raster(
+        doc,
         &raster,
         &p.path,
         &format,
-        doc.resolution,
         p.quality,
         p.matte,
+        physical_size,
     )?;
     Ok(
         json!({"path":absolute(&p.path)?,"format":format,"width":raster.width,"height":raster.height,"bytes":fs::metadata(&p.path)?.len(),"sha256":fingerprint(&p.path)?}),
     )
 }
 
+pub(crate) fn export_document_raster(
+    document: &Document,
+    raster: &Raster,
+    path: &Path,
+    format: &str,
+    quality: u8,
+    matte: [u8; 3],
+    physical_size: Option<pdf_io::PdfPageSize>,
+) -> Result<()> {
+    if format == "pdf" {
+        // Keep the document's physical page size even when a preview has fewer
+        // pixels. Passing an explicit size also avoids aspect-ratio rounding
+        // changing one dimension when a single DPI value cannot represent both.
+        ensure!(
+            document.resolution.is_finite() && document.resolution > 0.,
+            "PDF 文档分辨率无效"
+        );
+        let size = physical_size.unwrap_or(pdf_io::PdfPageSize {
+            width_points: f64::from(document.width) * 72. / document.resolution,
+            height_points: f64::from(document.height) * 72. / document.resolution,
+        });
+        pdf_io::export_pages(path, std::iter::once(Ok((raster.clone(), size))))
+    } else {
+        image_io::export_raster(raster, path, format, document.resolution, quality, matte)
+    }
+}
+
 pub fn capabilities() -> Value {
     json!({"name":"Compositor","protocolVersion":1,"applicationVersion":env!("CARGO_PKG_VERSION"),
         "headless":true,"stdio":true,"liveControl":true,"externalVisionApi":false,
-        "methods":["capabilities","fonts","open","new","inspect","apply","undo","redo","save","export","close"],
+        "methods":["capabilities","fonts","pdf-info","pdf-open","open","new","inspect","apply","undo","redo","save","export","close"],
         "methodExamples":{
-            "open":{"path":"input.comp"},"new":{"width":1024,"height":768},"inspect":{},
+            "open":{"path":"input.comp"},"pdf-info":{"path":"input.pdf"},"pdf-open":{"path":"input.pdf","page":1,"dpi":150},
+            "new":{"width":1024,"height":768},"inspect":{},
             "apply":{"operations":[{"op":"add_layer","name":"背景"}]},"undo":{},"redo":{},
             "save":{"path":"edited.comp","overwrite":false},
             "export":{"path":"preview.png","maxSide":1024,"quality":90,"matte":[255,255,255],"overwrite":false},"close":{"discard":false}},
         "operations":crate::automation::capabilities(),"filters":crate::filters::FILTERS.iter().map(|name| json!({"name":name,"settings":crate::filters::default_settings(name)})).collect::<Vec<_>>(),
         "project":{"readVersions":[1,11],"writeVersion":11,"container":"single-file","containerVersion":1,"legacyDirectoryRead":true,"selectionPersisted":false,"historyPersisted":false},
-        "exportFormats":["png","jpeg","tiff","bmp","gif","webp"],"limits":{"requestBytes":MAX_REQUEST_BYTES,"operationsPerBatch":1000},
+        "exportFormats":["png","jpeg","tiff","bmp","gif","webp","pdf"],
+        "pdf":{"editing":"rasterized_pages","pageNumbering":"one_based","openRequires":["page","dpi"],"dpiRange":[72,600],"export":"one flattened raster page per document; maxSide preserves physical page size","liveOpen":"Use the GUI PDF import dialog; live controls existing documents only","limitations":"Original PDF text, vectors, forms and signatures are not preserved"},
+        "limits":{"requestBytes":MAX_REQUEST_BYTES,"operationsPerBatch":1000},
         "concurrency":"apply is one atomic in-memory transaction; save checks the opened source fingerprint; shared GUI changes require expectedRevision",
-        "help":"cli capabilities | fonts | inspect INPUT | new --width N --height N --output PATH.comp | apply INPUT --operations @FILE --output PATH.comp | export INPUT --output PATH.png | serve | live METHOD --params @FILE [--endpoint FILE] | skill show | skill install [--path FOLDER]"})
+        "help":"cli capabilities | fonts | pdf-info INPUT.pdf | pdf-open INPUT.pdf --page N --dpi N --output PATH.comp | inspect INPUT [--page N --dpi N] | new --width N --height N --output PATH.comp | apply INPUT --operations @FILE --output PATH.comp [--page N --dpi N] | export INPUT --output PATH.png|PATH.pdf [--page N --dpi N] | serve | live METHOD --params @FILE [--endpoint FILE] | skill show | skill install [--path FOLDER]"})
 }
 
 #[derive(Deserialize)]
@@ -624,6 +762,9 @@ impl Arguments {
             })
             .transpose()
     }
+    fn open_params(&mut self, path: &Path) -> Result<Value> {
+        Ok(json!({"path":path,"page":self.number("page")?,"dpi":self.number("dpi")?}))
+    }
 }
 fn json_input(value: OsString) -> Result<Value> {
     let text = value.to_str().context("JSON 参数不是 UTF-8")?;
@@ -657,11 +798,29 @@ fn one_shot(command: &str, args: Vec<OsString>) -> Result<Value> {
             args.finish()?;
             Ok(capabilities())
         }
-        "inspect" => {
+        "pdf-info" => {
             let input = args.input()?;
             args.finish()?;
+            pdf_info(&input)
+        }
+        "pdf-open" => {
+            let input = args.input()?;
+            let output = PathBuf::from(args.required("output")?);
+            let params = args.open_params(&input)?;
+            let overwrite = args.take("overwrite").is_some();
+            args.finish()?;
             let mut s = Session::default();
-            s.request("open", json!({"path":input}))
+            let opened = s.request("pdf-open", params)?;
+            let warnings = opened["warnings"].clone();
+            let saved = s.request("save", json!({"path":output,"overwrite":overwrite}))?;
+            Ok(json!({"opened":opened,"saved":saved,"warnings":warnings}))
+        }
+        "inspect" => {
+            let input = args.input()?;
+            let params = args.open_params(&input)?;
+            args.finish()?;
+            let mut s = Session::default();
+            s.request("open", params)
         }
         "new" => {
             let width = args.number("width")?.context("缺少 --width")?;
@@ -681,9 +840,10 @@ fn one_shot(command: &str, args: Vec<OsString>) -> Result<Value> {
             let expected = args
                 .take("expected-fingerprint")
                 .map(|s| s.to_string_lossy().into_owned());
+            let params = args.open_params(&input)?;
             args.finish()?;
             let mut s = Session::default();
-            let opened = s.request("open", json!({"path":input}))?;
+            let opened = s.request("open", params)?;
             if expected
                 .as_ref()
                 .is_some_and(|hash| opened["fingerprint"].as_str() != Some(hash))
@@ -701,9 +861,10 @@ fn one_shot(command: &str, args: Vec<OsString>) -> Result<Value> {
             let quality = args.number("quality")?.unwrap_or(90);
             ensure!(quality <= 100 && quality > 0, "quality 范围是 1–100");
             let overwrite = args.take("overwrite").is_some();
+            let params = args.open_params(&input)?;
             args.finish()?;
             let mut s = Session::default();
-            s.request("open", json!({"path":input}))?;
+            s.request("open", params)?;
             s.request(
                 "export",
                 json!({"path":output,"maxSide":max_side,"quality":quality,"overwrite":overwrite}),
@@ -1011,5 +1172,163 @@ mod tests {
         let err = s.request("save", json!({"path":path})).unwrap_err();
         assert_eq!(failure(Value::Null, &err)["error"]["code"], "conflict");
         assert_eq!(project::load(&path).unwrap().layers[0].name, "external");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pdf_requires_explicit_page_and_dpi_without_replacing_the_session() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("两页.pdf");
+        pdf_io::export_pages(
+            &path,
+            [
+                Ok((
+                    Raster::solid(36, 18, [10, 180, 30, 255]),
+                    pdf_io::PdfPageSize {
+                        width_points: 36.,
+                        height_points: 18.,
+                    },
+                )),
+                Ok((
+                    Raster::solid(36, 18, [220, 20, 40, 255]),
+                    pdf_io::PdfPageSize {
+                        width_points: 36.25,
+                        height_points: 18.5,
+                    },
+                )),
+            ],
+        )
+        .unwrap();
+        let information = pdf_info(&path).unwrap();
+        assert_eq!(information["pageCount"], 2);
+        assert_eq!(information["pages"][1]["page"], 2);
+        let mut s = Session::default();
+        s.request("new", json!({"width":8,"height":9})).unwrap();
+        let before = s.opened().unwrap().document.clone();
+        let missing_page = s.request("open", json!({"path":path})).unwrap_err();
+        assert_eq!(
+            failure(Value::Null, &missing_page)["error"]["code"],
+            "pdf_page_required"
+        );
+        assert!(missing_page.to_string().contains("2 页"));
+        assert_eq!(s.opened().unwrap().document, before);
+        let missing_dpi = s
+            .request("open", json!({"path":path,"page":2}))
+            .unwrap_err();
+        assert_eq!(
+            failure(Value::Null, &missing_dpi)["error"]["code"],
+            "pdf_dpi_required"
+        );
+        for params in [
+            json!({"path":path,"page":0,"dpi":150}),
+            json!({"path":path,"page":3,"dpi":150}),
+            json!({"path":path,"page":1,"dpi":71}),
+            json!({"path":path,"page":1,"dpi":601}),
+        ] {
+            assert!(s.request("open", params).is_err());
+            assert_eq!(s.opened().unwrap().document, before);
+        }
+        let opened = s
+            .request("pdf-open", json!({"path":path,"page":2,"dpi":72}))
+            .unwrap();
+        assert_eq!(opened["document"]["resolution"], 72.);
+        let selected = s
+            .opened()
+            .unwrap()
+            .document
+            .active()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .get(4, 4);
+        assert!(
+            selected[0] > 180 && selected[1] < 60,
+            "Selected page 2 must contain the red raster: {selected:?}"
+        );
+        assert!(opened["warnings"][0].as_str().unwrap().contains("第 2 页"));
+        let preview = folder.path().join("第二页预览.pdf");
+        s.request("export", json!({"path":preview,"maxSide":20}))
+            .unwrap();
+        let preview_information = pdf_io::info(&preview).unwrap();
+        assert!((preview_information.pages[0].width_points - 36.25).abs() < 0.001);
+        assert!((preview_information.pages[0].height_points - 18.5).abs() < 0.001);
+        let output = folder.path().join("第二页.comp");
+        let converted = one_shot(
+            "pdf-open",
+            vec![
+                path.into_os_string(),
+                "--page".into(),
+                "2".into(),
+                "--dpi".into(),
+                "72".into(),
+                "--output".into(),
+                output.clone().into_os_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            converted["saved"]["document"]["width"],
+            opened["document"]["width"]
+        );
+        assert_eq!(project::load(&output).unwrap().resolution, 72.);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn pdf_preview_keeps_physical_page_size_and_dirty_state() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("缩略预览.pdf");
+        let mut s = Session::default();
+        s.request("new", json!({"width":103,"height":77,"resolution":150}))
+            .unwrap();
+        s.request(
+            "apply",
+            json!({"operations":[{"op":"add_layer","name":"edit"}]}),
+        )
+        .unwrap();
+        let revision = s.opened().unwrap().history.revision();
+        let result = s
+            .request("export", json!({"path":path,"maxSide":40}))
+            .unwrap();
+        assert_eq!(result["format"], "pdf");
+        assert_eq!(result["width"], 40);
+        assert!(result["height"].as_u64().unwrap() < 77);
+        let information = pdf_io::info(&path).unwrap();
+        assert_eq!(information.pages.len(), 1);
+        assert!((information.pages[0].width_points - 103. * 72. / 150.).abs() < 0.001);
+        assert!((information.pages[0].height_points - 77. * 72. / 150.).abs() < 0.001);
+        assert!(s.opened().unwrap().history.is_modified());
+        assert_eq!(s.opened().unwrap().history.revision(), revision);
+        let prior_bytes = fs::read(&path).unwrap();
+        let exists = s
+            .request("export", json!({"path":path,"maxSide":20}))
+            .unwrap_err();
+        assert_eq!(
+            failure(Value::Null, &exists)["error"]["code"],
+            "already_exists"
+        );
+        assert_eq!(fs::read(path).unwrap(), prior_bytes);
+    }
+
+    #[test]
+    fn pdf_options_are_rejected_for_non_pdf_inputs() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("图像.png");
+        image_io::export_raster(
+            &Raster::solid(4, 4, [20, 30, 40, 255]),
+            &path,
+            "png",
+            72.,
+            90,
+            [255; 3],
+        )
+        .unwrap();
+        let mut s = Session::default();
+        let err = s
+            .request("open", json!({"path":path,"page":1,"dpi":150}))
+            .unwrap_err();
+        assert!(err.to_string().contains("仅用于 PDF"));
+        assert!(s.opened.is_none());
     }
 }

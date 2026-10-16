@@ -4,6 +4,8 @@ param(
     [string]$CompilerPath,
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
     [string]$PackageName = 'Compositor-Windows-zh-CN-original-ui',
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,100}\.exe$')]
+    [string]$InstallerName = 'Compositor-Windows-Setup-x64.exe',
     [string]$RecordDirectory = 'build\validation\current',
     [ValidatePattern('^$|^Compositor-QA-[a-f0-9]{12}$')]
     [string]$QaName = ''
@@ -68,7 +70,7 @@ $importPolicy = $runtime.windows10ImportPolicy
 if ($null -eq $importPolicy -or $importPolicy.passed -ne $true -or @($importPolicy.forbiddenImportsFound).Count -ne 0) {
     throw 'The runtime audit found imports outside the Windows 10 API baseline.'
 }
-$python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+$python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 # The EXE contains full originals, including this exact compiler's copyright.
 $licenseResult = & $python -B -X utf8 (Join-Path $root 'generate-open-source-licenses.py') --check --verify-exe (Join-Path $payload 'compositor.exe') --verify-package-index (Join-Path $payload 'LICENSES.md') --nsis-copying $compilerCopying
 if ($LASTEXITCODE -ne 0) { throw 'Embedded license, package index or official NSIS copyright verification failed.' }
@@ -88,7 +90,7 @@ foreach ($requiredInstallerPolicy in @(
         throw "Installer is missing the Windows 10/11 compatibility policy: $requiredInstallerPolicy"
     }
 }
-$outputRelative = if ($QaName) { "$RecordDirectory/$QaName-Setup.exe" } else { 'dist/Compositor-Windows-Setup-x64.exe' }
+$outputRelative = if ($QaName) { "$RecordDirectory/$QaName-Setup.exe" } else { "dist/$InstallerName" }
 $output = Resolve-ProjectPath $root $outputRelative
 if (Test-Path -LiteralPath $output) { throw 'An existing setup executable is retained. Move it to a review record before rebuilding.' }
 $definePath = Join-Path $record "installer-$mode.nsh"

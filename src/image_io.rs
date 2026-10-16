@@ -78,6 +78,29 @@ pub fn is_raw(path: &Path) -> bool {
 }
 
 pub fn import(path: &Path) -> Result<ImportResult> {
+    if ext(path) == "pdf" {
+        let info = crate::pdf_io::info(path)?;
+        ensure!(
+            info.pages.len() == 1,
+            "这是多页 PDF，请在打开窗口选择页面，或使用 CLI 的 --page 指定页码"
+        );
+        let mut page = crate::pdf_io::render_pages(path, &[0], 300)?;
+        let page = page.pop().context("PDF 没有可导入页面")?;
+        let mut document = Document::new(page.raster.width, page.raster.height);
+        document.resolution = 300.;
+        let layer = Layer::raster(
+            path.file_stem().unwrap_or_default().to_string_lossy(),
+            page.raster,
+        );
+        document.active_layer_id = Some(layer.id);
+        document.layers = vec![layer];
+        return Ok(ImportResult {
+            document,
+            conversions: vec![
+                "PDF 已按 300 DPI 转为图片；文字、链接和表单不再保留为 PDF 对象".into(),
+            ],
+        });
+    }
     if path.is_dir() || ext(path) == "comp" {
         return Ok(ImportResult {
             document: crate::project::load(path)?,
@@ -187,6 +210,19 @@ fn convert_icc(profile: &[u8], pixels: &mut [u8]) -> Result<()> {
 }
 
 pub fn decode_svg(path: &Path, fitting: Option<[u32; 2]>) -> Result<Raster> {
+    let path = path.to_path_buf();
+    // usvg recursively converts nested groups and references. Keep parsing,
+    // rendering and tree destruction off Windows' default 1 MiB caller stack.
+    std::thread::Builder::new()
+        .name("svg-decode".to_owned())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || decode_svg_worker(&path, fitting))
+        .context("启动 SVG 解码线程失败")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("SVG 解码器处理图像时异常"))?
+}
+
+fn decode_svg_worker(path: &Path, fitting: Option<[u32; 2]>) -> Result<Raster> {
     ensure!(
         fs::metadata(path)?.len() <= 64 * 1024 * 1024,
         "SVG 文件超过 64 MiB"
@@ -564,6 +600,16 @@ pub fn export_raster(
         "bmp" => export_bmp(raster, path),
         "gif" => export_gif(raster, path),
         "webp" => export_webp(raster, path),
+        "pdf" => crate::pdf_io::export_pages(
+            path,
+            std::iter::once(Ok((
+                raster.clone(),
+                crate::pdf_io::PdfPageSize {
+                    width_points: f64::from(raster.width) * 72. / resolution,
+                    height_points: f64::from(raster.height) * 72. / resolution,
+                },
+            ))),
+        ),
         other => anyhow::bail!("不支持导出格式：{other}"),
     }
 }
@@ -994,6 +1040,37 @@ mod tests {
         let p = decode_svg(&path, None).unwrap().get(0, 0);
         assert_eq!(p[0], 255);
         assert!((127..=128).contains(&p[3]));
+    }
+    #[test]
+    fn svg_nested_groups_import_on_a_small_windows_caller_stack() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested.svg");
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                for depth in [384, 1000, 2048] {
+                    let xml = format!(
+                        r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2">{}<rect width="2" height="2" fill="#123456"/>{}</svg>"##,
+                        "<g>".repeat(depth),
+                        "</g>".repeat(depth)
+                    );
+                    fs::write(&path, xml).unwrap();
+                    let imported = import(&path);
+                    if depth <= 1000 {
+                        let document = imported.unwrap().document;
+                        let pixel = document.layers[0].image.as_ref().unwrap().get(0, 0);
+                        assert_eq!(pixel, [0x12, 0x34, 0x56, 255]);
+                    } else {
+                        assert!(imported.is_err());
+                    }
+                    let normal = path.with_extension("png");
+                    export_png(&Raster::solid(2, 2, [10, 20, 30, 255]), &normal, 72.0).unwrap();
+                    assert_eq!(import(&normal).unwrap().document.width, 2);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
     #[test]
     fn tiff_transparency_roundtrip() {

@@ -401,6 +401,7 @@ impl EditorApp {
 
     fn agent_interaction_busy(&self) -> bool {
         self.operation_busy()
+            || self.pdf_ui.is_open()
             || self.dialog.is_some()
             || self.color_picker.is_some()
             || self.text_color_target.is_some()
@@ -490,6 +491,8 @@ impl EditorApp {
                 "transport": "authenticated_loopback_jsonl",
                 "liveControl": true,
                 "methods": ["capabilities", "inspect", "apply", "undo", "redo", "save", "export"],
+                "exportFormats": ["png", "jpeg", "tiff", "bmp", "gif", "webp", "pdf"],
+                "pdf": {"editing":"rasterized_pages", "open":"Use the GUI PDF import dialog to select pages and DPI; live controls existing documents only", "export":"one flattened raster page per document; maxSide preserves physical page size", "limitations":"Original PDF text, vectors, forms and signatures are not preserved"},
                 "sessions": self.tabs.iter().enumerate().filter(|(_, session)| !session.placeholder)
                     .map(|(index, _)| self.agent_info(index)).collect::<Vec<_>>(),
                 "transaction": "single_undo_step",
@@ -728,9 +731,11 @@ impl EditorApp {
                         .to_ascii_lowercase()
                 });
                 ensure!(
-                    ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp"]
-                        .contains(&format.as_str()),
-                    "invalid_params: 导出 format 必须是 png、jpeg、tiff、bmp、gif 或 webp"
+                    [
+                        "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp", "pdf"
+                    ]
+                    .contains(&format.as_str()),
+                    "invalid_params: 导出 format 必须是 png、jpeg、tiff、bmp、gif、webp 或 pdf"
                 );
                 ensure!(
                     (1..=100).contains(&params.quality),
@@ -744,6 +749,7 @@ impl EditorApp {
                 );
                 let session = &self.tabs[index];
                 let document = session.doc.clone();
+                let physical_size = super::pdf_ui::page_size(session);
                 let id = session.id;
                 let revision = session.history.revision();
                 let bridge = self
@@ -772,13 +778,14 @@ impl EditorApp {
                         {
                             fs::create_dir_all(parent)?;
                         }
-                        image_io::export_raster(
+                        cli::export_document_raster(
+                            &document,
                             &raster,
                             &params.path,
                             &format,
-                            document.resolution,
                             params.quality,
                             params.matte,
+                            Some(physical_size),
                         )
                     });
                     let _ = sender.send(Event::Complete(Completion::Export {

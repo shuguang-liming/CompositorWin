@@ -4072,6 +4072,80 @@ fn headless_app() -> EditorApp {
     app
 }
 
+#[test]
+fn pdf_pages_open_as_separate_editable_tabs_with_names_sizes_and_resolution() {
+    let mut app = headless_app();
+    let size = crate::pdf_io::PdfPageSize {
+        width_points: 72.,
+        height_points: 36.,
+    };
+    let pages = (0..2)
+        .map(|index| crate::pdf_io::PdfPage {
+            raster: Raster::solid(300, 150, [index as u8 * 80, 30, 200, 255]),
+            size,
+            index,
+        })
+        .collect();
+    app.install_pdf_pages(PathBuf::from("样例.pdf"), None, 300, pages);
+    assert_eq!(app.tabs.len(), 2);
+    for (i, session) in app.tabs.iter().enumerate() {
+        assert!(session.title().contains(&format!("第 {} 页", i + 1)));
+        assert!(session.path.is_none());
+        assert_eq!(session.doc.resolution, 300.);
+        assert_eq!((session.doc.width, session.doc.height), (300, 150));
+    }
+    let before = app.session().doc.clone();
+    app.session_mut().edit("PDF page edit", |doc| {
+        doc.active_mut().unwrap().opacity = 0.5
+    });
+    assert!(app.session().history.is_modified());
+    let session = app.session_mut();
+    assert!(session.history.undo(&mut session.doc));
+    assert_eq!(session.doc, before);
+}
+
+#[test]
+fn pdf_multiple_pages_are_rejected_atomically_for_import_as_layer() {
+    let mut app = headless_app();
+    app.install_canvas_session(Session::new(Document::new(20, 20), None));
+    let target = app.session().id;
+    let before = app.session().doc.clone();
+    let pages = (0..2)
+        .map(|index| crate::pdf_io::PdfPage {
+            raster: Raster::solid(20, 20, [255; 4]),
+            size: crate::pdf_io::PdfPageSize {
+                width_points: 20.,
+                height_points: 20.,
+            },
+            index,
+        })
+        .collect();
+    app.install_pdf_pages(PathBuf::from("two.pdf"), Some(target), 72, pages);
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.session().doc, before);
+    assert!(app.message.as_deref().unwrap().contains("请选择一页"));
+}
+
+#[test]
+fn closing_waits_until_background_file_output_is_complete() {
+    let mut app = headless_app();
+    app.window_motion = crate::window_motion::WindowMotion::with_animations(true);
+    app.pending_io = 1;
+    app.exit_pending = true;
+    let ctx = egui::Context::default();
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        app.handle_window_close(ctx)
+    });
+    assert!(!app.window_close_ready());
+    assert!(!app.window_motion.is_closing());
+    app.pending_io = 0;
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        app.handle_window_close(ctx)
+    });
+    assert!(app.window_close_ready());
+    assert!(app.window_motion.is_closing());
+}
+
 fn welcome_enter(app: &mut EditorApp) {
     let context = egui::Context::default();
     let input = egui::RawInput {
@@ -4148,6 +4222,34 @@ fn welcome_return_waits_for_pending_io_and_open_dialog() {
     app.dialog = None;
     welcome_enter(&mut app);
     assert_ne!(app.session().id, placeholder);
+}
+
+#[test]
+fn welcome_return_waits_for_pdf_import_dialog_and_resumes_after_cancel() {
+    let mut app = headless_app();
+    let placeholder = app.session().id;
+    app.pdf_ui.enqueue(
+        PathBuf::from("pending.pdf"),
+        None,
+        crate::pdf_io::PdfInfo {
+            pages: vec![crate::pdf_io::PdfPageSize {
+                width_points: 72.,
+                height_points: 72.,
+            }],
+        },
+    );
+    let context = egui::Context::default();
+    let _ = context.run(egui::RawInput::default(), |context| {
+        app.pdf_dialogs(context);
+    });
+    assert!(app.pdf_ui.is_open());
+    welcome_enter(&mut app);
+    assert_eq!(app.session().id, placeholder);
+    assert!(app.is_welcome());
+    app.pdf_ui.cancel();
+    welcome_enter(&mut app);
+    assert_ne!(app.session().id, placeholder);
+    assert!(!app.is_welcome());
 }
 
 #[test]

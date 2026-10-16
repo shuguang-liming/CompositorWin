@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="110" height="26" role="img" aria-label="App license: MIT">
+  <title>App license: MIT</title>
+  <rect width="110" height="26" rx="6" fill="#eeeaf5"/>
+  <path d="M13 7h7v12h-9V9zm0 0v3h-2m3 3h4m-4 3h4" fill="none" stroke="#796493" stroke-width="1.2" stroke-linejoin="round"/>
+  <text x="29" y="17" fill="#67517f" font-family="Segoe UI,Arial,sans-serif" font-size="11" font-weight="600">App · MIT</text>
+</svg>

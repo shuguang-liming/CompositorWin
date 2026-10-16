@@ -42,6 +42,8 @@ mod welcome_ui;
 mod agent_bridge;
 #[path = "import_worker.rs"]
 mod import_worker;
+#[path = "pdf_ui.rs"]
+mod pdf_ui;
 #[path = "theme_settings.rs"]
 mod theme_settings;
 
@@ -151,6 +153,8 @@ struct Session {
     doc: Document,
     history: History,
     path: Option<PathBuf>,
+    display_name: Option<String>,
+    pdf_size: Option<(u32, u32, f64, crate::pdf_io::PdfPageSize)>,
     selected: HashSet<Uuid>,
     /// Physical screen pixels per document pixel (1.0 is actual size at any DPI).
     zoom: f32,
@@ -185,6 +189,8 @@ impl Session {
             doc,
             history: History::default(),
             path,
+            display_name: None,
+            pdf_size: None,
             selected,
             zoom: 0.,
             pixels_per_point: 1.,
@@ -216,6 +222,7 @@ impl Session {
                 .as_ref()
                 .and_then(|p| p.file_stem())
                 .map(|p| p.to_string_lossy().to_string())
+                .or_else(|| self.display_name.clone())
                 .unwrap_or_else(|| "未命名".into()),
             if self.history.is_modified() { " *" } else { "" }
         )
@@ -241,6 +248,17 @@ impl Session {
     }
 }
 enum Worker {
+    PdfInfo {
+        path: PathBuf,
+        target: Option<Uuid>,
+        result: Result<crate::pdf_io::PdfInfo, String>,
+    },
+    PdfOpen {
+        path: PathBuf,
+        target: Option<Uuid>,
+        dpi: u32,
+        result: Result<Vec<crate::pdf_io::PdfPage>, String>,
+    },
     DiskChanged {
         target: WatchTarget,
         stamp: u64,
@@ -398,6 +416,7 @@ enum Command {
     ExportJpeg,
     ExportTiff,
     ExportOther,
+    ExportPdf,
     Undo,
     Redo,
     Close,
@@ -616,6 +635,7 @@ pub struct EditorApp {
     receiver: mpsc::Receiver<Worker>,
     pending_io: usize,
     imports: import_worker::ImportQueue,
+    pdf_ui: pdf_ui::PdfUi,
     busy_since: Option<Instant>,
     segment_sender: mpsc::Sender<SegmentRequest>,
     tool: Tool,
@@ -2059,6 +2079,7 @@ impl EditorApp {
             receiver,
             pending_io: 0,
             imports: import_worker::ImportQueue::default(),
+            pdf_ui: pdf_ui::PdfUi::default(),
             busy_since: None,
             segment_sender,
             tool: Tool::Move,
@@ -2276,6 +2297,13 @@ impl EditorApp {
         self.open_target(path, target);
     }
     fn open_target(&mut self, path: PathBuf, target: Option<Uuid>) {
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            self.open_pdf(path, target);
+            return;
+        }
         if target.is_none()
             && let Some(index) = self
                 .tabs
@@ -2392,6 +2420,7 @@ impl EditorApp {
             .add_filter("BMP 图像", &["bmp"])
             .add_filter("GIF 图像", &["gif"])
             .add_filter("WebP 图像", &["webp"])
+            .add_filter("PDF 文档（当前页面）", &["pdf"])
             .set_file_name(format!(
                 "{}.png",
                 self.session().title().trim_end_matches(" *")
@@ -2406,7 +2435,7 @@ impl EditorApp {
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
         let extension = match extension.as_str() {
-            "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "gif" | "webp" => extension,
+            "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "gif" | "webp" | "pdf" => extension,
             _ => {
                 path.set_extension("png");
                 "png".to_owned()
@@ -2416,6 +2445,11 @@ impl EditorApp {
     }
     fn export_to_path(&mut self, extension: String, path: PathBuf) {
         let d = self.session().doc.clone();
+        let pdf_size = pdf_ui::page_size(self.session());
+        if extension == "pdf" {
+            self.start_pdf_export(vec![(d, pdf_size)], path);
+            return;
+        }
         let sender = self.sender.clone();
         let matte = [self.jpeg_matte[0], self.jpeg_matte[1], self.jpeg_matte[2]];
         let quality = self.jpeg_quality;
@@ -2433,6 +2467,29 @@ impl EditorApp {
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
+                Worker::PdfInfo {
+                    path,
+                    target,
+                    result,
+                } => {
+                    self.pending_io = self.pending_io.saturating_sub(1);
+                    match result {
+                        Ok(info) => self.pdf_ui.enqueue(path, target, info),
+                        Err(error) => self.message = Some(error),
+                    }
+                }
+                Worker::PdfOpen {
+                    path,
+                    target,
+                    dpi,
+                    result,
+                } => {
+                    self.pending_io = self.pending_io.saturating_sub(1);
+                    match result {
+                        Ok(pages) => self.install_pdf_pages(path, target, dpi, pages),
+                        Err(error) => self.message = Some(error),
+                    }
+                }
                 Worker::DiskChanged { target, stamp } => {
                     if self.tabs.iter().any(|s| {
                         s.id == target.id
@@ -2989,6 +3046,7 @@ impl EditorApp {
                             ("导出 JPEG…", Command::ExportJpeg),
                             ("导出 TIFF…", Command::ExportTiff),
                             ("导出其他格式…", Command::ExportOther),
+                            ("导出 PDF（可合并多页）…", Command::ExportPdf),
                             ("关闭      Ctrl+W", Command::Close),
                         ] {
                             if ui
@@ -3288,6 +3346,9 @@ impl EditorApp {
         {
             return vec![];
         }
+        if self.pdf_ui.is_open() {
+            return vec![];
+        }
         let accepts_clipboard = !ctx.wants_keyboard_input() && self.color_picker.is_none();
         ctx.input_mut(|input| {
             adapt_native_clipboard(input, &mut self.paste_key_handled, accepts_clipboard);
@@ -3547,7 +3608,7 @@ impl EditorApp {
                         &[
                             "comp", "json", "png", "jpg", "jpeg", "tif", "tiff", "svg", "psd",
                             "psb", "dng", "nef", "cr2", "cr3", "arw", "raf", "rw2", "orf", "heic",
-                            "heif", "bmp", "gif", "webp",
+                            "heif", "bmp", "gif", "webp", "pdf",
                         ],
                     )
                     .pick_file()
@@ -3572,6 +3633,7 @@ impl EditorApp {
             Command::ExportPng => self.export("png"),
             Command::ExportTiff => self.export("tif"),
             Command::ExportOther => self.export_other(),
+            Command::ExportPdf => self.begin_pdf_export(),
             Command::ExportJpeg => {
                 self.begin_dialog(Dialog::Jpeg);
                 self.preview_key = None;
@@ -6173,6 +6235,7 @@ impl EditorApp {
         }
     }
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.pdf_dialogs(ctx);
         if let Some(dialog) = self.dialog.clone() {
             if self.dialog_target.is_none() {
                 self.dialog_target = Some(self.dialog_destination(&dialog));
@@ -7335,7 +7398,17 @@ impl EditorApp {
                 self.message = Some("Apply or cancel the open dialog to finish closing".into());
             }
         }
-        if self.exit_pending && self.close_pending.is_none() && self.dialog.is_none() {
+        if self.exit_pending {
+            self.pdf_ui.cancel();
+        }
+        if self.exit_pending && self.pending_io > 0 {
+            self.message = Some("正在等待文件读写完成后关闭…".into());
+        }
+        if self.exit_pending
+            && self.close_pending.is_none()
+            && self.dialog.is_none()
+            && self.pending_io == 0
+        {
             if self.drag.is_some()
                 || self.guide_drag.is_some()
                 || self.gradient_handle.is_some()
@@ -7354,7 +7427,8 @@ impl EditorApp {
     }
 
     fn window_close_ready(&self) -> bool {
-        self.close_pending.is_none()
+        self.pending_io == 0
+            && self.close_pending.is_none()
             && self.dialog.is_none()
             && self.drag.is_none()
             && self.guide_drag.is_none()
