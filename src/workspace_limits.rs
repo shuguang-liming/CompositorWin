@@ -86,7 +86,28 @@ fn budget_for_memory(physical_bytes: Option<u64>) -> u64 {
 /// One third of installed RAM, bounded to 256 MiB..6 GiB; 512 MiB if detection fails.
 /// The remainder covers the OS, GPU/preview caches and temporary decoding/rendering buffers.
 pub fn workspace_budget_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(budget) = TEST_WORKSPACE_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
     budget_for_memory(physical_memory_bytes())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_WORKSPACE_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_workspace_budget<T>(budget: u64, operation: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_WORKSPACE_BUDGET.with(|value| value.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_WORKSPACE_BUDGET.with(|value| value.replace(Some(budget))));
+    operation()
 }
 
 /// `retained_history_bytes` is an upper bound supplied by the session histories.

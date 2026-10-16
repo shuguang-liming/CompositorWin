@@ -5,7 +5,7 @@ use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader};
 use rayon::prelude::*;
 use std::{
     fs::{self, File},
-    io::{BufReader, Cursor, Read, Write},
+    io::{BufReader, Cursor, Read, Seek, Write},
     path::Path,
 };
 use uuid::Uuid;
@@ -290,15 +290,40 @@ fn develop_raw_worker(
             && (0.0..=2.0).contains(&settings.boost),
         "RAW 显影参数无效"
     );
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Keep preflight and decoding on the same file, without a concurrent
+        // writer or path replacement invalidating the checked sensor layout.
+        options.share_mode(1); // FILE_SHARE_READ
+    }
+    let mut file = options.open(path)?;
     ensure!(
-        fs::metadata(path)?.len() <= 512 * 1024 * 1024,
+        file.metadata()?.len() <= 512 * 1024 * 1024,
         "RAW 编码文件超过 512 MiB"
     );
-    let dummy =
-        rawloader::decode_dummy(&mut File::open(path)?).context("不支持此 RAW 相机或压缩格式")?;
-    size(u32::try_from(dummy.width)?, u32::try_from(dummy.height)?)?;
-    let raw = rawloader::decode_file(path)?;
+    let dummy = rawloader::decode_dummy(&mut file).context("不支持此 RAW 相机或压缩格式")?;
+    // Unsupported component counts must be rejected before rawloader allocates
+    // width * height * cpp samples; an allocation abort bypasses thread joining.
+    raw_sample_count(&dummy)?;
+    file.rewind()?;
+    let raw = rawloader::decode(&mut file)?;
     develop_sensor(&raw, settings, limit)
+}
+
+fn raw_sample_count(raw: &rawloader::RawImage) -> Result<usize> {
+    size(u32::try_from(raw.width)?, u32::try_from(raw.height)?)?;
+    ensure!(raw.cpp == 1 || raw.cpp == 3, "不支持此 RAW 分量数量");
+    ensure!(
+        raw.cpp == 3 || raw.cfa.is_valid(),
+        "RAW 没有可支持的彩色滤光阵列"
+    );
+    raw.width
+        .checked_mul(raw.height)
+        .and_then(|n| n.checked_mul(raw.cpp))
+        .context("RAW 尺寸溢出")
 }
 
 fn develop_sensor(
@@ -306,17 +331,7 @@ fn develop_sensor(
     settings: RawDevelopSettings,
     limit: Option<u32>,
 ) -> Result<Raster> {
-    size(u32::try_from(raw.width)?, u32::try_from(raw.height)?)?;
-    ensure!(raw.cpp == 1 || raw.cpp == 3, "不支持此 RAW 分量数量");
-    ensure!(
-        raw.cpp == 3 || raw.cfa.is_valid(),
-        "RAW 没有可支持的彩色滤光阵列"
-    );
-    let expected = raw
-        .width
-        .checked_mul(raw.height)
-        .and_then(|n| n.checked_mul(raw.cpp))
-        .context("RAW 尺寸溢出")?;
+    let expected = raw_sample_count(raw)?;
     ensure!(
         match &raw.data {
             rawloader::RawImageData::Integer(v) => v.len() >= expected,
@@ -854,6 +869,29 @@ fn decode_wic(path: &Path) -> Result<Raster> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_import_rejects_excess_components_before_sensor_allocation_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("异常分量.dng");
+        fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/raw/unsupported-components.dng"),
+        )
+        .unwrap();
+        let error = import(&path).err().unwrap().to_string();
+        assert!(error.contains("RAW 分量数量"), "{error}");
+        for fixture in [
+            include_bytes!("../tests/fixtures/raw/bayer.dng").as_slice(),
+            include_bytes!("../tests/fixtures/raw/linear-rgb.dng").as_slice(),
+        ] {
+            fs::write(&path, fixture).unwrap();
+            let document = import(&path).unwrap().document;
+            assert_eq!((document.width, document.height), (8, 8));
+            let image = document.layers[0].image.as_ref().unwrap();
+            assert_eq!(image.get(0, 0)[3], 255);
+            assert!(image.get(0, 0)[..3].iter().any(|&v| v > 0));
+        }
+    }
     #[test]
     fn pixel_allocation_rejects_overflow_without_aborting() {
         assert!(zeroed_bytes(u32::MAX, u32::MAX, u64::MAX, "图像测试").is_err());

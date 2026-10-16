@@ -131,7 +131,7 @@ enum Completion {
 pub(super) struct AgentBridge {
     receiver: mpsc::Receiver<Event>,
     sender: mpsc::SyncSender<Event>,
-    context: egui::Context,
+    context: Arc<Mutex<Option<egui::Context>>>,
     engine: Arc<Mutex<automation::Engine>>,
     stopped: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
@@ -142,6 +142,7 @@ pub(super) struct AgentBridge {
 
 impl AgentBridge {
     pub(super) fn start(context: egui::Context) -> Result<Self> {
+        let context = Arc::new(Mutex::new(Some(context)));
         let listener = TcpListener::bind(("127.0.0.1", 0)).context("绑定本机 Agent 接口")?;
         listener.set_nonblocking(true)?;
         let token = Uuid::new_v4().to_string();
@@ -178,7 +179,11 @@ impl AgentBridge {
                         let stopped = accept_stopped.clone();
                         let token = accept_token.clone();
                         thread::spawn(move || {
-                            let _ = serve_connection(stream, &token, &sender, &context, &stopped);
+                            if let Err(error) =
+                                serve_connection(stream, &token, &sender, &context, &stopped)
+                            {
+                                log::warn!("Local Agent connection {peer} failed: {error:#}");
+                            }
                             active.fetch_sub(1, Ordering::AcqRel);
                         });
                     }
@@ -200,6 +205,10 @@ impl AgentBridge {
             token,
             observed_sessions: Default::default(),
         })
+    }
+
+    pub(super) fn bind_context(&mut self, context: egui::Context) {
+        *self.context.lock().unwrap_or_else(|e| e.into_inner()) = Some(context);
     }
 }
 
@@ -229,15 +238,21 @@ fn serve_connection(
     mut stream: TcpStream,
     token: &str,
     sender: &mpsc::SyncSender<Event>,
-    context: &egui::Context,
+    context: &Mutex<Option<egui::Context>>,
     stopped: &AtomicBool,
 ) -> Result<()> {
+    // Windows can inherit the listener's nonblocking mode. The JSONL reader
+    // must wait for delayed/fragmented requests instead of closing on WouldBlock.
+    stream
+        .set_nonblocking(false)
+        .context("设置 Agent 连接为阻塞读取")?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut bytes = Vec::new();
     let length = BufReader::new(stream.try_clone()?)
         .take(REQUEST_LIMIT + 1)
-        .read_until(b'\n', &mut bytes)?;
+        .read_until(b'\n', &mut bytes)
+        .context("读取 Agent JSONL 请求")?;
     let response = if length as u64 > REQUEST_LIMIT {
         protocol_error(Value::Null, "request_too_large", "Agent 请求超过 4 MiB")
     } else if bytes.last() != Some(&b'\n') {
@@ -271,7 +286,7 @@ fn serve_connection(
                         protocol_error(id, "gui_busy", "Agent 请求队列已满，请稍后重试")
                     }
                     Ok(()) => {
-                        context.request_repaint();
+                        super::wake_renderer(context);
                         let started = Instant::now();
                         loop {
                             match receiver.recv_timeout(Duration::from_millis(100)) {
@@ -305,9 +320,9 @@ fn serve_connection(
             }
         }
     };
-    serde_json::to_writer(&mut stream, &response)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    serde_json::to_writer(&mut stream, &response).context("写入 Agent JSON 响应")?;
+    stream.write_all(b"\n").context("写入 Agent 响应结束符")?;
+    stream.flush().context("发送 Agent 响应")?;
     Ok(())
 }
 
@@ -536,7 +551,7 @@ impl EditorApp {
                         Err(error) => result["fingerprintError"] = json!(format!("{error:#}")),
                     }
                     let _ = sender.send(Event::Complete(Completion::Inspect { request, result }));
-                    context.request_repaint();
+                    super::wake_renderer(&context);
                 });
                 Ok(None)
             }
@@ -617,7 +632,7 @@ impl EditorApp {
                         before: Box::new(before),
                         result,
                     }));
-                    context.request_repaint();
+                    super::wake_renderer(&context);
                 });
                 Ok(None)
             }
@@ -706,7 +721,7 @@ impl EditorApp {
                         path,
                         result,
                     }));
-                    context.request_repaint();
+                    super::wake_renderer(&context);
                 });
                 Ok(None)
             }
@@ -795,7 +810,7 @@ impl EditorApp {
                         path: params.path,
                         result,
                     }));
-                    context.request_repaint();
+                    super::wake_renderer(&context);
                 });
                 Ok(None)
             }
@@ -951,6 +966,85 @@ fn background_result<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn nonblocking_accepted_connection_waits_for_delayed_and_fragmented_jsonl() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "Loopback accept timed out");
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("Loopback accept failed: {error}"),
+            }
+        };
+        // Force the Windows inheritance condition on every platform. The client
+        // sends no bytes until the server has demonstrably waited for them.
+        accepted.set_nonblocking(true).unwrap();
+        assert_eq!(
+            accepted.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let (requests, receiver) = mpsc::sync_channel(1);
+        let (started, start) = mpsc::channel();
+        let (finished, finish) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = serve_connection(
+                accepted,
+                "delayed-request-token",
+                &requests,
+                &Mutex::new(None),
+                &AtomicBool::new(false),
+            )
+            .map_err(|error| format!("{error:#}"));
+            finished.send(result).unwrap();
+        });
+        start.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(
+                finish.recv_timeout(Duration::from_millis(150)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "The server must wait while a connected client has not sent its request"
+        );
+        client
+            .write_all(br#"{"token":"delayed-request-token","id":73,"method":"capab"#)
+            .unwrap();
+        assert!(
+            matches!(
+                finish.recv_timeout(Duration::from_millis(150)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "The server must also wait for the rest of a fragmented request"
+        );
+        client.write_all(b"ilities\",\"params\":{}}\n").unwrap();
+        let Event::Request(request) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() else {
+            panic!("The delayed JSONL request must reach the GUI request queue");
+        };
+        assert_eq!(request.id, json!(73));
+        assert_eq!(request.method, "capabilities");
+        assert_eq!(request.params, json!({}));
+        let expected = json!({"protocolVersion":1,"id":73,"ok":true,"result":{"received":true}});
+        request.reply.send(expected.clone()).unwrap();
+        let mut response = String::new();
+        BufReader::new(client).read_line(&mut response).unwrap();
+        assert!(response.ends_with('\n'));
+        assert_eq!(serde_json::from_str::<Value>(&response).unwrap(), expected);
+        finish
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    }
+
     fn editor() -> EditorApp {
         let mut app = EditorApp::create(None, None);
         app.tabs = vec![super::super::Session::new(Document::new(8, 8), None)];
@@ -981,6 +1075,68 @@ mod tests {
             result: Ok(Box::new((document, json!({"results":[]})))),
         };
         (completion, receiver, guard)
+    }
+
+    #[test]
+    fn renderer_rebind_retains_the_live_agent_endpoint_and_in_flight_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = editor();
+        app.tabs[0].edit("User edit", |doc| doc.resolution = 144.);
+        let before = app.tabs[0].doc.clone();
+        let mut after = before.clone();
+        after.layers[0].name = "恢复后提交的 Agent 修改".into();
+        let (completion, response, guard) = completion(&mut app, after.clone());
+        let (sender, receiver) = mpsc::sync_channel(CONNECTION_LIMIT * 2);
+        let producer = sender.clone();
+        let engine = Arc::new(Mutex::new(automation::Engine::default()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let endpoint_path = directory.path().join("agent.json");
+        let token = Uuid::new_v4().to_string();
+        let endpoint_bytes = serde_json::to_vec(&json!({"token":token})).unwrap();
+        fs::write(&endpoint_path, &endpoint_bytes).unwrap();
+        app.agent_bridge = Some(AgentBridge {
+            receiver,
+            sender,
+            context: Arc::new(Mutex::new(Some(egui::Context::default()))),
+            engine: engine.clone(),
+            stopped: stopped.clone(),
+            listener: None,
+            endpoint_path: endpoint_path.clone(),
+            token: token.clone(),
+            observed_sessions: Default::default(),
+        });
+        let context = egui::Context::default();
+        let marker = egui::Id::new("agent-replacement-context");
+        context.data_mut(|data| data.insert_temp(marker, 23_u32));
+        app.recover_renderer(&eframe::CreationContext::_new_kittest(context));
+        let bridge = app.agent_bridge.as_ref().unwrap();
+        assert!(!stopped.load(Ordering::Acquire));
+        assert_eq!(bridge.token, token);
+        assert!(Arc::ptr_eq(&bridge.engine, &engine));
+        assert_eq!(fs::read(endpoint_path).unwrap(), endpoint_bytes);
+        assert_eq!(
+            bridge
+                .context
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .data(|data| data.get_temp::<u32>(marker)),
+            Some(23)
+        );
+        assert!(guard.pending().is_ok());
+        // This sender was captured by a worker before the native renderer failed.
+        producer.send(Event::Complete(completion)).unwrap();
+        app.poll_agent();
+        let result = response.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["result"]["historyRecorded"], true);
+        assert_eq!(app.tabs[0].doc, after);
+        assert!(!app.tabs[0].edit_busy);
+        let session = &mut app.tabs[0];
+        assert!(session.history.undo(&mut session.doc));
+        assert_eq!(session.doc, before);
+        assert_eq!(session.history.undo_name(), Some("User edit"));
     }
 
     #[test]

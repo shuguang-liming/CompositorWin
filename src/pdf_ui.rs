@@ -132,17 +132,9 @@ impl EditorApp {
             }
             // Check the entire batch before adding any tabs; an oversized PDF
             // must leave the existing workspace intact.
-            let histories = self
-                .tabs
-                .iter()
-                .map(|s| s.history.retained_bytes(&s.doc) as u64)
-                .sum::<u64>();
-            crate::workspace_limits::ensure_workspace_budget(
-                self.tabs
-                    .iter()
-                    .map(|s| &s.doc)
-                    .chain(sessions.iter().map(|s| &s.doc)),
-                histories,
+            self.check_workspace_documents(
+                sessions.iter().map(|s| &s.doc),
+                self.retained_sampler_bytes(),
             )?;
             if let Some(target) = target {
                 let session = sessions.pop().context("PDF 页面为空")?;

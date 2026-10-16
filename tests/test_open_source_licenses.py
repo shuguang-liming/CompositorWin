@@ -1,20 +1,30 @@
 """Byte preservation and fail-closed checks for embedded license packaging."""
 import contextlib
 import hashlib
-import importlib.util
 import io
 import json
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("embedded_licenses", ROOT / "generate-open-source-licenses.py")
-GENERATOR = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(GENERATOR)
+def load_project_tool(name):
+    # Test the same readable source and in-memory loader used by project.ps1.
+    script = (ROOT / "project.ps1").read_text(encoding="utf-8-sig")
+    bootstrap = re.search(r"(?ms)^# <PROJECT-PYTHON-BOOTSTRAP>\n\$script:ProjectPythonBootstrap = @'\n(.*?)\n'@\n# </PROJECT-PYTHON-BOOTSTRAP>", script).group(1)
+    loader = types.ModuleType("project_loader")
+    with patch.object(sys, "argv", ["project-loader", str(ROOT)]):
+        exec(compile(bootstrap, str(ROOT / "project.ps1") + "::bootstrap", "exec"), loader.__dict__)
+    return loader.project_module(name)
+
+
+GENERATOR = load_project_tool("generate-open-source-licenses")
 
 
 class EmbeddedLicenseTests(unittest.TestCase):
@@ -30,7 +40,7 @@ class EmbeddedLicenseTests(unittest.TestCase):
         self.directory = Path(self.temporary.name)
 
     def run_cli(self, *arguments):
-        return subprocess.run([sys.executable, "-B", "-X", "utf8", str(ROOT / "generate-open-source-licenses.py"), *map(str, arguments)], cwd=ROOT, capture_output=True, encoding="utf-8")
+        return subprocess.run([shutil.which("pwsh") or shutil.which("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "project.ps1"), "GenerateLicenses", "-PythonPath", sys.executable, *map(str, arguments)], cwd=ROOT, capture_output=True, encoding="utf-8")
 
     def test_all_originals_and_compiler_notices_are_byte_exact(self):
         index, bundle = GENERATOR.unpack(self.resource)
@@ -43,12 +53,30 @@ class EmbeddedLicenseTests(unittest.TestCase):
         self.assertIn("installer-licenses/NSIS-3.11-COPYING.txt", self.originals)
 
     def test_current_application_row_does_not_repeat_historical_self_notice(self):
-        self.assertEqual(self.index["components"][0]["version"], "0.0.1")
+        application = self.index["components"][0]
+        package = GENERATOR.tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]
+        self.assertEqual(application["name"], "CompositorWin")
+        self.assertEqual(application["version"], package["version"])
+        self.assertEqual(application["license"], "Apache-2.0")
+        self.assertEqual(application["repository"], "https://github.com/shuguang-liming/CompositorWin")
+        self.assertEqual(self.originals["CompositorWin-LICENSE.md"], (ROOT / "LICENSE.md").read_bytes())
+        self.assertEqual([self.index["originals"][source]["path"] for source in application["originals"]], ["CompositorWin-LICENSE.md"])
+        original = self.index["components"][1]
+        self.assertEqual(original["license"], "MIT")
+        self.assertEqual([self.index["originals"][source]["path"] for source in original["originals"]], ["LICENSE"])
+        self.assertIn(b"Copyright (c) 2026 Wonder Assembly LLC", self.originals["LICENSE"])
         self.assertFalse(any(component["name"] == "compositor-windows" for component in self.index["components"]))
         self.assertIn(b'"name": "compositor-windows"', self.originals["THIRD-PARTY-NOTICES.json"])
 
+    def test_different_bundled_application_license_is_rejected(self):
+        summary, originals = GENERATOR.BUNDLE.verify_bundle(ROOT / "LICENSES.md")
+        originals["CompositorWin-LICENSE.md"] += b"changed"
+        with patch.object(GENERATOR.BUNDLE, "verify_bundle", return_value=(summary, originals)), patch.object(GENERATOR, "source_ranges", return_value=[{"path": name, "offset": 0, "bytes": len(text), "sha256": hashlib.sha256(text).hexdigest()} for name, text in originals.items()]):
+            with self.assertRaisesRegex(ValueError, "bundled application license differs"):
+                GENERATOR.generate(ROOT / "LICENSES.md")
+
     def test_every_dependency_points_to_its_actual_license_originals(self):
-        for component in self.index["components"][3:]:
+        for component in self.index["components"][4:]:
             prefix = f"third-party-licenses/{component['name']}-{component['version']}-"
             sources = [self.index["originals"][source]["path"] for source in component["originals"]]
             self.assertTrue(sources)
@@ -99,6 +127,8 @@ class EmbeddedLicenseTests(unittest.TestCase):
         self.assertEqual(created.returncode, 0, created.stderr)
         original = target.read_bytes()
         self.assertLess(len(original), 2048)
+        self.assertIn("CompositorWin 主程序：Apache-2.0".encode(), original)
+        self.assertIn("原 Compositor 项目：MIT".encode(), original)
         self.assertEqual(self.run_cli("--check", "--verify-package-index", target).returncode, 0)
         self.assertNotEqual(self.run_cli("--check", "--write-package-index", target).returncode, 0)
         self.assertEqual(target.read_bytes(), original)
