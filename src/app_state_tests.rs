@@ -1,6 +1,93 @@
 use super::*;
 
 #[test]
+fn repeat_filter_uses_only_successful_commits_and_the_current_target() {
+    let mut document = Document::new(3, 2);
+    document.layers[0].image = Some(Arc::new(Raster::solid(3, 2, [30, 90, 180, 255])));
+    let mut app = editor(vec![document]);
+    let original = app.session().doc.clone();
+    let ctx = egui::Context::default();
+    assert!(!app.command_available(Command::RepeatFilter));
+    app.filter("Invert", json!({}), false);
+    finish_gui_background_event(&mut app, &ctx);
+    assert_eq!(app.last_filter.as_ref().unwrap().0, "Invert");
+    assert!(app.command_available(Command::RepeatFilter));
+    app.filter("Unsupported filter", json!({}), false);
+    finish_gui_background_event(&mut app, &ctx);
+    assert_eq!(app.last_filter.as_ref().unwrap().0, "Invert");
+    let before_repeat = app.session().doc.clone();
+    app.command(Command::RepeatFilter);
+    finish_gui_background_event(&mut app, &ctx);
+    assert_eq!(app.session().doc, original);
+    app.command(Command::Undo);
+    assert_eq!(app.session().doc, before_repeat);
+    app.begin_dialog(Dialog::Filter {
+        kind: "Invert".into(),
+    });
+    app.cancel_dialog();
+    assert_eq!(app.last_filter.as_ref().unwrap().0, "Invert");
+    gui_threads::with_spawn_failure("后台编辑", || {
+        app.filter("Exposure", json!({"exposure": 1.}), false)
+    });
+    assert!(!app.session().edit_busy);
+    assert_eq!(app.last_filter.as_ref().unwrap().0, "Invert");
+}
+
+#[test]
+fn canvas_only_key_does_not_intercept_text_or_filter_panels() {
+    let mut app = editor(vec![Document::new(8, 8)]);
+    let ctx = egui::Context::default();
+    let key = egui::Event::Key {
+        key: Key::F,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let _ = ctx.run(
+        egui::RawInput {
+            events: vec![key.clone()],
+            ..Default::default()
+        },
+        |ctx| {
+            let commands = app.shortcuts(ctx);
+            assert!(commands.iter().any(|c| matches!(c, Command::CanvasOnly)));
+        },
+    );
+    app.dialog = Some(Dialog::CameraRaw);
+    let _ = ctx.run(
+        egui::RawInput {
+            events: vec![key.clone()],
+            ..Default::default()
+        },
+        |ctx| {
+            assert!(
+                !app.shortcuts(ctx)
+                    .iter()
+                    .any(|c| matches!(c, Command::CanvasOnly))
+            );
+        },
+    );
+    app.dialog = None;
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("test-text-editor")));
+    });
+    let _ = ctx.run(
+        egui::RawInput {
+            events: vec![key],
+            ..Default::default()
+        },
+        |ctx| {
+            assert!(
+                !app.shortcuts(ctx)
+                    .iter()
+                    .any(|c| matches!(c, Command::CanvasOnly))
+            );
+        },
+    );
+}
+
+#[test]
 fn window_close_keeps_dirty_and_busy_documents_before_any_animation() {
     for busy in [false, true] {
         let mut app = headless_app();
@@ -334,7 +421,7 @@ fn worker_completion_wakes_a_sleeping_editor_and_applies_the_result() {
     ctx.set_request_repaint_callback(move |info| {
         wake.send(info.delay).unwrap();
     });
-    app.sender.context.set(ctx.clone()).unwrap();
+    app.sender.bind_context(ctx.clone());
     let sender = app.sender.clone();
     std::thread::spawn(move || {
         sender
@@ -389,9 +476,9 @@ fn background_watch_reports_only_changes_and_stops_when_the_editor_closes() {
     let (sender, receiver) = mpsc::channel();
     let mut watcher = PackageWatcher::new(WorkerSender {
         sender,
-        context: Arc::new(OnceLock::new()),
+        context: Arc::new(Mutex::new(None)),
     });
-    watcher.sync(vec![target.clone()]);
+    watcher.sync(vec![target.clone()]).unwrap();
     assert!(matches!(
         receiver.recv_timeout(Duration::from_millis(650)),
         Err(mpsc::RecvTimeoutError::Timeout)
@@ -413,7 +500,7 @@ fn background_watch_reports_only_changes_and_stops_when_the_editor_closes() {
         receiver.recv_timeout(Duration::from_millis(650)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
-    watcher.sync(Vec::new());
+    watcher.sync(Vec::new()).unwrap();
     drop(watcher);
     assert!(matches!(
         receiver.recv_timeout(Duration::from_secs(2)),
@@ -916,6 +1003,324 @@ fn conversion_reports_are_fifo_and_preserve_import_targets() {
     assert_eq!(app.current, 2);
     assert_eq!(app.tabs[0].doc.layers[1].name, "Second layer");
     assert_eq!(app.tabs[1].doc, other);
+}
+
+#[test]
+fn conversion_import_admission_counts_pending_documents_and_releases_rejected_pixels() {
+    fn dense_document(name: &str, value: u8) -> Document {
+        let mut document = Document::new(32, 32);
+        document.layers[0].name = name.into();
+        document.layers[0].image = Some(Arc::new(Raster::from_rgba(
+            32,
+            32,
+            vec![value; 32 * 32 * 4],
+        )));
+        document
+    }
+    let mut app = editor(vec![dense_document("Already open", 1)]);
+    let original = app.session().doc.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let ctx = egui::Context::default();
+    let mut rejected = None;
+    crate::workspace_limits::with_test_workspace_budget(3 * 4096, || {
+        for index in 0..3 {
+            let document = dense_document(&format!("Import {index}"), index + 2);
+            if index == 2 {
+                rejected = Some(Arc::downgrade(
+                    &document.layers[0].image.as_ref().unwrap().pixels,
+                ));
+            }
+            app.pending_io += 1;
+            send(
+                &mut app,
+                &ctx,
+                Worker::Open {
+                    path: directory.path().join(format!("page-{index}.psd")),
+                    result: Ok(image_io::ImportResult {
+                        document,
+                        conversions: vec![format!("Conversion {index}")],
+                    }),
+                    target: None,
+                },
+            );
+        }
+        assert_eq!(app.pending_io, 0);
+        assert_eq!(
+            app.import_queue.len(),
+            1,
+            "Over-budget imports must not accumulate behind the report"
+        );
+        assert!(
+            rejected.as_ref().unwrap().upgrade().is_none(),
+            "Rejected decoded pixels must be released"
+        );
+        assert!(app.message.as_deref().unwrap().contains("工作区内存上限"));
+        assert_eq!(app.session().doc, original);
+        assert_eq!(app.report, ["Conversion 0"]);
+        click_dialog_button(&mut app, &ctx, "Import");
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.report, ["Conversion 1"]);
+        click_dialog_button(&mut app, &ctx, "Import");
+        assert_eq!(app.tabs.len(), 3);
+        assert!(app.pending_import.is_none());
+        assert!(app.import_queue.is_empty());
+    });
+}
+
+#[test]
+fn import_worker_waits_for_gui_consumption_before_decoding_the_next_result() {
+    use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+    for first in ["open", "pdf-info", "pdf-open", "raw-preview", "raw-import"] {
+        let mut app = headless_app();
+        // Keep decoder replies separate: poll may drain the next result immediately
+        // after acknowledging the first, before this test can receive it.
+        let (worker_sender, worker_receiver) = mpsc::channel();
+        let worker_replies = WorkerSender {
+            sender: worker_sender,
+            context: app.sender.context.clone(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-input");
+        let task = match first {
+            "open" => import_worker::ImportTask::Open { path, target: None },
+            "pdf-info" => import_worker::ImportTask::PdfInfo { path, target: None },
+            "pdf-open" => import_worker::ImportTask::PdfPages {
+                path,
+                target: None,
+                indices: vec![0],
+                dpi: 72,
+            },
+            "raw-import" => import_worker::ImportTask::RawImport {
+                path,
+                settings: Default::default(),
+                target: None,
+            },
+            _ => import_worker::ImportTask::RawPreview {
+                path,
+                settings: Default::default(),
+                key: [0; 7],
+            },
+        };
+        app.imports.submit(task, &worker_replies).unwrap();
+        let second_path = directory.path().join("missing-second.png");
+        app.imports
+            .submit(
+                import_worker::ImportTask::Open {
+                    path: second_path.clone(),
+                    target: None,
+                },
+                &worker_replies,
+            )
+            .unwrap();
+        let result = worker_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(
+            matches!(
+                worker_receiver.recv_timeout(Duration::from_millis(200)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "{first}: decoding must wait while the GUI has not consumed its previous result"
+        );
+        app.sender.send(result).unwrap();
+        app.poll(&egui::Context::default());
+        let next = worker_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(next, Worker::Open { path, result: Err(_), .. } if path == second_path));
+    }
+}
+
+#[test]
+fn closing_import_queue_releases_a_worker_waiting_for_unconsumed_pixels() {
+    let app = headless_app();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-input.png");
+    let mut imports = import_worker::ImportQueue::default();
+    imports
+        .submit(
+            import_worker::ImportTask::Open {
+                path: path.clone(),
+                target: None,
+            },
+            &app.sender,
+        )
+        .unwrap();
+    // This queued task must not keep the decoder alive after the owner closes.
+    imports
+        .submit(
+            import_worker::ImportTask::Open { path, target: None },
+            &app.sender,
+        )
+        .unwrap();
+    let worker = imports.take_worker_handle().unwrap();
+    let result = app.receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(matches!(result, Worker::Open { result: Err(_), .. }));
+    // Deliberately do not acknowledge the first result.
+    drop(imports);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !worker.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        worker.is_finished(),
+        "Closing the queue must cancel the ACK wait"
+    );
+    worker.join().unwrap();
+    assert!(app.receiver.try_recv().is_err());
+}
+
+#[test]
+fn workspace_admission_includes_pending_imports_history_and_eyedropper_storage() {
+    fn dense_document(value: u8) -> Document {
+        let mut document = Document::new(32, 32);
+        document.layers[0].image = Some(Arc::new(Raster::from_rgba(32, 32, vec![value; 4096])));
+        document
+    }
+    let mut app = editor(vec![dense_document(1), dense_document(2)]);
+    app.session_mut().edit("Replace pixels", |document| {
+        document.layers[0].image = Some(Arc::new(Raster::from_rgba(32, 32, vec![3; 4096])));
+        document.layers[0].transform.size = [8., 8.];
+    });
+    let sampler = Arc::new(render::CompositeSampler::new(&app.session().doc));
+    let sampler_bytes = sampler.allocated_bytes() as u64;
+    assert!(sampler_bytes > 0);
+    app.sample_cache = Some((app.session().id, sampler));
+    app.pending_import = Some((
+        PathBuf::from("pending.psd"),
+        image_io::ImportResult {
+            document: dense_document(4),
+            conversions: vec!["Pending".into()],
+        },
+        None,
+    ));
+    app.import_queue.push_back((
+        PathBuf::from("queued.psd"),
+        image_io::ImportResult {
+            document: dense_document(5),
+            conversions: vec!["Queued".into()],
+        },
+        None,
+    ));
+    let candidate = dense_document(6);
+    let history_bytes: u64 = app
+        .tabs
+        .iter()
+        .map(|session| session.history.retained_bytes(&session.doc) as u64)
+        .sum();
+    assert!(history_bytes > 0);
+    // Five distinct dense documents: two tabs, pending report, queued report, candidate.
+    let total = 5 * 4096 + history_bytes + sampler_bytes;
+    crate::workspace_limits::with_test_workspace_budget(total, || {
+        assert!(app.check_workspace(&candidate).is_ok());
+    });
+    crate::workspace_limits::with_test_workspace_budget(total - 1, || {
+        assert!(app.check_workspace(&candidate).is_err());
+    });
+}
+
+#[test]
+fn queued_conversion_pixels_limit_plain_and_pdf_imports_without_partial_changes() {
+    fn dense_document(value: u8) -> Document {
+        let mut document = Document::new(32, 32);
+        document.layers[0].image = Some(Arc::new(Raster::from_rgba(32, 32, vec![value; 4096])));
+        document
+    }
+    for pdf in [false, true] {
+        let mut app = editor(vec![dense_document(1)]);
+        let original = app.session().doc.clone();
+        app.pending_import = Some((
+            PathBuf::from("pending.psd"),
+            image_io::ImportResult {
+                document: dense_document(2),
+                conversions: vec!["Pending".into()],
+            },
+            None,
+        ));
+        let pixels = Arc::new(vec![3; 4096]);
+        let rejected = Arc::downgrade(&pixels);
+        let raster = Raster {
+            width: 32,
+            height: 32,
+            pixels,
+            tiles: Default::default(),
+            deep: None,
+        };
+        crate::workspace_limits::with_test_workspace_budget(2 * 4096, || {
+            if pdf {
+                app.install_pdf_pages(
+                    PathBuf::from("new.pdf"),
+                    None,
+                    72,
+                    vec![crate::pdf_io::PdfPage {
+                        raster,
+                        size: crate::pdf_io::PdfPageSize {
+                            width_points: 32.,
+                            height_points: 32.,
+                        },
+                        index: 0,
+                    }],
+                );
+            } else {
+                let mut document = Document::new(32, 32);
+                document.layers[0].image = Some(Arc::new(raster));
+                app.pending_io += 1;
+                send(
+                    &mut app,
+                    &egui::Context::default(),
+                    Worker::Open {
+                        path: PathBuf::from("new.png"),
+                        target: None,
+                        result: Ok(image_io::ImportResult {
+                            document,
+                            conversions: vec![],
+                        }),
+                    },
+                );
+                assert_eq!(app.pending_io, 0);
+            }
+        });
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.session().doc, original);
+        assert!(app.pending_import.is_some());
+        assert!(app.message.as_deref().unwrap().contains("工作区内存上限"));
+        assert!(
+            rejected.upgrade().is_none(),
+            "Rejected import must release decoded pages"
+        );
+    }
+}
+
+#[test]
+fn dialog_output_paths_keep_the_confirmed_name_and_reject_silent_renames() {
+    let directory = tempfile::tempdir().unwrap();
+    let existing_project = directory.path().join("keep.comp");
+    let existing_image = directory.path().join("keep.png");
+    std::fs::write(&existing_project, b"existing project").unwrap();
+    std::fs::write(&existing_image, b"existing image").unwrap();
+    for (supported, name) in [
+        (&["comp"][..], "keep.txt"),
+        (&["comp"][..], "keep"),
+        (&["png", "jpg", "pdf"][..], "keep.txt"),
+        (&["png", "jpg", "pdf"][..], "keep"),
+    ] {
+        let path = directory.path().join(name);
+        let result = EditorApp::dialog_output_path(path.clone(), supported);
+        assert!(
+            result.is_err(),
+            "The save dialog did not confirm a replacement at {path:?}"
+        );
+    }
+    let path = directory.path().join("中文文件.JPG");
+    let (output, extension) =
+        EditorApp::dialog_output_path(path.clone(), &["png", "jpg", "pdf"]).unwrap();
+    assert_eq!(output, path);
+    assert_eq!(extension, "jpg");
+    assert_eq!(
+        std::fs::read(existing_project).unwrap(),
+        b"existing project"
+    );
+    assert_eq!(std::fs::read(existing_image).unwrap(), b"existing image");
 }
 
 #[test]
@@ -4378,4 +4783,379 @@ fn switching_tabs_drops_the_previous_brush_line_anchor() {
     app.activate_tab(1);
     assert_eq!(app.brush_line_start([7., 8.]), [7., 8.]);
     assert!(app.last_brush.is_none());
+}
+
+#[test]
+fn gui_thread_creation_failure_preserves_imported_canvas_and_allows_window_close() {
+    let mut app = editor(vec![Document::new(8, 8)]);
+    let before = app.session().doc.clone();
+    let ctx = egui::Context::default();
+    let view = crate::preview::ViewRequest::new([8, 8], [0., 0., 8., 8.], 1.).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gui_threads::with_spawn_failure("画布预览", || app.render_canvas(&ctx, view));
+    }));
+    assert!(
+        result.is_ok(),
+        "A failed CPU-preview thread must preserve the live GUI"
+    );
+    assert!(!app.session().preview_busy);
+    assert_eq!(app.session().doc, before);
+    assert!(
+        app.message
+            .as_deref()
+            .is_some_and(|error| error.contains("线程失败"))
+    );
+    assert!(app.window_close_ready());
+}
+
+#[test]
+fn gui_thread_creation_failure_does_not_leave_save_busy_or_block_window_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("keep.comp");
+    let mut app = editor(vec![Document::new(8, 8)]);
+    project::save(&app.session().doc, &path).unwrap();
+    app.session_mut().path = Some(path.clone());
+    let bytes = std::fs::read(&path).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gui_threads::with_spawn_failure("保存项目", || app.save(false));
+    }));
+    assert!(
+        result.is_ok(),
+        "A failed save thread must preserve the live GUI"
+    );
+    assert!(!app.session().save_busy);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    assert!(
+        app.message
+            .as_deref()
+            .is_some_and(|error| error.contains("线程失败"))
+    );
+    assert!(app.window_close_ready());
+}
+
+#[test]
+fn gui_thread_creation_failure_does_not_leak_export_pending_io_or_overwrite_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("keep.png");
+    std::fs::write(&path, b"existing destination").unwrap();
+    let mut app = editor(vec![Document::new(8, 8)]);
+    let before = app.session().doc.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gui_threads::with_spawn_failure("导出图像", || {
+            app.export_to_path("png".into(), path.clone())
+        });
+    }));
+    assert!(
+        result.is_ok(),
+        "A failed export thread must preserve the live GUI"
+    );
+    assert_eq!(app.pending_io, 0);
+    assert_eq!(app.session().doc, before);
+    assert_eq!(std::fs::read(path).unwrap(), b"existing destination");
+    assert!(
+        app.message
+            .as_deref()
+            .is_some_and(|error| error.contains("线程失败"))
+    );
+    assert!(app.window_close_ready());
+}
+
+fn finish_gui_background_event(app: &mut EditorApp, ctx: &egui::Context) {
+    let event = app
+        .receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("The real GUI worker must report success or failure");
+    send(app, ctx, event);
+}
+
+#[test]
+fn gui_thread_operation_panic_in_save_and_export_clears_busy_and_preserves_existing_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("keep.comp");
+    let export_path = directory.path().join("keep.png");
+    let mut app = editor(vec![Document::new(8, 8)]);
+    let before = app.session().doc.clone();
+    project::save(&before, &project_path).unwrap();
+    app.session_mut().path = Some(project_path.clone());
+    let bytes = std::fs::read(&project_path).unwrap();
+    std::fs::write(&export_path, b"existing destination").unwrap();
+    let ctx = egui::Context::default();
+    gui_threads::with_operation_panic("保存项目", || app.save(false));
+    assert!(app.session().save_busy);
+    finish_gui_background_event(&mut app, &ctx);
+    assert!(!app.session().save_busy);
+    assert_eq!(std::fs::read(&project_path).unwrap(), bytes);
+    assert_eq!(app.session().path.as_ref(), Some(&project_path));
+    assert_eq!(app.save_count, 0);
+    assert!(app.window_close_ready());
+    gui_threads::with_operation_panic("导出图像", || {
+        app.export_to_path("png".into(), export_path.clone());
+    });
+    assert_eq!(app.pending_io, 1);
+    finish_gui_background_event(&mut app, &ctx);
+    assert_eq!(app.pending_io, 0);
+    assert_eq!(
+        std::fs::read(&export_path).unwrap(),
+        b"existing destination"
+    );
+    assert_eq!(app.session().doc, before);
+    assert!(app.window_close_ready());
+    assert!(app.message.as_deref().unwrap().contains("发生异常"));
+    app.save(false);
+    finish_gui_background_event(&mut app, &ctx);
+    assert_eq!(
+        app.save_count, 1,
+        "Saving must remain usable after a failed worker"
+    );
+    app.export_to_path("png".into(), export_path.clone());
+    finish_gui_background_event(&mut app, &ctx);
+    assert_eq!(app.pending_io, 0);
+    assert_eq!(image_io::decode_image(&export_path).unwrap().width, 8);
+}
+
+#[test]
+fn gui_thread_preview_failure_is_not_restarted_each_frame_and_recovers_after_edit_and_tab_switch() {
+    for panic in [false, true] {
+        let mut app = editor(vec![Document::new(8, 8), Document::new(8, 8)]);
+        let ctx = egui::Context::default();
+        let view = crate::preview::ViewRequest::new([8, 8], [0., 0., 8., 8.], 1.).unwrap();
+        app.session_mut().preview_view = Some(view);
+        let before = app.session().doc.clone();
+        if panic {
+            gui_threads::with_operation_panic("画布预览", || app.render_canvas(&ctx, view));
+            finish_gui_background_event(&mut app, &ctx);
+        } else {
+            gui_threads::with_spawn_failure("画布预览", || app.render_canvas(&ctx, view));
+        }
+        assert!(!app.session().preview_busy);
+        assert_eq!(
+            app.session().preview_failed,
+            Some((app.session().serial, view))
+        );
+        assert_eq!(app.session().doc, before);
+        for _ in 0..3 {
+            app.render_canvas(&ctx, view);
+        }
+        assert!(!app.session().preview_busy);
+        assert!(
+            app.receiver.try_recv().is_err(),
+            "Identical failed previews must not spin"
+        );
+        app.activate_tab(1);
+        app.activate_tab(0);
+        assert!(app.session().preview_failed.is_none());
+        app.render_canvas(&ctx, view);
+        finish_gui_background_event(&mut app, &ctx);
+        assert_eq!(app.session().rendered, app.session().serial);
+        app.session_mut().rendered = 0;
+        gui_threads::with_spawn_failure("画布预览", || app.render_canvas(&ctx, view));
+        assert!(app.session().preview_failed.is_some());
+        app.session_mut()
+            .edit("Change after failed preview", |doc| {
+                doc.layers[0].opacity = 0.5
+            });
+        assert!(app.session().preview_failed.is_none());
+        app.render_canvas(&ctx, view);
+        finish_gui_background_event(&mut app, &ctx);
+        assert_eq!(app.session().rendered, app.session().serial);
+        assert!(app.session().texture.is_some());
+    }
+}
+
+#[test]
+fn gui_thread_background_edit_failure_preserves_document_and_accepts_a_later_edit() {
+    let mut app = editor(vec![Document::new(8, 8)]);
+    let before = app.session().doc.clone();
+    gui_threads::with_spawn_failure("后台编辑", || {
+        app.background_edit("Not started", |doc| {
+            doc.layers[0].opacity = 0.2;
+            Ok(())
+        })
+    });
+    assert!(!app.session().edit_busy);
+    assert_eq!(app.session().doc, before);
+    app.background_edit("Panic after modifying private copy", |doc| {
+        doc.layers[0].opacity = 0.3;
+        panic!("injected edit panic after private document modification")
+    });
+    let ctx = egui::Context::default();
+    finish_gui_background_event(&mut app, &ctx);
+    assert!(!app.session().edit_busy);
+    assert_eq!(app.session().doc, before);
+    assert!(!app.session().history.is_modified());
+    assert!(app.window_close_ready());
+    app.background_edit("Successful retry", |doc| {
+        doc.layers[0].opacity = 0.4;
+        Ok(())
+    });
+    finish_gui_background_event(&mut app, &ctx);
+    assert!(!app.session().edit_busy);
+    assert_eq!(app.session().doc.layers[0].opacity, 0.4);
+    assert_eq!(app.session().history.undo_name(), Some("Successful retry"));
+}
+
+#[test]
+fn gui_thread_color_sampling_failure_clears_matching_busy_and_can_retry() {
+    let mut app = editor(vec![Document::new(8, 8)]);
+    let key = (app.session().id, app.session().serial);
+    gui_threads::with_spawn_failure("颜色取样", || app.start_color_sampler(key));
+    assert!(app.sample_busy.is_none());
+    let ctx = egui::Context::default();
+    gui_threads::with_operation_panic("颜色取样", || app.start_color_sampler(key));
+    assert_eq!(app.sample_busy, Some(key));
+    finish_gui_background_event(&mut app, &ctx);
+    assert!(app.sample_busy.is_none());
+    assert!(app.sample_cache.is_none());
+    app.start_color_sampler(key);
+    finish_gui_background_event(&mut app, &ctx);
+    assert!(app.sample_busy.is_none());
+    assert!(app.sample_cache.is_some());
+}
+
+#[test]
+fn gui_thread_filter_preview_failure_clears_busy_and_cancel_remains_usable() {
+    for panic in [false, true] {
+        let mut app = editor(vec![Document::new(8, 8)]);
+        app.session_mut().doc.layers[0].image =
+            Some(Arc::new(Raster::solid(8, 8, [40, 70, 100, 255])));
+        let before = app.session().doc.clone();
+        app.begin_dialog(Dialog::CameraRaw);
+        app.dialog_value = crate::filters::camera_raw_defaults();
+        let ctx = egui::Context::default();
+        if panic {
+            gui_threads::with_operation_panic("滤镜预览", || {
+                app.dialog_preview(&ctx, &Dialog::CameraRaw)
+            });
+            finish_gui_background_event(&mut app, &ctx);
+        } else {
+            gui_threads::with_spawn_failure("滤镜预览", || {
+                app.dialog_preview(&ctx, &Dialog::CameraRaw)
+            });
+        }
+        assert!(!app.dialog_preview_busy);
+        assert!(app.dialog_preview_error.is_some());
+        assert_eq!(app.session().doc, before);
+        app.cancel_dialog();
+        assert!(app.window_close_ready());
+        app.begin_dialog(Dialog::CameraRaw);
+        app.dialog_preview(&ctx, &Dialog::CameraRaw);
+        assert!(app.dialog_preview_busy);
+        finish_gui_background_event(&mut app, &ctx);
+        assert!(!app.dialog_preview_busy);
+        assert!(app.dialog_preview_error.is_none());
+    }
+}
+
+#[test]
+fn gui_thread_gradient_and_warp_failures_clear_busy_without_changing_the_document() {
+    for name in ["渐变编辑", "变形预览"] {
+        for panic in [false, true] {
+            let mut app = editor(vec![Document::new(8, 8)]);
+            let before = app.session().doc.clone();
+            let start = |app: &mut EditorApp| {
+                if name == "渐变编辑" {
+                    let state = GradientState {
+                        session: app.session().id,
+                        request: Uuid::new_v4(),
+                        base_revision: app.session().history.revision(),
+                        before: before.clone(),
+                        start: [0., 0.],
+                        end: [7., 7.],
+                        layer: app.session().doc.active_layer_id.unwrap(),
+                        mask: false,
+                        revision: None,
+                        parameters: app.gradient_parameters(),
+                    };
+                    app.update_gradient(state);
+                } else {
+                    app.drag = Some(distort_drag(&before));
+                    app.update_warp_preview();
+                }
+            };
+            if panic {
+                gui_threads::with_operation_panic(name, || start(&mut app));
+                finish_gui_background_event(&mut app, &egui::Context::default());
+            } else {
+                gui_threads::with_spawn_failure(name, || start(&mut app));
+            }
+            assert!(!app.session().edit_busy, "{name}");
+            assert!(!app.warp_preview_busy, "{name}");
+            assert!(app.session().gradient_task.is_none(), "{name}");
+            assert_eq!(app.session().doc, before, "{name}");
+            assert!(
+                app.message
+                    .as_deref()
+                    .is_some_and(|error| error.contains(name)),
+                "{name}"
+            );
+            app.drag = None;
+            app.gradient = None;
+            assert!(app.window_close_ready(), "{name}");
+        }
+    }
+}
+
+#[test]
+fn gui_thread_disk_reload_failure_clears_busy_and_preserves_current_document() {
+    for forced in [false, true] {
+        for panic in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("watched.comp");
+            let before = Document::new(8, 8);
+            project::save(&before, &path).unwrap();
+            let mut app = editor(vec![before.clone()]);
+            app.session_mut().path = Some(path.clone());
+            app.session_mut().stamp = package_stamp(&path);
+            let target = watched(&app);
+            project::save(&Document::new(9, 10), &path).unwrap();
+            let stamp = package_stamp(&path);
+            let ctx = egui::Context::default();
+            let mut start = || {
+                if forced {
+                    app.external_pending = Some((app.session().id, stamp));
+                    click_dialog_button(&mut app, &ctx, "重新载入");
+                } else {
+                    app.disk_changes.insert(target.id, (target.clone(), stamp));
+                    app.watch();
+                }
+            };
+            if panic {
+                gui_threads::with_operation_panic("重新载入", &mut start);
+                finish_gui_background_event(&mut app, &ctx);
+            } else {
+                gui_threads::with_spawn_failure("重新载入", &mut start);
+            }
+            assert!(!app.session().reload_busy);
+            assert_eq!(app.session().doc, before);
+            assert!(
+                app.message
+                    .as_deref()
+                    .is_some_and(|error| error.contains("重新载入"))
+            );
+            assert!(app.window_close_ready());
+            assert_eq!(project::load(&path).unwrap().width, 9);
+        }
+    }
+}
+
+#[test]
+fn gui_thread_watcher_creation_failure_reports_error_and_same_targets_can_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("watched.comp");
+    let mut app = editor(vec![Document::new(8, 8)]);
+    project::save(&app.session().doc, &path).unwrap();
+    app.session_mut().path = Some(path);
+    gui_threads::with_spawn_failure("磁盘监听", || app.sync_watch_targets());
+    assert!(!app.watcher.started);
+    assert!(
+        app.message
+            .as_deref()
+            .is_some_and(|error| error.contains("磁盘监听"))
+    );
+    app.sync_watch_targets();
+    assert!(
+        app.watcher.started,
+        "Identical targets must retry a failed watcher creation"
+    );
+    assert!(app.window_close_ready());
 }

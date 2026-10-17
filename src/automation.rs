@@ -101,6 +101,14 @@ pub enum Operation {
     FlipCanvas {
         horizontal: bool,
     },
+    RotateCanvas {
+        clockwise: bool,
+    },
+    ConvertDepth {
+        #[serde(default)]
+        layer: Option<Uuid>,
+        depth: String,
+    },
     ResizeCanvas {
         width: u32,
         height: u32,
@@ -224,6 +232,8 @@ pub enum Operation {
         color: [u8; 4],
         #[serde(default)]
         corner_radius: f64,
+        #[serde(default)]
+        smoothing: bool,
         #[serde(default = "one")]
         line_width: f64,
         #[serde(default)]
@@ -622,6 +632,21 @@ impl Engine {
                 edit::flip_canvas(doc, *horizontal);
                 json!({})
             }
+            Operation::RotateCanvas { clockwise } => {
+                edit::rotate_canvas(doc, *clockwise);
+                json!({"width":doc.width,"height":doc.height})
+            }
+            Operation::ConvertDepth { layer, depth } => {
+                let id = layer.or(doc.active_layer_id).context("请先选择图层")?;
+                let target = match depth.as_str() {
+                    "8-bit" => None,
+                    "16-bit" => Some(crate::deep_pixels::Depth::U16),
+                    "HDR" => Some(crate::deep_pixels::Depth::Hdr),
+                    _ => bail!("depth 必须为 8-bit、16-bit 或 HDR"),
+                };
+                edit::convert_layer_depth(doc, id, target)?;
+                json!({"layer":id,"depth":depth})
+            }
             Operation::ResizeCanvas {
                 width,
                 height,
@@ -869,6 +894,7 @@ impl Engine {
                 rect,
                 color,
                 corner_radius,
+                smoothing,
                 line_width,
                 line_ends,
             } => {
@@ -879,7 +905,7 @@ impl Engine {
                     Shape::Ellipse => ShapeKind::Ellipse,
                     Shape::Line => ShapeKind::Line,
                 };
-                json!({"layer":edit::add_shape(doc,kind,*rect,*color,*corner_radius,*line_width,*line_ends)?})
+                json!({"layer":edit::add_shape_with_smoothing(doc,kind,*rect,*color,*corner_radius,*line_width,*line_ends,*smoothing)?})
             }
             Operation::UpdateShape { layer, style } => {
                 let id = layer_id(doc, *layer)?;
@@ -1778,11 +1804,13 @@ fn shape_style(old: &Value, patch: &Value) -> Result<Value> {
     let kind = old["kind"].as_str().context("原形状类型无效")?;
     let template = if kind == "Line" {
         json!({"kind":"Line","red":0,"green":0,"blue":0,"cornerRadius":0,"lineWidth":1,"start":[0,0],"end":[1,1]})
+    } else if kind == "Rectangle" {
+        json!({"kind":kind,"red":0,"green":0,"blue":0,"cornerRadius":0,"smoothing":false})
     } else {
         json!({"kind":kind,"red":0,"green":0,"blue":0,"cornerRadius":0})
     };
     let base = merge_settings(&template, old, "style")?;
-    let result = merge_settings(&base, patch, "style")?;
+    let mut result = merge_settings(&base, patch, "style")?;
     ensure!(
         result["kind"].as_str() == Some(kind),
         "update_shape 保持已有形状类型；新类型请使用 add_shape"
@@ -1808,6 +1836,10 @@ fn shape_style(old: &Value, patch: &Value) -> Result<Value> {
                 unit(value.as_f64().context("端点应为数值")?, key)?;
             }
         }
+    }
+    // Match the original optional field: absent/false means ordinary corners.
+    if result["smoothing"] == false {
+        result.as_object_mut().unwrap().remove("smoothing");
     }
     Ok(result)
 }
@@ -1948,6 +1980,16 @@ pub fn capabilities() -> Value {
             &["horizontal"],
         ),
         descriptor(
+            json!({"op":"rotate_canvas","clockwise":true}),
+            "将画布顺时针旋转90°；false为逆时针，宽高互换，所有图层、蒙版、参考线和选区随画布转动，原始图像不重采样。",
+            &["clockwise"],
+        ),
+        descriptor(
+            json!({"op":"convert_depth","depth":"16-bit"}),
+            "转换当前像素图层为8-bit、16-bit或HDR；8-bit转换会量化低位和裁切超白颜色，可撤销。",
+            &["depth"],
+        ),
+        descriptor(
             json!({"op":"resize_canvas","width":1920,"height":1080}),
             "调整画布边界；anchor 为旧内容在新画布中 0–1 的保留锚点。",
             &["width", "height"],
@@ -2036,12 +2078,12 @@ pub fn capabilities() -> Value {
         ),
         descriptor(
             json!({"op":"add_shape","kind":"rectangle","rect":[10,20,200,100],"color":[40,130,255,255]}),
-            "增加可编辑矩形、椭圆或线条；line_ends 为 0–1 相对端点，RGBA alpha 转为图层透明度。",
+            "增加可编辑矩形、椭圆或线条；smoothing=true 为矩形启用平滑圆角，line_ends 为 0–1 相对端点，RGBA alpha 转为图层透明度。",
             &["kind", "rect", "color"],
         ),
         descriptor(
             json!({"op":"update_shape","style":{"red":1,"green":0,"blue":0}}),
-            "更新已有形状样式，保留未指定字段；kind 不变，样式使用原项目 camelCase 字段。",
+            "更新已有形状样式，保留未指定字段；矩形支持布尔 smoothing 平滑圆角，kind 不变，样式使用原项目 camelCase 字段。",
             &["style"],
         ),
         descriptor(
@@ -2167,7 +2209,7 @@ mod tests {
     #[test]
     fn capabilities_examples_use_real_strict_operations() {
         let caps = capabilities();
-        assert_eq!(caps["operations"].as_array().unwrap().len(), 39);
+        assert_eq!(caps["operations"].as_array().unwrap().len(), 41);
         let mut names = HashSet::new();
         for item in caps["operations"].as_array().unwrap() {
             let parsed: Operation = serde_json::from_value(item["example"].clone()).unwrap();
@@ -2180,6 +2222,101 @@ mod tests {
             unknown["misspelled_field"] = json!(true);
             assert!(serde_json::from_value::<Operation>(unknown).is_err());
         }
+    }
+
+    #[test]
+    fn smooth_shape_operations_keep_defaults_and_preserve_optional_style() {
+        let mut doc = Document::new(120, 100);
+        let value = json!({"op":"add_shape","kind":"rectangle","rect":[0,0,100,80],"color":[255,0,0,255],"corner_radius":20});
+        let ordinary: Operation = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&ordinary).unwrap()["smoothing"], false);
+        Engine::default().apply(&mut doc, &ordinary).unwrap();
+        let original = doc.active().unwrap().image.clone().unwrap();
+        assert!(
+            doc.active()
+                .unwrap()
+                .shape
+                .as_ref()
+                .unwrap()
+                .get("smoothing")
+                .is_none()
+        );
+
+        apply(
+            &mut doc,
+            json!({"op":"update_shape","style":{"smoothing":true}}),
+        );
+        let smoothed = doc.active().unwrap().image.clone().unwrap();
+        assert_ne!(smoothed, original);
+        assert_eq!(
+            doc.active().unwrap().shape.as_ref().unwrap()["smoothing"],
+            true
+        );
+        apply(&mut doc, json!({"op":"update_shape","style":{"red":0.5}}));
+        assert_eq!(
+            doc.active().unwrap().shape.as_ref().unwrap()["smoothing"],
+            true
+        );
+        apply(
+            &mut doc,
+            json!({"op":"update_shape","style":{"smoothing":false,"red":1.}}),
+        );
+        assert_eq!(doc.active().unwrap().image.as_ref(), Some(&original));
+        assert!(
+            doc.active()
+                .unwrap()
+                .shape
+                .as_ref()
+                .unwrap()
+                .get("smoothing")
+                .is_none()
+        );
+
+        let mut smooth = value.clone();
+        smooth["smoothing"] = json!(true);
+        apply(&mut doc, smooth);
+        assert_eq!(doc.active().unwrap().image.as_ref(), Some(&smoothed));
+        for invalid in [json!("true"), json!(1), Value::Null] {
+            let mut wrong = value.clone();
+            wrong["smoothing"] = invalid.clone();
+            assert!(serde_json::from_value::<Operation>(wrong).is_err());
+            assert!(
+                shape_style(
+                    doc.active().unwrap().shape.as_ref().unwrap(),
+                    &json!({"smoothing":invalid})
+                )
+                .is_err()
+            );
+        }
+        for kind in ["Ellipse", "Line"] {
+            let style = if kind == "Line" {
+                json!({"kind":kind,"red":1.,"green":0.,"blue":0.,"cornerRadius":0.,"lineWidth":1.,"start":[0.,0.],"end":[1.,1.]})
+            } else {
+                json!({"kind":kind,"red":1.,"green":0.,"blue":0.,"cornerRadius":0.})
+            };
+            assert!(shape_style(&style, &json!({"smoothing":true})).is_err());
+        }
+    }
+
+    #[test]
+    fn rotate_canvas_operation_swaps_dimensions_and_inverse_restores_document() {
+        let mut doc = Document::new(8, 6);
+        apply(&mut doc, json!({"op":"fill","color":[20,60,90,255]}));
+        apply(
+            &mut doc,
+            json!({"op":"add_guide","horizontal":false,"position":2.}),
+        );
+        let original = doc.clone();
+        let result = apply(&mut doc, json!({"op":"rotate_canvas","clockwise":true}));
+        assert_eq!(result["width"], 6);
+        assert_eq!(result["height"], 8);
+        assert_eq!(doc.guides[0].axis, "horizontal");
+        apply(&mut doc, json!({"op":"rotate_canvas","clockwise":false}));
+        assert_eq!(doc, original);
+        assert!(
+            serde_json::from_value::<Operation>(json!({"op":"rotate_canvas","clockwise":"true"}))
+                .is_err()
+        );
     }
 
     #[test]

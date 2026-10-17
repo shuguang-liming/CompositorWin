@@ -52,7 +52,7 @@ impl Tool {
             Self::Crop => "拖动裁剪 · Enter 应用 · Esc 取消 · 空格平移",
             Self::Eyedropper => "单击取样颜色 · Alt 设置背景色",
             Self::Hand => "拖动平移 · 滚轮缩放",
-            Self::Zoom => "单击放大 · Alt 单击缩小 · 横向拖动连续缩放",
+            Self::Zoom => "单击放大 · Alt 单击缩小 · 上下拖动连续缩放 · Ctrl+中键缩放",
         }
     }
 }
@@ -64,14 +64,22 @@ impl EditorApp {
 
     pub(super) fn command_available(&self, command: Command) -> bool {
         !self.pdf_ui.is_open()
+            && self.export_dialog.is_none()
+            && (!matches!(command, Command::RepeatFilter)
+                || (self.last_filter.is_some()
+                    && !self.is_welcome()
+                    && self.dialog.is_none()
+                    && !self.session().edit_busy))
             && (!self.is_welcome()
                 || matches!(
                     command,
                     Command::New
                         | Command::Open
                         | Command::Import
+                        | Command::ImportFolder
                         | Command::Close
                         | Command::Shortcuts
+                        | Command::Search
                         | Command::Paste
                 ))
     }

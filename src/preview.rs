@@ -170,8 +170,16 @@ impl PreviewCache {
         {
             return raster.clone();
         }
-        let prepared = self.prepare(doc, max_side);
-        let effects = self.prepared_effects(&prepared);
+        let prepared = if render::has_deep_layers(doc) {
+            doc.clone()
+        } else {
+            self.prepare(doc, max_side)
+        };
+        let effects = if render::has_deep_layers(doc) {
+            HashMap::new()
+        } else {
+            self.prepared_effects(&prepared)
+        };
         let scale = preview_scale(doc, max_side);
         let raster = Arc::new(render::render_region_cached(
             &prepared,
@@ -194,7 +202,11 @@ impl PreviewCache {
             return raster.clone();
         }
         self.sources.clear();
-        let effects = self.prepared_effects(doc);
+        let effects = if render::has_deep_layers(doc) {
+            HashMap::new()
+        } else {
+            self.prepared_effects(doc)
+        };
         let raster = if render::CompositeSampler::needs_full_surface(doc) {
             if !self
                 .full_output
@@ -335,6 +347,7 @@ fn same_pixels(a: &Arc<Raster>, b: &Arc<Raster>) -> bool {
         || (a.width == b.width
             && a.height == b.height
             && Arc::ptr_eq(&a.pixels, &b.pixels)
+            && render::same_deep_pixels(a, b)
             && a.tiles.len() == b.tiles.len()
             && a.tiles.iter().all(|(key, data)| {
                 b.tiles
@@ -354,7 +367,7 @@ fn same_mask(a: Option<&Mask>, b: Option<&Mask>) -> bool {
         _ => false,
     }
 }
-fn same_composite(a: &Document, b: &Document) -> bool {
+pub(crate) fn same_composite(a: &Document, b: &Document) -> bool {
     a.width == b.width
         && a.height == b.height
         && a.layers.len() == b.layers.len()
@@ -380,6 +393,9 @@ fn same_composite(a: &Document, b: &Document) -> bool {
 
 /// Area coverage averages premultiplied colors, so invisible RGB never creates fringes.
 pub(crate) fn area_resize(image: &Raster, width: u32, height: u32) -> Raster {
+    if let Some(deep) = &image.deep {
+        return Raster::from_deep(deep.resized(width, height));
+    }
     if image.tiles.is_empty() && image.pixels.len() <= 4 {
         return Raster::solid(width, height, image.get(0, 0));
     }
@@ -464,6 +480,10 @@ pub fn scale_adjustment(settings: &mut Value, scale: f64) {
         "Motion Blur" => {
             let distance = filters::number(settings, "distance", 10.0);
             scaled_number(settings, "motionDistance", distance, scale);
+        }
+        "Progressive Blur" => {
+            scaled_number(settings, "progressiveFrom", 0., scale);
+            scaled_number(settings, "progressiveTo", 20., scale);
         }
         "Bloom / Glow" => scaled_number(settings, "bloomRadius", 24.0, scale),
         "Tonal Contrast" => scaled_number(settings, "tonalRadius", 20.0, scale),

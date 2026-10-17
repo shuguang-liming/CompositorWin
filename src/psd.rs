@@ -1,6 +1,10 @@
-//! Bounded PSD/PSB reader for the original application's 8-bit RGB subset.
+//! Bounded PSD/PSB reader for the original application's 8-bit RGB and CMYK subset.
 use crate::model::{Document, Layer, Mask, Raster, Transform, import_pixel_budget};
 use anyhow::{Context, Result, bail, ensure};
+use moxcms::{
+    ColorProfile, DataColorSpace, Layout, ParsingOptions, RenderingIntent, Transform8BitExecutor,
+    TransformOptions,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::{fs::File, io::Read, path::Path, sync::Arc};
@@ -577,6 +581,146 @@ fn channel(
     Ok(out)
 }
 
+enum PixelColor {
+    Rgb,
+    Cmyk(Option<Arc<Transform8BitExecutor>>),
+}
+
+impl PixelColor {
+    fn new(mode: u16, profile: Option<&[u8]>, notes: &mut Vec<String>) -> Self {
+        if mode == 3 {
+            return Self::Rgb;
+        }
+        let transform = profile.map(Self::embedded_cmyk);
+        match transform {
+            Some(Ok(transform)) => {
+                notes.push(
+                    "CMYK Photoshop：已按嵌入 ICC 相对比色转换为 sRGB；继续使用 RGB 编辑".into(),
+                );
+                Self::Cmyk(Some(transform))
+            }
+            unavailable => {
+                let reason = match unavailable {
+                    Some(Err(error)) => format!("嵌入 ICC 不受支持（{error:#}）"),
+                    _ => "文件没有嵌入 CMYK ICC".into(),
+                };
+                notes.push(format!(
+                    "CMYK Photoshop：{reason}，使用 (1−墨量)×(1−黑墨量) 的设备 CMYK 近似转为 sRGB；颜色可能与印刷配置不同"
+                ));
+                Self::Cmyk(None)
+            }
+        }
+    }
+
+    fn embedded_cmyk(bytes: &[u8]) -> Result<Arc<Transform8BitExecutor>> {
+        const MAX_ICC: usize = 16 * 1024 * 1024;
+        ensure!(
+            (132..=MAX_ICC).contains(&bytes.len()),
+            "ICC 长度无效或超过 16 MiB"
+        );
+        ensure!(
+            u32::from_be_bytes(bytes[..4].try_into()?) as usize == bytes.len(),
+            "ICC 声明大小与实际长度不一致"
+        );
+        ensure!(&bytes[36..40] == b"acsp", "ICC 标识无效");
+        ensure!(&bytes[16..20] == b"CMYK", "嵌入 ICC 不是 CMYK 色彩空间");
+        // Import needs only the forward A2B transform. Output profiles used for
+        // printing have a separate, stricter bidirectional validation path.
+        std::panic::catch_unwind(|| {
+            let profile = ColorProfile::new_from_slice_with_options(
+                bytes,
+                ParsingOptions {
+                    max_profile_size: MAX_ICC,
+                    max_allowed_clut_size: 8 * 1024 * 1024,
+                    ..Default::default()
+                },
+            )?;
+            ensure!(
+                profile.color_space == DataColorSpace::Cmyk,
+                "ICC 不是 CMYK 色彩空间"
+            );
+            profile
+                .create_transform_8bit(
+                    Layout::Rgba,
+                    &ColorProfile::new_srgb(),
+                    Layout::Rgb,
+                    TransformOptions {
+                        rendering_intent: RenderingIntent::RelativeColorimetric,
+                        prefer_fixed_point: false,
+                        ..Default::default()
+                    },
+                )
+                .context("ICC 缺少可用的 CMYK 到 RGB 转换表")
+        })
+        .map_err(|_| anyhow::anyhow!("ICC 转换表损坏"))?
+    }
+
+    fn color_channels(&self) -> usize {
+        match self {
+            Self::Rgb => 3,
+            Self::Cmyk(_) => 4,
+        }
+    }
+
+    fn rgba(
+        &self,
+        count: usize,
+        planes: &[Option<&[u8]>; 4],
+        alpha: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            planes.iter().flatten().all(|p| p.len() >= count)
+                && alpha.is_none_or(|p| p.len() >= count),
+            "Photoshop 像素通道被截断"
+        );
+        let mut rgba = zeroed_bytes(
+            (count as u64)
+                .checked_mul(4)
+                .context("PSD 像素缓冲区大小溢出")?,
+            "PSD 像素",
+        )?;
+        // Reuse bounded scratch for ICC conversion instead of copying every
+        // plane into full-size interleaved CMYK and RGB buffers.
+        let mut inks = [0_u8; 4096 * 4];
+        let mut rgb = [0_u8; 4096 * 3];
+        for (block, output) in rgba.chunks_mut(4096 * 4).enumerate() {
+            let start = block * 4096;
+            let length = output.len() / 4;
+            if let Self::Cmyk(Some(transform)) = self {
+                for (index, ink) in inks[..length * 4]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
+                    for c in 0..4 {
+                        // Photoshop encodes 255 as no ink, unlike ICC's 0.
+                        ink[c] = 255 - planes[c].map_or(255, |p| p[start + index]);
+                    }
+                }
+                transform.transform(&inks[..length * 4], &mut rgb[..length * 3])?;
+            }
+            for (index, pixel) in output.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let at = start + index;
+                for c in 0..3 {
+                    pixel[c] = match self {
+                        Self::Rgb => planes[c].map_or(0, |p| p[at]),
+                        Self::Cmyk(Some(_)) => rgb[index * 3 + c],
+                        Self::Cmyk(None) => {
+                            let ink = u16::from(planes[c].map_or(255, |p| p[at]));
+                            let black = u16::from(planes[3].map_or(255, |p| p[at]));
+                            ((ink * black + 127) / 255) as u8
+                        }
+                    };
+                }
+                // Raster uses straight alpha. Black ink is never alpha.
+                pixel[3] = alpha.map_or(255, |p| p[at]);
+            }
+        }
+        Ok(rgba)
+    }
+}
+
 pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
     let mut c = Cursor::new(bytes);
     ensure!(c.take(4)? == b"8BPS", "这不是 Photoshop 文件");
@@ -601,12 +745,18 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
             && u64::from(width) * u64::from(height) <= limits.max_surface_pixels,
         "Photoshop 画布超出内存限制"
     );
-    ensure!(depth == 8 && mode == 3, "仅支持 8-bit RGB Photoshop 文件");
+    ensure!(depth == 8, "仅支持 8-bit Photoshop 文件");
+    ensure!(mode == 3 || mode == 4, "仅支持 RGB 或 CMYK Photoshop 文件");
+    ensure!(
+        channels >= if mode == 4 { 4 } else { 3 },
+        "Photoshop 颜色通道数量不足"
+    );
     let color_length = c.u32()? as usize;
     c.skip(color_length)?;
     let resources_length = c.u32()? as usize;
     let mut resources = c.section(resources_length)?;
     let mut resolution = 72.0;
+    let mut icc = None;
     while resources.bytes.len() - resources.offset >= 12 {
         ensure!(resources.take(4)? == b"8BIM", "Photoshop 资源标识无效");
         let id = resources.u16()?;
@@ -624,7 +774,12 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
             resolution =
                 (u32::from_be_bytes(data[..4].try_into()?) as f64 / 65536.0).clamp(1.0, 9600.0);
         }
+        if id == 1039 && !data.is_empty() {
+            icc = Some(data);
+        }
     }
+    let mut notes = Vec::new();
+    let color = PixelColor::new(mode, icc, &mut notes);
     let section_length = c.length(large)?;
     let mut section = c.section(section_length)?;
     let mut records = Vec::new();
@@ -648,7 +803,6 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
             let mut used = 0_u64;
             let mut mask_used = 0_u64;
             let mut layers = Vec::new();
-            let mut notes = Vec::new();
             let mut groups = Vec::new();
             let mut bases = BTreeMap::<Option<Uuid>, Uuid>::new();
             for r in records {
@@ -686,7 +840,9 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
                 let mut planes = BTreeMap::new();
                 for (id, len) in &r.channels {
                     let data = info.take(*len)?;
-                    if ![-2, -1, 0, 1, 2].contains(id) || *len < 2 {
+                    if !(*id == -2 || *id == -1 || (0..color.color_channels() as i16).contains(id))
+                        || *len < 2
+                    {
                         continue;
                     }
                     let mask = *id == -2;
@@ -732,17 +888,13 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
                     r.name
                 };
                 let mut pixels = if w > 0 && h > 0 && !is_group {
-                    let mut data = zeroed_bytes(
-                        count.checked_mul(4).context("PSD 图层缓冲区大小溢出")?,
-                        "PSD 图层",
+                    let channels =
+                        std::array::from_fn(|c| planes.get(&(c as i16)).map(Vec::as_slice));
+                    let data = color.rgba(
+                        count as usize,
+                        &channels,
+                        planes.get(&-1).map(Vec::as_slice),
                     )?;
-                    for p in 0..count as usize {
-                        for component in 0..3 {
-                            data[p * 4 + component] =
-                                planes.get(&(component as i16)).map_or(0, |v| v[p]);
-                        }
-                        data[p * 4 + 3] = planes.get(&-1).map_or(255, |v| v[p]);
-                    }
                     Some(PsdRaster {
                         width: w,
                         height: h,
@@ -919,15 +1071,15 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
         "Photoshop 合成图像超出内存限制"
     );
     let mut planes = Vec::new();
+    let retained_channels = color.color_channels() + 1;
     if compression == 0 {
         ensure!(
             data.len() >= count * channels as usize,
             "Photoshop 合成图像数据被截断"
         );
         // Photoshop may store spot/extra alpha channels here. The importer
-        // supports RGB(A), so retain only the first four planes and skip the
-        // rest without allocating a full-size Vec for each one.
-        for ch in 0..(channels as usize).min(4) {
+        // retains RGB(A) or CMYK(A), skipping all remaining spot channels.
+        for ch in 0..(channels as usize).min(retained_channels) {
             planes.push(copied_bytes(
                 &data[ch * count..(ch + 1) * count],
                 "PSD 合成通道",
@@ -964,7 +1116,7 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
                 offset.checked_add(total).is_some_and(|n| n <= data.len()),
                 "合成图像的 PackBits 数据被截断"
             );
-            if ch < 4 {
+            if ch < retained_channels {
                 let mut payload = Vec::new();
                 payload
                     .try_reserve_exact(
@@ -988,19 +1140,17 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
     } else {
         bail!("不支持 Photoshop 合成图像的压缩方式 {compression}");
     }
-    ensure!(planes.len() >= 3, "RGB Photoshop 图像需要三个通道");
-    let mut rgba = zeroed_bytes(
-        (count as u64)
-            .checked_mul(4)
-            .context("PSD 合成图像缓冲区大小溢出")?,
-        "PSD 合成图像",
+    ensure!(
+        planes.len() >= color.color_channels(),
+        "Photoshop 颜色通道数量不足"
+    );
+    let colors =
+        std::array::from_fn(|c| (c < color.color_channels()).then(|| planes[c].as_slice()));
+    let rgba = color.rgba(
+        count,
+        &colors,
+        planes.get(color.color_channels()).map(Vec::as_slice),
     )?;
-    for i in 0..count {
-        rgba[i * 4] = planes[0][i];
-        rgba[i * 4 + 1] = planes[1][i];
-        rgba[i * 4 + 2] = planes[2][i];
-        rgba[i * 4 + 3] = planes.get(3).map_or(255, |p| p[i]);
-    }
     Ok(PsdFile {
         width,
         height,
@@ -1011,7 +1161,7 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
             height,
             data: rgba,
         }),
-        conversions: Vec::new(),
+        conversions: notes,
     })
 }
 

@@ -80,6 +80,10 @@ cli("export", edited_project_path, "--output", output_pdf)
 
 `.comp` 默认保存为单个可编辑工程文件，交付该文件即可。旧目录包仍可读取；将旧工程转换时另存到新的 `.comp` 文件路径，不覆盖原目录。保存到用户授权的目标；编辑已有工程优先另存为，新文件冲突时使用新路径。不要直接改 manifest 或将导出的 PNG 当作分层工程。多个进程编辑同一个项目时使用指纹检查；`project_busy` 表示其他进程正在读写目标，等待后先重新 `inspect`，再按最新状态决定操作。收到指纹冲突后同样重新检查，勿盲目覆盖。
 
+包含原版 1.5.3 迁移的构建还支持 `convert_depth`（`depth` 为 `8-bit`、`16-bit` 或 `HDR`）、`rotate_canvas` 和形状 `smoothing`；先核对 capabilities，再使用这些操作。16 位 PNG/TIFF 与 HDR/EXR 会保留高精度图层，`inspect` 的图层 `image.depth` 可确认。转成 8 位会量化低位并裁切超白颜色。工程清单按内容使用 11/12/13/14，勿手动改清单版本。
+
+JSONL `export` 可传 `bitDepth:16`（仅 PNG/TIFF）或 `cmykProfile`（CMYK ICC 文件路径，仅 JPEG/TIFF/PDF，墨色通道为 8 位）；两者不组合。一次性 CLI 对应 `--bit-depth 16` 和 `--cmyk-profile 路径.icc`。OpenEXR 使用 `.exr`，保留 HDR 浮点颜色；普通 JPG/PNG8 会裁切超白亮部。CMYK 输出透明处铺白并嵌入 ICC；不宣称 PDF/X。EXR 按线性 sRGB/Rec.709 色度读取，自定义色度暂不转换。
+
 ## 连续操作会话
 
 连续编辑、撤销或重做用 `cli serve`，通过 stdin/stdout 每行传一个 JSON 对象。响应回显请求 `id`，`protocolVersion` 为 1，`ok` 为真时读取 `result`，否则读取 `error.code` 与 `error.message`。日志走 stderr。

@@ -6,14 +6,36 @@ use serde_json::Value;
 mod camera_raw;
 #[path = "dither.rs"]
 mod dither;
+#[path = "progressive_blur.rs"]
+mod progressive_blur;
+#[path = "scanlines.rs"]
+mod scanlines;
+
+pub fn bind_camera_raw_gpu(device: wgpu::Device, queue: wgpu::Queue) {
+    camera_raw::bind_gpu(device, queue);
+}
+
+pub fn discard_camera_raw_gpu_buffers() {
+    camera_raw::discard_gpu_buffers();
+}
+
+pub fn unbind_camera_raw_gpu() {
+    camera_raw::unbind_gpu();
+}
+
+pub(crate) fn neutralize_camera_raw_color(color: [f64; 3]) -> Option<[f64; 2]> {
+    camera_raw::neutralize(color)
+}
 
 pub const FILTERS: &[&str] = &[
     "Gaussian Blur",
+    "Progressive Blur",
     "Motion Blur",
     "Add Noise",
     "Vignette",
     "Bloom / Glow",
     "Dither",
+    "Scanlines",
     "Tonal Contrast",
     "Lens Correction",
     "Camera Raw Filter",
@@ -52,6 +74,9 @@ pub fn default_settings(kind: &str) -> Value {
             json!({"colorBalanceSettings":{"shadowCyanRed":0,"shadowMagentaGreen":0,"shadowYellowBlue":0,"midCyanRed":0,"midMagentaGreen":0,"midYellowBlue":0,"highlightCyanRed":0,"highlightMagentaGreen":0,"highlightYellowBlue":0,"preserveLuminosity":true}})
         }
         "Gaussian Blur" => json!({"blurRadius":10}),
+        "Progressive Blur" => {
+            json!({"progressiveFrom":0,"progressiveTo":20,"progressiveRadial":false,"progressiveInverted":false})
+        }
         "Motion Blur" => json!({"motionAngle":0,"motionDistance":10}),
         "Add Noise" => {
             json!({"noiseAmount":10,"noiseGaussian":false,"noiseMonochromatic":false,"noiseSeed":0})
@@ -66,6 +91,9 @@ pub fn default_settings(kind: &str) -> Value {
         "Lens Correction" => json!({"distortion":0}),
         "Dither" => {
             json!({"dither":{"style":"Atkinson (Classic Mac)","pixelSize":2,"pixelShape":"Square","cellSize":8,"textSize":14,"lineSpacing":4,"glow":35,"dots":0,"wobble":0,"angle":45,"levels":2,"diffusion":100,"density":0,"contrast":0,"colors":"Black & White","dark":{"red":0,"green":0,"blue":0},"light":{"red":1,"green":1,"blue":1},"lightOnDark":true,"characters":" .:-=+*#%@"}})
+        }
+        "Scanlines" => {
+            serde_json::json!({"scanlines":{"lineSpacing":4,"thickness":70,"glow":0,"dots":0,"wobble":0,"displace":0,"smoothness":50,"threshold":0,"split":0,"density":0,"contrast":0,"blackLevel":0,"colors":"Black & White","dark":{"red":0,"green":0,"blue":0},"light":{"red":1,"green":1,"blue":1}}})
         }
         "Camera Raw Filter" => camera_raw_defaults(),
         _ => json!({}),
@@ -119,6 +147,9 @@ pub fn apply_filter(image: &Raster, kind: &str, settings: &Value) -> Result<Rast
     if !FILTERS.contains(&kind) {
         return Err(format!("未知滤镜：{kind}"));
     }
+    if image.deep.is_some() && kind != "Dither" {
+        return apply_deep_filter(image, kind, settings);
+    }
     let (w, h) = (image.width as usize, image.height as usize);
     let mut p = image.to_rgba();
     pixels::premultiply(&mut p);
@@ -138,6 +169,7 @@ pub fn apply_filter(image: &Raster, kind: &str, settings: &Value) -> Result<Rast
                 number(settings, "blurRadius", number(settings, "radius", 10.0)),
             )
         }
+        "Progressive Blur" => p = progressive_blur::apply(&p, w, h, settings)?,
         "Motion Blur" => {
             p = motion_blur(
                 &p,
@@ -296,11 +328,138 @@ pub fn apply_filter(image: &Raster, kind: &str, settings: &Value) -> Result<Rast
             )
         }
         "Dither" => dither::apply(&mut p, w, h, section(settings, "dither"))?,
+        "Scanlines" => scanlines::apply(&mut p, w, h, section(settings, "scanlines"))?,
         "Camera Raw Filter" => camera_raw::apply(&mut p, w, h, section(settings, "cameraRaw"))?,
         _ => return Err(format!("滤镜处理程序缺失：{kind}")),
     }
     pixels::unpremultiply(&mut p);
     Ok(Raster::from_rgba(image.width, image.height, p))
+}
+
+/// Keep the authoritative 16-bit or half-float surface throughout an edit.
+/// Point curves use full precision; byte kernels use the upstream 4/10-pass
+/// derivative reconstruction instead of applying once to the display preview.
+fn apply_deep_filter(image: &Raster, kind: &str, settings: &Value) -> Result<Raster, String> {
+    let deep = image.deep.as_ref().expect("checked high-precision image");
+    let output = match kind {
+        "Invert" => deep.map_colors(|p| {
+            let scale = if deep.depth == crate::deep_pixels::Depth::Hdr {
+                p[0].max(p[1]).max(p[2]).max(1.)
+            } else {
+                1.
+            };
+            p.map(|v| scale - v)
+        }),
+        "Exposure" => {
+            let s = section(settings, "exposureSettings");
+            deep.exposure(
+                number(s, "exposure", 0.) as f32,
+                number(s, "offset", 0.) as f32,
+                number(s, "gamma", 1.) as f32,
+            )
+        }
+        "Levels" => {
+            let s = section(settings, "levels");
+            let ranges = s.get("ranges").and_then(Value::as_array);
+            let identity = Value::Null;
+            let r = |i: usize| ranges.and_then(|r| r.get(i)).unwrap_or(&identity);
+            normalized_deep_colors(deep, |p| {
+                std::array::from_fn(|c| level(level(p[c] as f64, r(c + 1)), r(0)) as f32)
+            })
+        }
+        "Curves" => {
+            let s = section(settings, "curves");
+            let channels = s.get("channels").and_then(Value::as_array);
+            let identity = Value::Null;
+            let points = |i: usize| channels.and_then(|r| r.get(i)).unwrap_or(&identity);
+            normalized_deep_colors(deep, |p| {
+                std::array::from_fn(|c| {
+                    (curve(
+                        curve(p[c] as f64 * 255., points(c + 1), 255.),
+                        points(0),
+                        255.,
+                    ) / 255.) as f32
+                })
+            })
+        }
+        "Gaussian Blur" => deep.gaussian_blur(number(
+            settings,
+            "blurRadius",
+            number(settings, "radius", 10.),
+        )),
+        "Gradient Map" | "Hue/Saturation" | "Black & White" | "Color Balance" => {
+            // A red-fast color cube smooths channel-mixing point adjustments.
+            // This mirrors DeepLayers.lookup rather than a quantized per-pixel edit.
+            let dimension = 33usize;
+            let mut cube_pixels = Vec::with_capacity(dimension.pow(3) * 4);
+            for b in 0..dimension {
+                for g in 0..dimension {
+                    for r in 0..dimension {
+                        cube_pixels.extend_from_slice(
+                            &[r, g, b]
+                                .map(|v| (v as f64 * 255. / (dimension - 1) as f64).round() as u8),
+                        );
+                        cube_pixels.push(255);
+                    }
+                }
+            }
+            let cube = apply_filter(
+                &Raster::from_rgba(
+                    dimension as u32,
+                    (dimension * dimension) as u32,
+                    cube_pixels.clone(),
+                ),
+                kind,
+                settings,
+            )?;
+            let cube: Vec<[f32; 3]> = cube
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    std::array::from_fn(|c| {
+                        let position = match c {
+                            0 => i % dimension,
+                            1 => (i / dimension) % dimension,
+                            _ => i / (dimension * dimension),
+                        };
+                        (position as f32 / (dimension - 1) as f32
+                            + (p[c] as f32 - cube_pixels[i * 4 + c] as f32) / 255.)
+                            .clamp(0., 1.)
+                    })
+                })
+                .collect();
+            deep.apply_cube(&cube, dimension)?
+        }
+        _ => deep.run_8bit(kind == "Camera Raw Filter", |mut p| {
+            pixels::unpremultiply(&mut p);
+            let out = apply_filter(
+                &Raster::from_rgba(image.width, image.height, p),
+                kind,
+                settings,
+            )?;
+            let mut out = out.to_rgba();
+            pixels::premultiply(&mut out);
+            Ok(out)
+        })?,
+    };
+    Ok(Raster::from_deep(output))
+}
+
+fn normalized_deep_colors(
+    deep: &crate::deep_pixels::DeepRaster,
+    operation: impl Fn([f32; 3]) -> [f32; 3],
+) -> crate::deep_pixels::DeepRaster {
+    deep.map_colors(|p| {
+        let scale = if deep.depth == crate::deep_pixels::Depth::Hdr {
+            p[0].max(p[1]).max(p[2]).max(1.)
+        } else {
+            1.
+        };
+        operation(p.map(|v| v / scale)).map(|v| v * scale)
+    })
 }
 fn level(v: f64, r: &Value) -> f64 {
     let black = number(r, "black", 0.0).clamp(0.0, 254.0);
@@ -580,6 +739,9 @@ fn bloom(p: &mut [u8], w: usize, h: usize, s: &Value) {
 
 /// Apply all six effects around the visible alpha. Returned inset is in source-layer pixels.
 pub fn apply_effects(image: &Raster, effects: &Value) -> (Raster, f64) {
+    if image.deep.is_some() {
+        return apply_deep_effects(image, effects);
+    }
     let visible = |key: &str| {
         effects.get(key).filter(|v| {
             v.is_object() && boolean(v, "enabled", true) && number(v, "opacity", 1.0) > 0.0
@@ -607,6 +769,16 @@ pub fn apply_effects(image: &Raster, effects: &Value) -> (Raster, f64) {
             let mut p = image.get(x, y);
             pixels::premultiply(&mut p);
             source[i..i + 4].copy_from_slice(&p);
+        }
+    }
+    if let Some(s) = visible("colorOverlay") {
+        let color = color(s, [0.; 3]);
+        let opacity = number(s, "opacity", 1.).clamp(0., 1.);
+        for p in source.as_chunks_mut::<4>().0 {
+            for c in 0..3 {
+                p[c] =
+                    (p[c] as f64 * (1. - opacity) + color[c] * p[3] as f64 * opacity).round() as u8;
+            }
         }
     }
     let alpha = pixels::extract_alpha(&source);
@@ -677,9 +849,6 @@ pub fn apply_effects(image: &Raster, effects: &Value) -> (Raster, f64) {
             o[c] = (p[c] as f64 + o[c] as f64 * keep).round().min(255.0) as u8;
         }
     }
-    if let Some(s) = visible("colorOverlay") {
-        paint_coverage(&mut out, &alpha, s);
-    }
     for key in ["innerGlow", "innerShadow"] {
         if let Some(s) = visible(key) {
             let (dx, dy, blur) = if key == "innerShadow" {
@@ -720,10 +889,271 @@ fn paint_coverage(p: &mut [u8], coverage: &[u8], s: &Value) {
     }
 }
 
+/// Coverage effects are masks; the source and compositing remain at layer depth.
+/// This preserves sub-byte colors and HDR highlights under shadows and overlays.
+fn apply_deep_effects(image: &Raster, effects: &Value) -> (Raster, f64) {
+    let visible = |key: &str| {
+        effects.get(key).filter(|s| {
+            s.is_object() && boolean(s, "enabled", true) && number(s, "opacity", 1.) > 0.
+        })
+    };
+    let active = [
+        "stroke",
+        "shadow",
+        "outerGlow",
+        "colorOverlay",
+        "innerGlow",
+        "innerShadow",
+    ];
+    if active.iter().all(|key| visible(key).is_none()) {
+        return (image.clone(), 0.);
+    }
+    let mut margin = 0f64;
+    if let Some(s) = visible("stroke")
+        && !boolean(s, "inside", false)
+    {
+        margin = margin.max(number(s, "size", 4.));
+    }
+    if let Some(s) = visible("shadow") {
+        margin = margin.max(number(s, "distance", 20.) + number(s, "blur", 20.) * 3.);
+    }
+    if let Some(s) = visible("outerGlow") {
+        margin = margin.max(number(s, "size", 20.) * 3.);
+    }
+    let inset = margin.ceil() as usize + 2;
+    let w = image.width as usize + inset * 2;
+    let h = image.height as usize + inset * 2;
+    let mut coverage = vec![0u8; w * h];
+    for y in 0..image.height {
+        for x in 0..image.width {
+            coverage[(y as usize + inset) * w + x as usize + inset] =
+                (image.get_f32(x, y)[3] * 255.).round() as u8;
+        }
+    }
+    let shifted = |dx: f64, dy: f64, blur: f64| {
+        let rgba: Vec<u8> = coverage.iter().flat_map(|&a| [a; 4]).collect();
+        let mut moved = vec![0u8; rgba.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let alpha = pixels::bilinear(&rgba, w, h, x as f64 - dx, y as f64 - dy, false)[3];
+                moved[(y * w + x) * 4..(y * w + x + 1) * 4].fill(alpha);
+            }
+        }
+        pixels::extract_alpha(&pixels::gaussian_blur(&moved, w, h, blur / 2.))
+    };
+    let stroke = |s: &Value| {
+        let inside = boolean(s, "inside", false);
+        let morphed = pixels::morphology(
+            &coverage,
+            w,
+            h,
+            number(s, "size", 4.).round().max(1.) as usize,
+            inside,
+        );
+        coverage
+            .iter()
+            .zip(morphed)
+            .map(|(&a, b)| {
+                if inside {
+                    a.saturating_sub(b)
+                } else {
+                    b.saturating_sub(a)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut out = vec![0f32; w * h * 4];
+    let paint = |out: &mut [f32], mask: &[u8], s: &Value| {
+        let color = color(s, [0.; 3]).map(|v| v as f32);
+        let opacity = number(s, "opacity", 1.).clamp(0., 1.) as f32;
+        for (p, &coverage) in out.as_chunks_mut::<4>().0.iter_mut().zip(mask) {
+            let alpha = coverage as f32 / 255. * opacity;
+            for c in 0..3 {
+                p[c] = color[c] * alpha + p[c] * (1. - alpha);
+            }
+            p[3] = alpha + p[3] * (1. - alpha);
+        }
+    };
+    if let Some(s) = visible("shadow") {
+        let angle = number(s, "angle", 90.).to_radians();
+        let distance = number(s, "distance", 20.);
+        paint(
+            &mut out,
+            &shifted(
+                -angle.cos() * distance,
+                angle.sin() * distance,
+                number(s, "blur", 20.),
+            ),
+            s,
+        );
+    }
+    if let Some(s) = visible("outerGlow") {
+        let blurred = shifted(0., 0., number(s, "size", 20.));
+        let mask: Vec<u8> = blurred
+            .iter()
+            .zip(&coverage)
+            .map(|(&b, &a)| ((b as u32 * (255 - a as u32) + 127) / 255) as u8)
+            .collect();
+        paint(&mut out, &mask, s);
+    }
+    if let Some(s) = visible("stroke")
+        && !boolean(s, "inside", false)
+    {
+        paint(&mut out, &stroke(s), s);
+    }
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let mut source = image.get_f32(x, y);
+            if let Some(s) = visible("colorOverlay") {
+                let color = color(s, [0.; 3]);
+                let opacity = number(s, "opacity", 1.).clamp(0., 1.) as f32;
+                for c in 0..3 {
+                    source[c] = source[c] * (1. - opacity) + color[c] as f32 * opacity;
+                }
+            }
+            let i = ((y as usize + inset) * w + x as usize + inset) * 4;
+            for c in 0..3 {
+                out[i + c] = source[c] * source[3] + out[i + c] * (1. - source[3]);
+            }
+            out[i + 3] = source[3] + out[i + 3] * (1. - source[3]);
+        }
+    }
+    for key in ["innerGlow", "innerShadow"] {
+        if let Some(s) = visible(key) {
+            let (dx, dy, blur) = if key == "innerShadow" {
+                let angle = number(s, "angle", 90.).to_radians();
+                let d = number(s, "distance", 10.);
+                (-angle.cos() * d, angle.sin() * d, number(s, "blur", 10.))
+            } else {
+                (0., 0., number(s, "size", 10.))
+            };
+            let shifted = shifted(dx, dy, blur);
+            let mask: Vec<u8> = coverage
+                .iter()
+                .zip(shifted)
+                .map(|(&a, b)| ((a as u32 * (255 - b as u32) + 127) / 255) as u8)
+                .collect();
+            paint(&mut out, &mask, s);
+        }
+    }
+    if let Some(s) = visible("stroke")
+        && boolean(s, "inside", false)
+    {
+        paint(&mut out, &stroke(s), s);
+    }
+    for p in out.as_chunks_mut::<4>().0 {
+        if p[3] > 0. {
+            for c in 0..3 {
+                p[c] /= p[3];
+            }
+        }
+    }
+    let deep = crate::deep_pixels::DeepRaster::from_f32(
+        w as u32,
+        h as u32,
+        image.deep.as_ref().unwrap().depth,
+        &out,
+    )
+    .expect("finite layer-effect composition");
+    (Raster::from_deep(deep), inset as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn deep_point_filters_keep_low_bits_and_hdr_exposure_recovers_highlights() {
+        use crate::deep_pixels::{DeepRaster, Depth};
+        let source = Raster::from_deep(
+            DeepRaster::from_u16(
+                2,
+                1,
+                vec![30001, 30101, 30201, 32769, 30002, 30102, 30202, 32769],
+            )
+            .unwrap(),
+        );
+        for kind in [
+            "Levels",
+            "Curves",
+            "Exposure",
+            "Hue/Saturation",
+            "Color Balance",
+            "Camera Raw Filter",
+        ] {
+            let out = apply_filter(&source, kind, &default_settings(kind)).unwrap();
+            let bits = out.deep.as_ref().unwrap().to_bits();
+            assert_eq!(bits[3], 32769, "{kind} alpha");
+            assert!(
+                bits[4] > bits[0],
+                "{kind} lost adjacent sub-byte colors: {bits:?}"
+            );
+        }
+        let hdr =
+            Raster::from_deep(DeepRaster::from_f32(1, 1, Depth::Hdr, &[4., 2., 1., 0.5]).unwrap());
+        let out = apply_filter(&hdr, "Exposure", &json!({"exposure":-6.})).unwrap();
+        let p = out.get_f32(0, 0);
+        assert!(p[0] > p[1] && p[1] > p[2] && p[0] < 1.);
+        assert_eq!(p[3], 0.5);
+        let inverted = apply_filter(&source, "Invert", &Value::Null).unwrap();
+        assert_eq!(
+            inverted.deep.as_ref().unwrap().get_bits(0, 0),
+            [35534, 35434, 35334, 32769]
+        );
+        let dithered = apply_filter(&source, "Dither", &default_settings("Dither")).unwrap();
+        assert!(dithered.deep.is_none());
+    }
+    #[test]
+    fn color_overlay_changes_only_source_color_and_preserves_coverage_and_shadow() {
+        let white = json!({"red":1.,"green":1.,"blue":1.,"opacity":1.});
+        for (source, effects, expected) in [
+            (
+                [0, 0, 0, 128],
+                json!({"colorOverlay":white}),
+                [128, 128, 128, 128],
+            ),
+            (
+                [255, 0, 0, 255],
+                json!({"colorOverlay":{"red":0.,"green":0.,"blue":1.,"opacity":0.5}}),
+                [128, 0, 128, 255],
+            ),
+            (
+                [0, 0, 0, 128],
+                json!({"colorOverlay":white,"shadow":{"red":1.,"green":0.,"blue":0.,"opacity":1.,"distance":0.,"blur":0.}}),
+                [192, 128, 128, 192],
+            ),
+        ] {
+            let (out, inset) = apply_effects(&Raster::solid(1, 1, source), &effects);
+            let mut p = out.get(inset as u32, inset as u32);
+            pixels::premultiply(&mut p);
+            for c in 0..4 {
+                assert!(
+                    (p[c] as i32 - expected[c]).abs() <= 1,
+                    "{p:?} vs {expected:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn deep_effects_keep_hdr_source_and_exact_overlay_alpha() {
+        use crate::deep_pixels::{DeepRaster, Depth};
+        let source = Raster::from_deep(
+            DeepRaster::from_f32(1, 1, Depth::Hdr, &[4., 2., 0.25, 0.5]).unwrap(),
+        );
+        let (out, inset) = apply_effects(
+            &source,
+            &json!({"shadow":{"distance":4.,"blur":0.,"opacity":0.5}}),
+        );
+        assert_eq!(
+            out.get_f32(inset as u32, inset as u32),
+            source.get_f32(0, 0)
+        );
+        let (out, inset) = apply_effects(
+            &source,
+            &json!({"colorOverlay":{"red":1.,"green":1.,"blue":1.,"opacity":1.}}),
+        );
+        assert_eq!(out.get_f32(inset as u32, inset as u32), [1., 1., 1., 0.5]);
+    }
     #[test]
     fn exposure_alpha_and_linear_stops() {
         let r = Raster::solid(1, 1, [128, 128, 128, 128]);

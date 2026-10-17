@@ -471,6 +471,103 @@ pub fn flip_canvas(doc: &mut Document, horizontal: bool) {
     }
 }
 
+/// A quarter turn places the original layer grids; no image or mask is resampled.
+/// Ported from Compositor 1.5.3 CanvasRotation.swift (Wonder Assembly LLC, MIT).
+pub fn rotate_canvas(doc: &mut Document, clockwise: bool) {
+    let canvas = [doc.width as f64, doc.height as f64];
+    for layer in &mut doc.layers {
+        quarter_turn_transform(&mut layer.transform, canvas, clockwise);
+        if let Some(mask) = &mut layer.mask
+            && let Some(placement) = &mut mask.placement
+        {
+            quarter_turn_transform(placement, canvas, clockwise);
+        }
+    }
+    for guide in &mut doc.guides {
+        match (guide.axis.as_str(), clockwise) {
+            ("vertical", true) => guide.axis = "horizontal".into(),
+            ("vertical", false) => {
+                guide.axis = "horizontal".into();
+                guide.position = canvas[0] - guide.position;
+            }
+            ("horizontal", true) => {
+                guide.axis = "vertical".into();
+                guide.position = canvas[1] - guide.position;
+            }
+            ("horizontal", false) => guide.axis = "vertical".into(),
+            _ => {}
+        }
+    }
+    if let Some(selection) = &doc.selection {
+        doc.selection = Some(quarter_turn_selection(selection, clockwise));
+    }
+    std::mem::swap(&mut doc.width, &mut doc.height);
+}
+
+fn quarter_turn_transform(transform: &mut Transform, canvas: [f64; 2], clockwise: bool) {
+    let center = [
+        transform.origin[0] + transform.size[0] / 2.,
+        transform.origin[1] + transform.size[1] / 2.,
+    ];
+    let center = if clockwise {
+        [canvas[1] - center[1], center[0]]
+    } else {
+        [center[1], canvas[0] - center[0]]
+    };
+    transform.origin = [
+        center[0] - transform.size[0] / 2.,
+        center[1] - transform.size[1] / 2.,
+    ];
+    transform.rotation = (transform.rotation + if clockwise { 90. } else { -90. }) % 360.;
+}
+
+fn quarter_turn_selection(selection: &Selection, clockwise: bool) -> Selection {
+    let regions = selection
+        .regions()
+        .map(|(origin, size, coverage)| {
+            let mut rotated = vec![0; coverage.len()];
+            for y in 0..size[1] {
+                for x in 0..size[0] {
+                    let (rx, ry) = if clockwise {
+                        (size[1] - 1 - y, x)
+                    } else {
+                        (y, size[0] - 1 - x)
+                    };
+                    rotated[(ry as u64 * size[1] as u64 + rx as u64) as usize] =
+                        coverage[(y as u64 * size[0] as u64 + x as u64) as usize];
+                }
+            }
+            let origin = if clockwise {
+                [
+                    (selection.height as i64)
+                        .saturating_sub(origin[1])
+                        .saturating_sub(size[1] as i64),
+                    origin[0],
+                ]
+            } else {
+                [
+                    origin[1],
+                    (selection.width as i64)
+                        .saturating_sub(origin[0])
+                        .saturating_sub(size[0] as i64),
+                ]
+            };
+            crate::model::SelectionRegion {
+                origin,
+                size: [size[1], size[0]],
+                coverage: Arc::new(rotated),
+            }
+        })
+        .collect();
+    let mut result = Selection::from_regions(selection.height, selection.width, regions);
+    result.feather = selection.feather;
+    result.feather_base = selection
+        .feather_base
+        .as_ref()
+        .map(|base| Arc::new(quarter_turn_selection(base, clockwise)));
+    result
+}
+
 pub fn resize_canvas(doc: &mut Document, width: u32, height: u32, anchor: [f64; 2]) -> Result<()> {
     ensure!(Document::valid_size(width, height), "画布尺寸无效");
     ensure!(
@@ -531,9 +628,33 @@ pub fn crop(doc: &mut Document, rect: [f64; 4]) -> Result<()> {
 }
 pub fn resize_image(doc: &mut Document, width: u32, height: u32, sampling: Sampling) -> Result<()> {
     ensure!(Document::valid_size(width, height), "图像尺寸无效");
+    if doc.width == width && doc.height == height {
+        return Ok(());
+    }
     let sx = width as f64 / doc.width as f64;
     let sy = height as f64 / doc.height as f64;
+    let effect_scale = (sx * sy).sqrt();
     for l in &mut doc.layers {
+        if let Some(effects) = &mut l.effects {
+            for (section, fields) in [
+                ("stroke", &["size"][..]),
+                ("outerGlow", &["size"][..]),
+                ("innerGlow", &["size"][..]),
+                ("shadow", &["distance", "blur"][..]),
+                ("innerShadow", &["distance", "blur"][..]),
+            ] {
+                for &field in fields {
+                    if let Some(v) = effects[section][field].as_f64() {
+                        effects[section][field] =
+                            json!((v * effect_scale).min(if field == "distance" {
+                                5000.
+                            } else {
+                                500.
+                            }));
+                    }
+                }
+            }
+        }
         let old = l.transform;
         if let Some(m) = &mut l.mask {
             let mut t = m.placement.unwrap_or(old);
@@ -573,34 +694,56 @@ pub fn resize_image(doc: &mut Document, width: u32, height: u32, sampling: Sampl
             "调整后的图层超出图像大小上限"
         );
         if let Some(image) = &l.image {
-            let mut data = vec![0; w as usize * h as usize * 4];
-            for y in 0..h {
-                for x in 0..w {
-                    let unit = old.from_document([
-                        (minx + x as f64 + 0.5) / sx,
-                        (miny + y as f64 + 0.5) / sy,
-                    ]);
-                    let p = if sampling == Sampling::Nearest {
-                        if unit.iter().all(|v| *v >= 0. && *v < 1.) {
-                            image.get(
-                                (unit[0] * image.width as f64) as u32,
-                                (unit[1] * image.height as f64) as u32,
-                            )
-                        } else {
-                            [0; 4]
-                        }
-                    } else {
-                        crate::brush::sample(
-                            image,
-                            unit[0] * image.width as f64 - 0.5,
-                            unit[1] * image.height as f64 - 0.5,
-                        )
-                    };
-                    let i = ((y * w + x) * 4) as usize;
-                    data[i..i + 4].copy_from_slice(&p);
+            if let Some(deep) = &image.deep {
+                let mut result = crate::deep_pixels::DeepRaster::blank(w, h, deep.depth);
+                for y in 0..h {
+                    for x in 0..w {
+                        let unit = old.from_document([
+                            (minx + x as f64 + 0.5) / sx,
+                            (miny + y as f64 + 0.5) / sy,
+                        ]);
+                        result.set(
+                            x,
+                            y,
+                            image.sample_f32(
+                                unit[0] * image.width as f64 - 0.5,
+                                unit[1] * image.height as f64 - 0.5,
+                                sampling,
+                            ),
+                        );
+                    }
                 }
+                l.image = Some(Arc::new(Raster::from_deep(result)));
+            } else {
+                let mut data = vec![0; w as usize * h as usize * 4];
+                for y in 0..h {
+                    for x in 0..w {
+                        let unit = old.from_document([
+                            (minx + x as f64 + 0.5) / sx,
+                            (miny + y as f64 + 0.5) / sy,
+                        ]);
+                        let p = if sampling == Sampling::Nearest {
+                            if unit.iter().all(|v| *v >= 0. && *v < 1.) {
+                                image.get(
+                                    (unit[0] * image.width as f64) as u32,
+                                    (unit[1] * image.height as f64) as u32,
+                                )
+                            } else {
+                                [0; 4]
+                            }
+                        } else {
+                            crate::brush::sample(
+                                image,
+                                unit[0] * image.width as f64 - 0.5,
+                                unit[1] * image.height as f64 - 0.5,
+                            )
+                        };
+                        let i = ((y * w + x) * 4) as usize;
+                        data[i..i + 4].copy_from_slice(&p);
+                    }
+                }
+                l.image = Some(Arc::new(Raster::from_rgba(w, h, data)));
             }
-            l.image = Some(Arc::new(Raster::from_rgba(w, h, data)));
             l.text = None;
             l.shape = None;
         }
@@ -615,6 +758,50 @@ pub fn resize_image(doc: &mut Document, width: u32, height: u32, sampling: Sampl
     }
     doc.width = width;
     doc.height = height;
+    Ok(())
+}
+
+/// Explicit layer bit-depth conversion; converting to bytes is intentionally destructive.
+pub fn convert_layer_depth(
+    doc: &mut Document,
+    id: Uuid,
+    depth: Option<crate::deep_pixels::Depth>,
+) -> Result<()> {
+    let canvas = [doc.width, doc.height];
+    let layer = doc
+        .layer_mut(id)
+        .ok_or_else(|| anyhow::anyhow!("图层已不存在"))?;
+    ensure!(
+        !layer.is_group && layer.adjustment.is_none(),
+        "请选择像素图层"
+    );
+    let Some(image) = layer.image.as_deref() else {
+        if let Some(depth) = depth {
+            layer.image = Some(Arc::new(Raster::from_deep(
+                crate::deep_pixels::DeepRaster::blank(canvas[0], canvas[1], depth),
+            )));
+            layer.transform = Transform::new(0., 0., canvas[0] as f64, canvas[1] as f64);
+        }
+        return Ok(());
+    };
+    let result = if let Some(depth) = depth {
+        if let Some(deep) = &image.deep {
+            Raster::from_deep(deep.converted(depth))
+        } else {
+            let values: Vec<f32> = image
+                .to_rgba()
+                .into_iter()
+                .map(|v| v as f32 / 255.)
+                .collect();
+            Raster::from_deep(
+                crate::deep_pixels::DeepRaster::from_f32(image.width, image.height, depth, &values)
+                    .map_err(anyhow::Error::msg)?,
+            )
+        }
+    } else {
+        Raster::from_rgba(image.width, image.height, image.to_rgba())
+    };
+    layer.image = Some(Arc::new(result));
     Ok(())
 }
 
@@ -765,6 +952,29 @@ pub fn add_shape(
     line_width: f64,
     line_ends: Option<[[f64; 2]; 2]>,
 ) -> Result<Uuid> {
+    add_shape_with_smoothing(
+        doc,
+        kind,
+        rect,
+        color,
+        corner_radius,
+        line_width,
+        line_ends,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps the existing shape API while adding the optional corner geometry.
+pub fn add_shape_with_smoothing(
+    doc: &mut Document,
+    kind: ShapeKind,
+    rect: [f64; 4],
+    color: [u8; 4],
+    corner_radius: f64,
+    line_width: f64,
+    line_ends: Option<[[f64; 2]; 2]>,
+    smoothing: bool,
+) -> Result<Uuid> {
     ensure!(
         rect.iter().all(|x| x.is_finite()) && rect[2] >= 1. && rect[3] >= 1.,
         "形状尺寸必须是有效正数"
@@ -772,6 +982,9 @@ pub fn add_shape(
     let w = rect[2].round() as u32;
     let h = rect[3].round() as u32;
     let mut style = json!({"kind":match kind{ShapeKind::Rectangle=>"Rectangle",ShapeKind::Ellipse=>"Ellipse",ShapeKind::Line=>"Line"},"red":color[0] as f64/255.,"green":color[1] as f64/255.,"blue":color[2] as f64/255.,"cornerRadius":corner_radius});
+    if kind == ShapeKind::Rectangle && smoothing {
+        style["smoothing"] = json!(true);
+    }
     if kind == ShapeKind::Line {
         let ends = line_ends.unwrap_or([[0., 0.], [1., 1.]]);
         style["lineWidth"] = json!(line_width);
@@ -803,6 +1016,12 @@ pub fn shape_raster(style: &Value, width: u32, height: u32) -> Result<Raster> {
     ];
     let kind = style["kind"].as_str().unwrap_or("Rectangle");
     let radius = get("cornerRadius", 0.).clamp(0., width.min(height) as f64 / 2.);
+    let rectangle = crate::smooth_corners::RoundedRectangle::new(
+        width as f64,
+        height as f64,
+        radius,
+        style["smoothing"].as_bool() == Some(true),
+    );
     let thickness = get("lineWidth", 4.).clamp(0.1, 5000.);
     let point = |key: &str, default: [f64; 2]| {
         let v = &style[key];
@@ -847,11 +1066,7 @@ pub fn shape_raster(style: &Value, width: u32, height: u32) -> Result<Raster> {
                             .clamp(0., 1.);
                             (px - a[0] - t * d[0]).hypot(py - a[1] - t * d[1]) <= thickness / 2.
                         }
-                        _ => {
-                            let cx = px.clamp(radius, width as f64 - radius);
-                            let cy = py.clamp(radius, height as f64 - radius);
-                            (px - cx).hypot(py - cy) <= radius
-                        }
+                        _ => rectangle.contains(px, py),
                     };
                     if inside {
                         count += 1;
@@ -1190,6 +1405,9 @@ pub fn merge_layers(doc: &mut Document, ids: &[Uuid]) -> Result<Uuid> {
             raster.set(x, y, composite.get(x + b[0] as u32, y + b[1] as u32));
         }
     }
+    if let Some(deep) = &composite.deep {
+        raster = Raster::from_deep(deep.crop(b[0] as u32, b[1] as u32, b[2] as u32, b[3] as u32));
+    }
     let mut merged = Layer::raster(name, raster);
     merged.parent_id = parent;
     merged.transform.origin = [b[0], b[1]];
@@ -1321,7 +1539,17 @@ pub fn free_distort(
         {
             m.placement = Some(l.transform);
         }
-        l.image = Some(Arc::new(Raster::from_rgba(w, h, data)));
+        let output = if let Some(deep) = &source.deep {
+            let native = deep.flipped(old.flip_x, old.flip_y);
+            Raster::from_deep(
+                native
+                    .perspective_warp(w, h, local)
+                    .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            Raster::from_rgba(w, h, data)
+        };
+        l.image = Some(Arc::new(output));
         l.transform = t;
         l.text = None;
         l.shape = None;
@@ -1341,6 +1569,22 @@ pub fn selected_pixels(doc: &Document, composite: &Raster) -> Option<(Raster, [f
     let w = b[2] - b[0];
     let h = b[3] - b[1];
     let mut out = Raster::blank(w, h);
+    if let Some(deep) = &composite.deep {
+        let mut output = deep.crop(b[0], b[1], w, h);
+        if let Some(selection) = &doc.selection {
+            for y in 0..h {
+                for x in 0..w {
+                    let amount = selection.get(x + b[0], y + b[1]);
+                    if amount != 255 {
+                        let mut p = output.get(x, y);
+                        p[3] *= amount as f32 / 255.;
+                        output.set(x, y, p);
+                    }
+                }
+            }
+        }
+        return Some((Raster::from_deep(output), [b[0] as f64, b[1] as f64]));
+    }
     for y in 0..h {
         for x in 0..w {
             let mut p = composite.get(x + b[0], y + b[1]);
@@ -1489,6 +1733,33 @@ pub fn move_selected_pixels(
             }
         }
     }
+    if let Some(deep) = &source.deep {
+        let mut result = crate::deep_pixels::DeepRaster::blank(w, h, deep.depth);
+        let sample = |p: [f64; 2]| {
+            let unit = old.from_document(p);
+            deep.sample(
+                unit[0] * source.width as f64 - 0.5,
+                unit[1] * source.height as f64 - 0.5,
+            )
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let p = t.to_document([(x as f64 + 0.5) / w as f64, (y as f64 + 0.5) / h as f64]);
+                let mut base = sample(p);
+                if !duplicate {
+                    base[3] *= (1. - coverage(p)) as f32;
+                }
+                let from = [p[0] - offset[0], p[1] - offset[1]];
+                let paint = sample(from);
+                result.set(
+                    x,
+                    y,
+                    crate::deep_pixels::over(base, paint, coverage(from) as f32),
+                );
+            }
+        }
+        out = Raster::from_deep(result);
+    }
     let l = doc.layer_mut(id).unwrap();
     if mask {
         let m = l.mask.as_mut().unwrap();
@@ -1519,6 +1790,99 @@ pub fn move_selected_pixels(
 mod tests {
     use super::*;
     use crate::model::Mask;
+    #[test]
+    fn deep_resize_selection_copy_move_and_distort_retain_low_bits() {
+        let mut doc = Document::new(2, 1);
+        let id = doc.active_layer_id.unwrap();
+        let bits = vec![30001, 20001, 10001, 65535, 30002, 20002, 10002, 65535];
+        doc.active_mut().unwrap().image = Some(Arc::new(Raster::from_deep(
+            crate::deep_pixels::DeepRaster::from_u16(2, 1, bits.clone()).unwrap(),
+        )));
+        let original = doc.clone();
+        let copied = selected_pixels(&doc, doc.active().unwrap().image.as_deref().unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(copied.deep.as_ref().unwrap().to_bits(), bits);
+        resize_image(&mut doc, 4, 2, Sampling::Nearest).unwrap();
+        let out = doc
+            .active()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .deep
+            .as_ref()
+            .unwrap();
+        assert_eq!(out.get_bits(0, 0), [30001, 20001, 10001, 65535]);
+        assert_eq!(out.get_bits(3, 1), [30002, 20002, 10002, 65535]);
+        doc = original.clone();
+        free_distort(
+            &mut doc,
+            id,
+            [[0., 0.], [2., 0.], [2., 1.], [0., 1.]],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            doc.active()
+                .unwrap()
+                .image
+                .as_ref()
+                .unwrap()
+                .deep
+                .as_ref()
+                .unwrap()
+                .to_bits(),
+            bits
+        );
+        doc = original;
+        doc.selection = Some(crate::selection::marquee(
+            2,
+            1,
+            [0., 0., 1., 1.],
+            false,
+            false,
+        ));
+        move_selected_pixels(&mut doc, id, false, [1., 0.], false).unwrap();
+        let layer = doc.active().unwrap();
+        let out = layer.image.as_ref().unwrap().deep.as_ref().unwrap();
+        assert_eq!(out.get_bits(0, 0)[3], 0);
+        assert_eq!(out.get_bits(1, 0), [30001, 20001, 10001, 65535]);
+    }
+    #[test]
+    fn resolution_only_resize_keeps_metadata_and_resizing_scales_effects() {
+        let mut doc = Document::new(20, 10);
+        let layer = doc.active_mut().unwrap();
+        layer.text = Some(json!({"content":"Text","fontSize":20.}));
+        layer.shape = Some(json!({"kind":"Rectangle","cornerRadius":3.}));
+        layer.image = Some(Arc::new(Raster::solid(20, 10, [0; 4])));
+        layer.effects = Some(
+            json!({"stroke":{"size":4.},"shadow":{"distance":20.,"blur":10.,"angle":60.},"outerGlow":{"size":8.}}),
+        );
+        let before = doc.clone();
+        resize_image(&mut doc, 20, 10, Sampling::Smooth).unwrap();
+        assert_eq!(doc, before);
+        resize_image(&mut doc, 10, 5, Sampling::Smooth).unwrap();
+        let layer = doc.active().unwrap();
+        assert!(layer.text.is_none() && layer.shape.is_none());
+        let effects = layer.effects.as_ref().unwrap();
+        assert_eq!(effects["stroke"]["size"], json!(2.));
+        assert_eq!(effects["shadow"]["distance"], json!(10.));
+        assert_eq!(effects["shadow"]["blur"], json!(5.));
+        assert_eq!(effects["shadow"]["angle"], json!(60.));
+        assert_eq!(effects["outerGlow"]["size"], json!(4.));
+    }
+    #[test]
+    fn blank_layer_depth_conversion_supports_future_high_precision_paint() {
+        let mut doc = Document::new(3, 2);
+        let id = doc.active_layer_id.unwrap();
+        convert_layer_depth(&mut doc, id, Some(crate::deep_pixels::Depth::U16)).unwrap();
+        let image = doc.active().unwrap().image.as_ref().unwrap();
+        assert_eq!([image.width, image.height], [3, 2]);
+        assert!(image.deep.is_some());
+        convert_layer_depth(&mut doc, id, None).unwrap();
+        assert!(doc.active().unwrap().image.as_ref().unwrap().deep.is_none());
+    }
     #[test]
     fn groups_duplicate_with_ids_and_reject_cycles() {
         let mut d = Document::new(10, 10);
@@ -1555,6 +1919,161 @@ mod tests {
         assert_eq!(d.selection.as_ref().unwrap().get(0, 0), 255);
     }
     #[test]
+    fn quarter_turn_canvas_renders_exact_pixels_without_resampling_sources() {
+        let mut original = Document::new(3, 2);
+        original.active_mut().unwrap().image = Some(Arc::new(Raster::from_rgba(
+            3,
+            2,
+            [10, 20, 30, 40, 50, 60]
+                .into_iter()
+                .flat_map(|red| [red, 0, 0, 255])
+                .collect(),
+        )));
+        let source = original.active().unwrap().image.clone().unwrap();
+        for (clockwise, expected) in [
+            (true, [40, 10, 50, 20, 60, 30]),
+            (false, [30, 60, 20, 50, 10, 40]),
+        ] {
+            let mut doc = original.clone();
+            rotate_canvas(&mut doc, clockwise);
+            assert_eq!([doc.width, doc.height], [2, 3]);
+            assert!(Arc::ptr_eq(
+                doc.active().unwrap().image.as_ref().unwrap(),
+                &source
+            ));
+            let rendered = crate::render::render_document(&doc);
+            let reds = (0..3)
+                .flat_map(|y| (0..2).map(move |x| (x, y)))
+                .map(|(x, y)| rendered.get(x, y)[0])
+                .collect::<Vec<_>>();
+            assert_eq!(reds, expected);
+            rotate_canvas(&mut doc, !clockwise);
+            assert_eq!(doc, original);
+        }
+        let mut doc = original.clone();
+        for _ in 0..4 {
+            rotate_canvas(&mut doc, true);
+        }
+        assert_eq!(doc, original);
+    }
+    #[test]
+    fn quarter_turn_keeps_groups_placed_masks_sparse_feathered_selection_and_one_undo() {
+        let mut doc = Document::new(100, 60);
+        doc.resolution = 300.;
+        let id = doc.active_layer_id.unwrap();
+        let layer = doc.active_mut().unwrap();
+        layer.image = Some(Arc::new(Raster::solid(3, 2, [20, 60, 90, 255])));
+        layer.transform = Transform {
+            rotation: 37.,
+            flip_x: true,
+            ..Transform::new(10.25, 12.5, 30., 20.)
+        };
+        layer.mask = Some(Mask {
+            raster: Arc::new(Raster::solid(2, 1, [128; 4])),
+            enabled: true,
+            linked: false,
+            placement: Some(Transform {
+                rotation: 13.,
+                flip_y: true,
+                ..Transform::new(22.5, -3.25, 4., 6.)
+            }),
+        });
+        add_group(&mut doc, "组", &[id]).unwrap();
+        add_guide(&mut doc, false, 30.).unwrap();
+        add_guide(&mut doc, true, 10.).unwrap();
+        let selection = Selection::from_regions(
+            100,
+            60,
+            vec![
+                crate::model::SelectionRegion {
+                    origin: [-2, 1],
+                    size: [3, 2],
+                    coverage: Arc::new(vec![0, 80, 255, 10, 20, 30]),
+                },
+                crate::model::SelectionRegion {
+                    origin: [150, -20],
+                    size: [2, 1],
+                    coverage: Arc::new(vec![128, 129]),
+                },
+            ],
+        );
+        let mut softened = selection.clone();
+        softened.feather = 2.5;
+        softened.feather_base = Some(Arc::new(selection));
+        doc.selection = Some(softened);
+        let original = doc.clone();
+        rotate_canvas(&mut doc, true);
+        assert_eq!([doc.width, doc.height], [60, 100]);
+        assert_eq!(doc.id, original.id);
+        assert_eq!(doc.resolution, 300.);
+        for old in &original.layers {
+            let layer = doc.layer(old.id).unwrap();
+            assert_eq!(layer.parent_id, old.parent_id);
+            assert_eq!(layer.is_group, old.is_group);
+            for (before, after) in old
+                .transform
+                .corners()
+                .into_iter()
+                .zip(layer.transform.corners())
+            {
+                assert!((after[0] - (60. - before[1])).abs() < 1e-9);
+                assert!((after[1] - before[0]).abs() < 1e-9);
+            }
+        }
+        let old_layer = original.layer(id).unwrap();
+        let layer = doc.layer(id).unwrap();
+        assert!(Arc::ptr_eq(
+            layer.image.as_ref().unwrap(),
+            old_layer.image.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &layer.mask.as_ref().unwrap().raster,
+            &old_layer.mask.as_ref().unwrap().raster
+        ));
+        let old_mask = old_layer.mask.as_ref().unwrap().placement.unwrap();
+        let mask = layer.mask.as_ref().unwrap().placement.unwrap();
+        for (before, after) in old_mask.corners().into_iter().zip(mask.corners()) {
+            assert!((after[0] - (60. - before[1])).abs() < 1e-9);
+            assert!((after[1] - before[0]).abs() < 1e-9);
+        }
+        assert_eq!(doc.guides[0].axis, "horizontal");
+        assert_eq!(doc.guides[0].position, 30.);
+        assert_eq!(doc.guides[1].axis, "vertical");
+        assert_eq!(doc.guides[1].position, 50.);
+        let old_selection = original.selection.as_ref().unwrap();
+        let selection = doc.selection.as_ref().unwrap();
+        assert_eq!(selection.feather, 2.5);
+        assert!(selection.feather_base.is_some());
+        assert_eq!(
+            selection
+                .regions()
+                .map(|(_, size, _)| size)
+                .collect::<Vec<_>>(),
+            [[2, 3], [1, 2]]
+        );
+        for (origin, size, _) in old_selection.regions() {
+            for y in 0..size[1] as i64 {
+                for x in 0..size[0] as i64 {
+                    let (x, y) = (x + origin[0], y + origin[1]);
+                    assert_eq!(
+                        selection.get_unclipped(59 - y, x),
+                        old_selection.get_unclipped(x, y)
+                    );
+                }
+            }
+        }
+        let turned = doc.clone();
+        let mut history = crate::history::History::default();
+        assert!(history.record("旋转画布", original.clone(), &doc));
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc, original);
+        assert!(history.undo_name().is_none());
+        assert!(history.redo(&mut doc));
+        assert_eq!(doc, turned);
+        rotate_canvas(&mut doc, false);
+        assert_eq!(doc, original);
+    }
+    #[test]
     fn shapes_have_transparent_corners_and_redraw_radius() {
         let style = json!({"kind":"Ellipse","red":1.});
         let r = shape_raster(&style, 20, 20).unwrap();
@@ -1564,6 +2083,87 @@ mod tests {
         let r = shape_raster(&style, 20, 20).unwrap();
         assert_eq!(r.get(0, 0)[3], 0);
         assert_eq!(r.get(5, 0)[3], 255);
+    }
+    #[test]
+    fn shape_smoothing_off_preserves_legacy_samples_and_other_shapes() {
+        let ordinary = json!({"kind":"Rectangle","red":1.,"cornerRadius":9.});
+        let mut explicit = ordinary.clone();
+        explicit["smoothing"] = json!(false);
+        let raster = shape_raster(&ordinary, 37, 29).unwrap();
+        assert_eq!(raster, shape_raster(&explicit, 37, 29).unwrap());
+        for y in 0..29 {
+            for x in 0..37 {
+                let mut samples = 0;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let px = x as f64 + (sx as f64 + 0.5) / 4.;
+                        let py = y as f64 + (sy as f64 + 0.5) / 4.;
+                        let cx = px.clamp(9., 28.);
+                        let cy = py.clamp(9., 20.);
+                        samples += u32::from((px - cx).hypot(py - cy) <= 9.);
+                    }
+                }
+                assert_eq!(raster.get(x, y), [255, 0, 0, (samples * 255 / 16) as u8]);
+            }
+        }
+        for kind in ["Ellipse", "Line"] {
+            let ordinary = json!({"kind":kind,"red":1.,"cornerRadius":9.,"lineWidth":3.});
+            let mut smooth = ordinary.clone();
+            smooth["smoothing"] = json!(true);
+            assert_eq!(
+                shape_raster(&ordinary, 37, 29).unwrap(),
+                shape_raster(&smooth, 37, 29).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn smooth_shape_changes_only_corner_coverage_and_survives_save_resize() {
+        for smoothing in [false, true] {
+            let mut doc = Document::new(120, 100);
+            let id = add_shape_with_smoothing(
+                &mut doc,
+                ShapeKind::Rectangle,
+                [5., 6., 100., 80.],
+                [255, 64, 0, 128],
+                20.,
+                1.,
+                None,
+                smoothing,
+            )
+            .unwrap();
+            let layer = doc.layer(id).unwrap();
+            let style = layer.shape.clone().unwrap();
+            assert_eq!(style["smoothing"].as_bool().unwrap_or(false), smoothing);
+            assert_eq!(style.get("smoothing").is_some(), smoothing);
+            let raster = layer.image.clone().unwrap();
+            assert_eq!(raster.get(50, 40), [255, 64, 0, 255]);
+            assert_eq!(raster.get(0, 0)[3], 0);
+            let mut ordinary = style.clone();
+            ordinary.as_object_mut().unwrap().remove("smoothing");
+            let round = shape_raster(&ordinary, 100, 80).unwrap();
+            if smoothing {
+                assert!(raster.get(20, 0)[3] < round.get(20, 0)[3]);
+            } else {
+                assert_eq!(raster.as_ref(), &round);
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("smooth-corners.comp");
+            crate::project::save(&doc, &path).unwrap();
+            let mut reopened = crate::project::load(&path).unwrap();
+            assert_eq!(reopened.layer(id).unwrap().shape.as_ref(), Some(&style));
+            assert_eq!(reopened.layer(id).unwrap().image.as_ref(), Some(&raster));
+            let mut transform = reopened.layer(id).unwrap().transform;
+            transform.size = [160., 120.];
+            set_transform(&mut reopened, id, transform, false).unwrap();
+            let resized = reopened.layer(id).unwrap();
+            assert_eq!(resized.shape.as_ref(), Some(&style));
+            assert_eq!(resized.opacity, 128. / 255.);
+            assert_eq!(
+                resized.image.as_ref().unwrap().as_ref(),
+                &shape_raster(&style, 160, 120).unwrap()
+            );
+            assert_eq!(resized.shape.as_ref().unwrap()["cornerRadius"], 20.);
+        }
     }
     #[test]
     fn shape_move_rotation_sampling_and_flip_share_pixels_but_size_redraws() {

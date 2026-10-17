@@ -4,6 +4,7 @@ struct LayerFixture {
     name: &'static str,
     section: Option<u32>,
     rgba: Option<[u8; 4]>,
+    cmyk: Option<[u8; 4]>,
     mask: bool,
     mask_bounds: [i32; 4],
     mask_flags: u8,
@@ -17,6 +18,7 @@ fn layer(name: &'static str, color: [u8; 4]) -> LayerFixture {
         name,
         section: None,
         rgba: Some(color),
+        cmyk: None,
         mask: false,
         mask_bounds: [1, 1, 2, 2],
         mask_flags: 0,
@@ -37,15 +39,24 @@ fn extra_block(key: &str, payload: &[u8]) -> Vec<u8> {
     b
 }
 fn fixture(version: u16, layers: &[LayerFixture], rle: bool) -> Vec<u8> {
+    color_fixture(version, layers, rle, 3, None)
+}
+fn color_fixture(
+    version: u16,
+    layers: &[LayerFixture],
+    rle: bool,
+    mode: u16,
+    icc: Option<&[u8]>,
+) -> Vec<u8> {
     let large = version == 2;
     let mut b = b"8BPS".to_vec();
     b.extend(version.to_be_bytes());
     b.extend([0; 6]);
-    b.extend(4_u16.to_be_bytes());
+    b.extend((if mode == 4 { 5_u16 } else { 4_u16 }).to_be_bytes());
     b.extend(2_u32.to_be_bytes());
     b.extend(2_u32.to_be_bytes());
     b.extend(8_u16.to_be_bytes());
-    b.extend(3_u16.to_be_bytes());
+    b.extend(mode.to_be_bytes());
     b.extend(0_u32.to_be_bytes());
     let mut resource = b"8BIM".to_vec();
     resource.extend(1005_u16.to_be_bytes());
@@ -53,6 +64,16 @@ fn fixture(version: u16, layers: &[LayerFixture], rle: bool) -> Vec<u8> {
     resource.extend(16_u32.to_be_bytes());
     resource.extend((300_u32 * 65536).to_be_bytes());
     resource.extend([0; 12]);
+    if let Some(icc) = icc {
+        resource.extend(b"8BIM");
+        resource.extend(1039_u16.to_be_bytes());
+        resource.extend([0, 0]);
+        resource.extend((icc.len() as u32).to_be_bytes());
+        resource.extend(icc);
+        if !icc.len().is_multiple_of(2) {
+            resource.push(0);
+        }
+    }
     b.extend((resource.len() as u32).to_be_bytes());
     b.extend(resource);
     let mut info = Vec::new();
@@ -61,7 +82,19 @@ fn fixture(version: u16, layers: &[LayerFixture], rle: bool) -> Vec<u8> {
     for l in layers {
         let mut layer_channels = Vec::new();
         if let Some(rgba) = l.rgba {
-            for (id, value) in [(0, rgba[0]), (1, rgba[1]), (2, rgba[2]), (-1, rgba[3])] {
+            let mut colors = if mode == 4 {
+                l.cmyk
+                    .unwrap_or([0; 4])
+                    .map(|ink| 255 - ink)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(c, value)| (c as i16, value))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![(0, rgba[0]), (1, rgba[1]), (2, rgba[2])]
+            };
+            colors.push((-1, rgba[3]));
+            for (id, value) in colors {
                 let mut bytes = Vec::new();
                 bytes.extend((if rle { 1_u16 } else { 0 }).to_be_bytes());
                 if rle {
@@ -95,7 +128,7 @@ fn fixture(version: u16, layers: &[LayerFixture], rle: bool) -> Vec<u8> {
         }
         info.extend((layer_channels.len() as u16).to_be_bytes());
         for (id, data) in &layer_channels {
-            info.extend((*id as i16).to_be_bytes());
+            info.extend(id.to_be_bytes());
             if large {
                 info.extend((data.len() as u64).to_be_bytes());
             } else {
@@ -268,8 +301,224 @@ fn unsupported_depth_and_mode_are_rejected() {
     invalid[22..24].copy_from_slice(&16_u16.to_be_bytes());
     assert!(decode(&invalid, PsdLimits::default()).is_err());
     let mut invalid = valid;
-    invalid[24..26].copy_from_slice(&4_u16.to_be_bytes());
+    invalid[24..26].copy_from_slice(&5_u16.to_be_bytes());
     assert!(decode(&invalid, PsdLimits::default()).is_err());
+}
+
+fn merged_cmyk_fixture(version: u16, rle: bool, inks: [[u8; 4]; 4], icc: Option<&[u8]>) -> Vec<u8> {
+    let mut bytes = color_fixture(version, &[], false, 4, icc);
+    let resources = u32::from_be_bytes(bytes[30..34].try_into().unwrap()) as usize;
+    bytes.truncate(34 + resources);
+    // A sixth spot channel is discarded, while the fifth channel is alpha.
+    bytes[12..14].copy_from_slice(&6_u16.to_be_bytes());
+    if version == 2 {
+        bytes.extend(0_u64.to_be_bytes());
+    } else {
+        bytes.extend(0_u32.to_be_bytes());
+    }
+    bytes.extend(u16::from(rle).to_be_bytes());
+    let planes: Vec<_> = (0..4)
+        .map(|channel| inks.map(|pixel| 255 - pixel[channel]))
+        .chain([[0, 64, 128, 255], [13, 24, 35, 46]])
+        .collect();
+    if rle {
+        for _ in 0..planes.len() * 2 {
+            if version == 2 {
+                bytes.extend(3_u32.to_be_bytes());
+            } else {
+                bytes.extend(3_u16.to_be_bytes());
+            }
+        }
+        for plane in planes {
+            for row in plane.chunks(2) {
+                bytes.extend([1, row[0], row[1]]);
+            }
+        }
+    } else {
+        for plane in planes {
+            bytes.extend(plane);
+        }
+    }
+    bytes
+}
+
+#[test]
+fn cmyk_layer_channels_are_inverted_and_keep_straight_alpha_masks_and_black() {
+    let mut cyan = layer("青色 CMYK", [0, 0, 0, 64]);
+    cyan.cmyk = Some([255, 0, 0, 0]);
+    cyan.mask = true;
+    let mut black = layer("Black", [0, 0, 0, 255]);
+    black.cmyk = Some([0, 0, 0, 255]);
+    for version in [1, 2] {
+        for rle in [false, true] {
+            let decoded = decode(
+                &color_fixture(version, &[cyan.clone(), black.clone()], rle, 4, None),
+                PsdLimits::default(),
+            )
+            .unwrap();
+            assert!(decoded.conversions.iter().any(|note| note.contains("近似")));
+            assert_eq!(decoded.layers[0].name, "青色 CMYK");
+            assert_eq!(decoded.layers[0].mask.as_ref().unwrap().data, [128]);
+            assert!(
+                decoded.layers[0]
+                    .pixels
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| *pixel == [0, 255, 255, 64])
+            );
+            assert!(
+                decoded.layers[1]
+                    .pixels
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| *pixel == [0, 0, 0, 255])
+            );
+        }
+    }
+    let color = PixelColor::new(4, None, &mut Vec::new());
+    assert_eq!(color.rgba(1, &[None; 4], None).unwrap(), [255; 4]);
+    assert!(color.rgba(1, &[Some(&[]), None, None, None], None).is_err());
+    assert!(color.rgba(1, &[None; 4], Some(&[])).is_err());
+}
+
+#[test]
+fn cmyk_merged_psd_and_psb_keep_alpha_and_skip_spot_channels_for_raw_and_packbits() {
+    let inks = [
+        [255, 0, 0, 0],
+        [0, 255, 0, 0],
+        [0, 0, 255, 0],
+        [0, 0, 0, 255],
+    ];
+    let expected = [
+        0, 255, 255, 0, 255, 0, 255, 64, 255, 255, 0, 128, 0, 0, 0, 255,
+    ];
+    for version in [1, 2] {
+        for rle in [false, true] {
+            let bytes = merged_cmyk_fixture(version, rle, inks, None);
+            let decoded = decode(&bytes, PsdLimits::default()).unwrap();
+            assert_eq!(decoded.merged.unwrap().data, expected);
+            assert!(decoded.conversions.iter().any(|note| note.contains("近似")));
+            assert!(decode(&bytes[..bytes.len() - 1], PsdLimits::default()).is_err());
+            let mut shallow = bytes.clone();
+            shallow[12..14].copy_from_slice(&3_u16.to_be_bytes());
+            assert!(decode(&shallow, PsdLimits::default()).is_err());
+            let mut sixteen = bytes;
+            sixteen[22..24].copy_from_slice(&16_u16.to_be_bytes());
+            assert!(decode(&sixteen, PsdLimits::default()).is_err());
+        }
+    }
+}
+
+#[test]
+fn cmyk_import_never_uses_rgb_icc_and_reports_its_approximate_fallback() {
+    let rgb = ColorProfile::new_srgb().encode().unwrap();
+    assert!(PixelColor::embedded_cmyk(&rgb).is_err());
+    assert!(PixelColor::embedded_cmyk(&[0; 132]).is_err());
+    let decoded = decode(
+        &merged_cmyk_fixture(1, true, [[128, 64, 0, 64]; 4], Some(&rgb)),
+        PsdLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(&decoded.merged.unwrap().data[..4], &[95, 143, 191, 0]);
+    assert!(
+        decoded
+            .conversions
+            .iter()
+            .any(|note| note.contains("不是 CMYK") && note.contains("近似"))
+    );
+}
+
+#[test]
+fn embedded_cmyk_icc_is_used_for_layers_and_merged_and_needs_only_forward_tables() {
+    let path = std::env::var_os("COMPOSITOR_CMYK_TEST_PROFILE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("WINDIR").map(|root| {
+                std::path::PathBuf::from(root).join("System32/spool/drivers/color/RSWOP.icm")
+            })
+        });
+    let Some(path) = path.filter(|path| path.is_file()) else {
+        eprintln!("No real CMYK ICC available; set COMPOSITOR_CMYK_TEST_PROFILE to run this test");
+        return;
+    };
+    let original = std::fs::read(path).unwrap();
+    let profile =
+        crate::color_management::CmykProfile::from_bytes("PSD reference", original.clone())
+            .unwrap();
+    let inks = [
+        [210, 70, 0, 20],
+        [0, 180, 100, 30],
+        [20, 30, 100, 160],
+        [0, 0, 0, 0],
+    ];
+    let expected = profile.to_srgb(4, 1, &inks.concat()).unwrap().to_rgba();
+    let mut forward = original.clone();
+    let count = u32::from_be_bytes(forward[128..132].try_into().unwrap()) as usize;
+    let mut removed = 0;
+    for (index, tag) in forward[132..132 + count * 12]
+        .as_chunks_mut::<12>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        if &tag[..3] == b"B2A" {
+            tag[..3].copy_from_slice(b"zzz");
+            tag[3] = index as u8;
+            removed += 1;
+        }
+    }
+    assert!(removed > 0);
+    assert!(PixelColor::embedded_cmyk(&forward).is_ok());
+    assert!(
+        crate::color_management::CmykProfile::from_bytes("Forward only", forward.clone()).is_err()
+    );
+    for version in [1, 2] {
+        for rle in [false, true] {
+            let decoded = decode(
+                &merged_cmyk_fixture(version, rle, inks, Some(&forward)),
+                PsdLimits::default(),
+            )
+            .unwrap();
+            let actual = decoded.merged.unwrap().data;
+            for i in 0..4 {
+                assert_eq!(&actual[i * 4..i * 4 + 3], &expected[i * 4..i * 4 + 3]);
+                assert_eq!(actual[i * 4 + 3], [0, 64, 128, 255][i]);
+            }
+            assert!(
+                decoded
+                    .conversions
+                    .iter()
+                    .any(|note| note.contains("嵌入 ICC 相对比色"))
+            );
+            assert!(!decoded.conversions.iter().any(|note| note.contains("近似")));
+            let mut ink_layer = layer("ICC 墨色", [0, 0, 0, 64]);
+            ink_layer.cmyk = Some(inks[0]);
+            let decoded = decode(
+                &color_fixture(version, &[ink_layer], rle, 4, Some(&original)),
+                PsdLimits::default(),
+            )
+            .unwrap();
+            assert!(
+                decoded.layers[0]
+                    .pixels
+                    .as_ref()
+                    .unwrap()
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[..3] == expected[..3] && pixel[3] == 64)
+            );
+        }
+    }
 }
 #[test]
 fn cropped_psd_keeps_only_canvas_pixels() {

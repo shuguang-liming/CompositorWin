@@ -336,16 +336,12 @@ mod native {
         // prefix. WinRT's StorageFile path APIs reject that prefix
         // with the misleading `UNABLE_TO_MASK_PATH` error, so retain a normal
         // absolute DOS path for the WinRT boundary.
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .context("解析 PDF 路径失败")?
-                .join(path)
-        };
+        let path = std::fs::canonicalize(path).context("解析 PDF 绝对路径失败")?;
         let raw_path = path
             .to_str()
             .context("PDF 路径包含无法传给 Windows PDF 服务的字符")?;
+        let normalized = raw_path.replace('/', "\\");
+        let raw_path = normalized.as_str();
         let path_text = raw_path
             .strip_prefix(r"\\?\UNC\")
             .map(|unc| format!(r"\\{unc}"))
@@ -559,5 +555,33 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(path).unwrap(), b"preserve");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pdf_opens_unicode_spaces_forward_and_extended_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("中文 PDF 路径");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("颜色 页面.pdf");
+        let size = PdfPageSize {
+            width_points: 144.,
+            height_points: 72.,
+        };
+        export_pages(&path, [Ok((Raster::solid(2, 1, [255, 0, 0, 255]), size))]).unwrap();
+        let forward = std::path::PathBuf::from(path.to_string_lossy().replace('\\', "/"));
+        let extended = path.canonicalize().unwrap();
+        for candidate in [&path, &forward, &extended] {
+            let info = info(candidate).unwrap_or_else(|error| panic!("{candidate:?}: {error:#}"));
+            assert_eq!(info.pages.len(), 1);
+            assert!((info.pages[0].width_points - 144.).abs() < 0.01);
+            let pages = render_pages(candidate, &[0], 72).unwrap();
+            assert_eq!((pages[0].raster.width, pages[0].raster.height), (144, 72));
+            let pixel = pages[0].raster.get(72, 36);
+            assert!(
+                pixel[0] > 240 && pixel[1] < 15 && pixel[2] < 15,
+                "{candidate:?}: {pixel:?}"
+            );
+        }
     }
 }

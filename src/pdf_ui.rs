@@ -132,17 +132,9 @@ impl EditorApp {
             }
             // Check the entire batch before adding any tabs; an oversized PDF
             // must leave the existing workspace intact.
-            let histories = self
-                .tabs
-                .iter()
-                .map(|s| s.history.retained_bytes(&s.doc) as u64)
-                .sum::<u64>();
-            crate::workspace_limits::ensure_workspace_budget(
-                self.tabs
-                    .iter()
-                    .map(|s| &s.doc)
-                    .chain(sessions.iter().map(|s| &s.doc)),
-                histories,
+            self.check_workspace_documents(
+                sessions.iter().map(|s| &s.doc),
+                self.retained_sampler_bytes(),
             )?;
             if let Some(target) = target {
                 let session = sessions.pop().context("PDF 页面为空")?;
@@ -245,7 +237,12 @@ impl EditorApp {
     }
 
     pub(super) fn pdf_dialogs(&mut self, ctx: &egui::Context) {
-        if self.dialog.is_some() || self.pending_import.is_some() || !self.report.is_empty() {
+        if self.dialog.is_some()
+            || self.export_dialog.is_some()
+            || self.command_palette.is_open()
+            || self.pending_import.is_some()
+            || !self.report.is_empty()
+        {
             return;
         }
         if self.pdf_ui.import.is_none() && self.pdf_ui.export.is_none() {

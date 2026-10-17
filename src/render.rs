@@ -8,6 +8,12 @@ use std::{
     sync::{Arc, Weak},
 };
 use uuid::Uuid;
+#[path = "render_deep.rs"]
+mod deep;
+
+pub fn has_deep_layers(doc: &Document) -> bool {
+    deep::has_deep(doc)
+}
 
 pub fn sample(image: &Raster, x: f64, y: f64) -> [u8; 4] {
     sample_with_sampling(image, x, y, Sampling::Smooth)
@@ -592,6 +598,9 @@ impl CompositeSampler {
     /// Determine whether a requested region needs native full-canvas filter context.
     /// This inspects only visible traversal and settings; no pixels/effects/mips are prepared.
     pub fn needs_full_surface(doc: &Document) -> bool {
+        if has_deep_layers(doc) {
+            return true;
+        }
         let mut ordered = Vec::new();
         ordered_visible(doc, None, 0, &mut ordered);
         Self::layers_need_full_surface(&ordered)
@@ -618,7 +627,7 @@ impl CompositeSampler {
         document.selection = None;
         let mut ordered = Vec::new();
         ordered_visible(&document, None, 0, &mut ordered);
-        let global = Self::layers_need_full_surface(&ordered);
+        let global = has_deep_layers(&document) || Self::layers_need_full_surface(&ordered);
         if global {
             let composite = Some(render_document(&document));
             return Self {
@@ -711,6 +720,7 @@ pub fn same_composite(a: &Document, b: &Document) -> bool {
             || (a.width == b.width
                 && a.height == b.height
                 && Arc::ptr_eq(&a.pixels, &b.pixels)
+                && same_deep_pixels(a, b)
                 && a.tiles.len() == b.tiles.len()
                 && a.tiles
                     .iter()
@@ -749,10 +759,20 @@ pub fn same_composite(a: &Document, b: &Document) -> bool {
                 && a.effects == b.effects
         })
 }
+pub(crate) fn same_deep_pixels(a: &Raster, b: &Raster) -> bool {
+    match (&a.deep, &b.deep) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.shares(b),
+        _ => false,
+    }
+}
 /// Render a document rectangle into a requested resolution. Preview/dirty tiles never allocate a full canvas.
 pub fn render_region(doc: &Document, region: [f64; 4], width: u32, height: u32) -> Raster {
     if width == 0 || height == 0 {
         return Raster::blank(width, height);
+    }
+    if deep::has_deep(doc) {
+        return deep::render(doc, region, width, height);
     }
     let data = render_group(doc, None, region, width, height, 0, None, None);
     to_straight_raster(data, width, height)
@@ -768,6 +788,9 @@ pub fn render_region_cached(
 ) -> Raster {
     if width == 0 || height == 0 {
         return Raster::blank(width, height);
+    }
+    if deep::has_deep(doc) {
+        return deep::render(doc, region, width, height);
     }
     to_straight_raster(
         render_group(doc, None, region, width, height, 0, Some(effects), None),
@@ -889,6 +912,15 @@ pub fn sample_mask_with_sampling(
 fn source_alpha(doc: &Document, l: &Layer, point: [f64; 2], depth: usize) -> f64 {
     let uv = l.transform.from_document(point);
     let a = if let Some(r) = &l.image {
+        if r.deep.is_some() {
+            return r.sample_f32(
+                uv[0] * r.width as f64 - 0.5,
+                uv[1] * r.height as f64 - 0.5,
+                l.transform.sampling,
+            )[3] as f64
+                * effective_opacity(doc, l)
+                * layer_mask(doc, l, point, depth);
+        }
         sample_premultiplied(
             r,
             uv[0] * r.width as f64 - 0.5,
@@ -955,6 +987,25 @@ fn ordered_visible<'a>(
 fn prepare_layer_effect(doc: &Document, layer: &Layer) -> Option<(Raster, f64)> {
     layer.image.as_ref().and_then(|image| {
         layer.effects.as_ref().map(|effects| {
+            if image.deep.is_some() {
+                let mut shown = image.as_ref().clone();
+                if layer.mask.as_ref().is_some_and(|m| m.enabled) {
+                    let mut own = layer.clone();
+                    own.mask_source_id = None;
+                    for y in 0..image.height {
+                        for x in 0..image.width {
+                            let point = layer.transform.to_document([
+                                (x as f64 + 0.5) / image.width as f64,
+                                (y as f64 + 0.5) / image.height as f64,
+                            ]);
+                            let mut p = image.get_f32(x, y);
+                            p[3] *= layer_mask(doc, &own, point, 0) as f32;
+                            shown.set_f32(x, y, p);
+                        }
+                    }
+                }
+                return filters::apply_effects(&shown, effects);
+            }
             // Effects follow the raster-masked shape, before opacity or live clipping.
             let mut shown = image.to_rgba();
             if layer.mask.as_ref().is_some_and(|m| m.enabled) {

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     time::{Duration, Instant, SystemTime},
 };
 use uuid::Uuid;
@@ -27,11 +27,20 @@ mod selection_panel;
 #[path = "app_state_tests.rs"]
 mod state_tests;
 
+#[cfg(test)]
+#[path = "renderer_recovery_tests.rs"]
+mod renderer_recovery_tests;
+
+#[path = "renderer_recovery.rs"]
+mod renderer_recovery;
+
 #[path = "app_chrome.rs"]
 mod chrome_ui;
 #[path = "app_text_color.rs"]
 mod text_color_ui;
 
+#[path = "app_shape_preview.rs"]
+mod shape_preview;
 #[path = "app_tools.rs"]
 mod tool_header_ui;
 
@@ -40,10 +49,24 @@ mod welcome_ui;
 
 #[path = "agent_bridge.rs"]
 mod agent_bridge;
+#[path = "canvas_navigation.rs"]
+mod canvas_navigation;
+#[path = "command_palette.rs"]
+mod command_palette;
+#[path = "export_ui.rs"]
+mod export_ui;
+#[path = "gui_threads.rs"]
+mod gui_threads;
+#[path = "image_folder.rs"]
+mod image_folder;
 #[path = "import_worker.rs"]
 mod import_worker;
+#[path = "navigator.rs"]
+mod navigator;
 #[path = "pdf_ui.rs"]
 mod pdf_ui;
+#[path = "progressive_canvas.rs"]
+mod progressive_canvas;
 #[path = "theme_settings.rs"]
 mod theme_settings;
 
@@ -166,6 +189,7 @@ struct Session {
     texture: Option<egui::TextureHandle>,
     gpu_id: Option<egui::TextureId>,
     preview_busy: bool,
+    preview_failed: Option<(u64, crate::preview::ViewRequest)>,
     preview_view: Option<crate::preview::ViewRequest>,
     rendered_view: Option<crate::preview::ViewRequest>,
     stamp: u64,
@@ -201,6 +225,7 @@ impl Session {
             texture: None,
             gpu_id: None,
             preview_busy: false,
+            preview_failed: None,
             preview_view: None,
             rendered_view: None,
             stamp,
@@ -229,6 +254,7 @@ impl Session {
     }
     fn changed(&mut self) {
         self.serial = self.serial.wrapping_add(1);
+        self.preview_failed = None;
         self.thumbnails.retain_document(&self.doc);
         let mask_ids = self
             .doc
@@ -248,6 +274,10 @@ impl Session {
     }
 }
 enum Worker {
+    FolderImages {
+        target: Option<Uuid>,
+        result: Result<Vec<PathBuf>, String>,
+    },
     PdfInfo {
         path: PathBuf,
         target: Option<Uuid>,
@@ -267,6 +297,11 @@ enum Worker {
         session: Uuid,
         serial: u64,
         sampler: Arc<render::CompositeSampler>,
+    },
+    ColorSampleFailure {
+        session: Uuid,
+        serial: u64,
+        error: String,
     },
     WarpPreview {
         session: Uuid,
@@ -290,10 +325,16 @@ enum Worker {
         view: crate::preview::ViewRequest,
         raster: Raster,
     },
+    PreviewFailure {
+        id: Uuid,
+        serial: u64,
+        view: crate::preview::ViewRequest,
+        error: String,
+    },
     Export(Result<PathBuf, String>),
     RawPreview {
         path: PathBuf,
-        key: [u32; 4],
+        key: [u32; 7],
         result: Result<Raster, String>,
     },
     DialogPreview {
@@ -410,6 +451,7 @@ enum Command {
     New,
     Open,
     Import,
+    ImportFolder,
     Save,
     SaveAs,
     ExportPng,
@@ -455,6 +497,10 @@ enum Command {
     Trim,
     FlipCanvasX,
     FlipCanvasY,
+    RotateCanvas(bool),
+    ConvertDepth(Option<crate::deep_pixels::Depth>),
+    CanvasOnly,
+    RepeatFilter,
     Fit,
     Actual,
     Grid,
@@ -465,6 +511,7 @@ enum Command {
     CropCommit,
     CropCancel,
     Shortcuts,
+    Search,
     FillForeground,
     FillBackground,
     ClearPixels,
@@ -495,15 +542,24 @@ struct Drag {
 #[derive(Clone)]
 struct WorkerSender {
     sender: mpsc::Sender<Worker>,
-    context: Arc<OnceLock<egui::Context>>,
+    context: Arc<Mutex<Option<egui::Context>>>,
 }
 impl WorkerSender {
+    fn bind_context(&self, context: egui::Context) {
+        *self.context.lock().unwrap_or_else(|e| e.into_inner()) = Some(context);
+    }
     fn send(&self, worker: Worker) -> Result<(), mpsc::SendError<()>> {
         self.sender.send(worker).map_err(|_| mpsc::SendError(()))?;
-        if let Some(context) = self.context.get() {
-            context.request_repaint();
-        }
+        wake_renderer(&self.context);
         Ok(())
+    }
+}
+
+fn wake_renderer(context: &Mutex<Option<egui::Context>>) {
+    // A repaint callback may reenter application code; never call it while locked.
+    let context = context.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(context) = context {
+        context.request_repaint();
     }
 }
 
@@ -532,23 +588,24 @@ impl PackageWatcher {
             started: false,
         }
     }
-    fn sync(&mut self, targets: Vec<WatchTarget>) {
+    fn sync(&mut self, targets: Vec<WatchTarget>) -> Result<(), String> {
         let (mutex, wake) = &*self.shared;
         let mut state = mutex.lock().unwrap_or_else(|e| e.into_inner());
-        if state.targets == targets {
-            return;
+        if state.targets == targets && (self.started || targets.is_empty()) {
+            return Ok(());
         }
         state.targets = targets;
         state.generation = state.generation.wrapping_add(1);
         let start = !self.started && !state.targets.is_empty();
         drop(state);
         if start {
-            self.started = true;
             let shared = self.shared.clone();
             let sender = self.sender.clone();
-            std::thread::spawn(move || Self::run(shared, sender));
+            gui_threads::spawn("磁盘监听", move || Self::run(shared, sender))?;
+            self.started = true;
         }
         wake.notify_one();
+        Ok(())
     }
     fn run(shared: Arc<(Mutex<WatchState>, Condvar)>, sender: WorkerSender) {
         let (mutex, wake) = &*shared;
@@ -671,6 +728,7 @@ pub struct EditorApp {
     healing_mode: usize,
     shape_kind: String,
     corner_radius: f64,
+    shape_smoothing: bool,
     line_width: f64,
     transform_percent: bool,
     show_transform: bool,
@@ -746,7 +804,7 @@ pub struct EditorApp {
     raw_settings: image_io::RawDevelopSettings,
     raw_texture: Option<egui::TextureHandle>,
     raw_busy: bool,
-    raw_key: Option<(PathBuf, [u32; 4])>,
+    raw_key: Option<(PathBuf, [u32; 7])>,
     raw_pointer_mode: String,
     raw_mixer_drag: Option<crate::raw_interaction::MixerDrag>,
     raw_curve_drag: Option<crate::raw_interaction::CurveDrag>,
@@ -769,6 +827,17 @@ pub struct EditorApp {
     floating_layers: bool,
     floating_tools: bool,
     shortcuts_open: bool,
+    command_palette: command_palette::CommandPalette,
+    navigator: navigator::Navigator,
+    navigator_visible: bool,
+    canvas_only: bool,
+    canvas_only_restore_fullscreen: Option<bool>,
+    last_filter: Option<(String, Value)>,
+    pending_filters: HashMap<Uuid, (Uuid, u64, String, Value)>,
+    export_dialog: Option<export_ui::ExportDialog>,
+    print_profile: Option<Arc<crate::color_management::CmykProfile>>,
+    soft_proof: bool,
+    gamut_warning: bool,
     shortcuts: BTreeMap<String, String>,
     watcher: PackageWatcher,
     disk_changes: HashMap<Uuid, (WatchTarget, u64)>,
@@ -882,6 +951,7 @@ impl EditorApp {
         self.current = index;
         self.tabs[index].rendered = 0;
         self.tabs[index].gpu_id = None;
+        self.tabs[index].preview_failed = None;
     }
     fn finish_color_picker(&mut self, accept: bool) {
         if self.text_color_target.is_some() {
@@ -989,63 +1059,86 @@ impl EditorApp {
         let generation = self.warp_generation;
         let session = self.session().id;
         let sender = self.sender.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<Layer> {
-                doc = crate::preview::prepare(&doc, 1000);
-                doc.width = (doc.width as f64 * scale).round().max(1.) as u32;
-                doc.height = (doc.height as f64 * scale).round().max(1.) as u32;
-                doc.selection = None;
-                for layer in &mut doc.layers {
-                    layer.transform.origin = layer.transform.origin.map(|v| v * scale);
-                    layer.transform.size = layer.transform.size.map(|v| v * scale);
+        if let Err(error) = gui_threads::spawn("变形预览", move || {
+            let result = gui_threads::run("变形预览", || {
+                (|| -> anyhow::Result<Layer> {
+                    doc = crate::preview::prepare(&doc, 1000);
+                    doc.width = (doc.width as f64 * scale).round().max(1.) as u32;
+                    doc.height = (doc.height as f64 * scale).round().max(1.) as u32;
+                    doc.selection = None;
+                    for layer in &mut doc.layers {
+                        layer.transform.origin = layer.transform.origin.map(|v| v * scale);
+                        layer.transform.size = layer.transform.size.map(|v| v * scale);
+                        if let Some(mask) = &mut layer.mask
+                            && let Some(transform) = &mut mask.placement
+                        {
+                            transform.origin = transform.origin.map(|v| v * scale);
+                            transform.size = transform.size.map(|v| v * scale);
+                        }
+                    }
+                    crate::edit::free_distort(
+                        &mut doc,
+                        id,
+                        corners.map(|p| p.map(|v| v * scale)),
+                        mask,
+                    )?;
+                    let mut layer = doc.layer(id).unwrap().clone();
+                    layer.transform.origin = layer.transform.origin.map(|v| v / scale);
+                    layer.transform.size = layer.transform.size.map(|v| v / scale);
                     if let Some(mask) = &mut layer.mask
                         && let Some(transform) = &mut mask.placement
                     {
-                        transform.origin = transform.origin.map(|v| v * scale);
-                        transform.size = transform.size.map(|v| v * scale);
+                        transform.origin = transform.origin.map(|v| v / scale);
+                        transform.size = transform.size.map(|v| v / scale);
                     }
-                }
-                crate::edit::free_distort(
-                    &mut doc,
-                    id,
-                    corners.map(|p| p.map(|v| v * scale)),
-                    mask,
-                )?;
-                let mut layer = doc.layer(id).unwrap().clone();
-                layer.transform.origin = layer.transform.origin.map(|v| v / scale);
-                layer.transform.size = layer.transform.size.map(|v| v / scale);
-                if let Some(mask) = &mut layer.mask
-                    && let Some(transform) = &mut mask.placement
-                {
-                    transform.origin = transform.origin.map(|v| v / scale);
-                    transform.size = transform.size.map(|v| v / scale);
-                }
-                Ok(layer)
-            })()
-            .map_err(|e| format!("{e:#}"));
+                    Ok(layer)
+                })()
+                .map_err(|e| format!("{e:#}"))
+            });
             let _ = sender.send(Worker::WarpPreview {
                 session,
                 generation,
                 result,
             });
-        });
+        }) {
+            self.warp_preview_busy = false;
+            self.message = Some(error);
+        }
     }
     fn check_workspace(&self, candidate: &Document) -> anyhow::Result<()> {
+        self.check_workspace_documents(std::iter::once(candidate), self.retained_sampler_bytes())
+    }
+    fn retained_sampler_bytes(&self) -> u64 {
+        self.sample_cache
+            .as_ref()
+            .map_or(0, |(_, sampler)| sampler.allocated_bytes() as u64)
+    }
+    fn check_workspace_documents<'a>(
+        &'a self,
+        candidates: impl IntoIterator<Item = &'a Document>,
+        sampler_bytes: u64,
+    ) -> anyhow::Result<()> {
         let histories: u64 = self
             .tabs
             .iter()
             .map(|s| s.history.retained_bytes(&s.doc) as u64)
-            .sum();
+            .fold(0, u64::saturating_add);
         crate::workspace_limits::ensure_workspace_budget(
             self.tabs
                 .iter()
                 .map(|s| &s.doc)
-                .chain(std::iter::once(candidate)),
-            histories
-                + self
-                    .sample_cache
-                    .as_ref()
-                    .map_or(0, |(_, sampler)| sampler.allocated_bytes() as u64),
+                .chain(
+                    self.pending_import
+                        .iter()
+                        .map(|(_, import, _)| &import.document),
+                )
+                .chain(
+                    self.import_queue
+                        .iter()
+                        .map(|(_, import, _)| &import.document),
+                )
+                .chain(candidates),
+            histories.saturating_add(sampler_bytes),
         )
         .map(|_| ())
     }
@@ -1060,6 +1153,9 @@ impl EditorApp {
                 .any(|s| s.save_busy || s.edit_busy || s.reload_busy || s.preview_busy)
     }
     fn cancel_dialog(&mut self) {
+        if matches!(self.dialog, Some(Dialog::CameraRaw)) {
+            crate::filters::discard_camera_raw_gpu_buffers();
+        }
         if self.text_color_target.is_some() {
             self.finish_color_picker(false);
         }
@@ -1105,6 +1201,19 @@ impl EditorApp {
         self.dialog_target = Some(self.dialog_destination(&dialog));
         self.dialog_mask = self.mask_target;
         self.dialog = Some(dialog);
+    }
+    fn prepare_progressive_line(&mut self) {
+        if matches!(&self.dialog, Some(Dialog::Filter { kind }) if kind == "Progressive Blur")
+            && let Some((session, Some(id))) = self.dialog_target
+            && let Some(target) = self.tabs.iter().find(|tab| tab.id == session)
+        {
+            crate::filter_edit::initialize_progressive_line(
+                &target.doc,
+                id,
+                self.dialog_mask,
+                &mut self.dialog_value,
+            );
+        }
     }
     fn set_tool(&mut self, tool: Tool) {
         if self.tool == tool {
@@ -1326,36 +1435,43 @@ impl EditorApp {
         self.session_mut().edit_busy = true;
         self.session_mut().gradient_task = Some((state.request, false));
         self.gradient = Some(state.clone());
-        std::thread::spawn(move || {
-            let mut doc = state.before.clone();
-            let (kind, from, to, opacity) = &state.parameters;
-            let shape = match kind.as_str() {
-                "Radial" => crate::brush::GradientShape::Radial,
-                "Angle" => crate::brush::GradientShape::Angle,
-                "Reflected" => crate::brush::GradientShape::Reflected,
-                "Diamond" => crate::brush::GradientShape::Diamond,
-                _ => crate::brush::GradientShape::Linear,
-            };
-            let result = crate::brush::gradient(
-                &mut doc,
-                state.layer,
-                state.mask,
-                state.start,
-                state.end,
-                *from,
-                *to,
-                shape,
-                *opacity,
-            )
-            .map(|_| doc)
-            .map_err(|e| format!("{e:#}"));
+        if let Err(error) = gui_threads::spawn("渐变编辑", move || {
+            let result = gui_threads::run("渐变编辑", || {
+                let mut doc = state.before.clone();
+                let (kind, from, to, opacity) = &state.parameters;
+                let shape = match kind.as_str() {
+                    "Radial" => crate::brush::GradientShape::Radial,
+                    "Angle" => crate::brush::GradientShape::Angle,
+                    "Reflected" => crate::brush::GradientShape::Reflected,
+                    "Diamond" => crate::brush::GradientShape::Diamond,
+                    _ => crate::brush::GradientShape::Linear,
+                };
+                crate::brush::gradient(
+                    &mut doc,
+                    state.layer,
+                    state.mask,
+                    state.start,
+                    state.end,
+                    *from,
+                    *to,
+                    shape,
+                    *opacity,
+                )
+                .map(|_| doc)
+                .map_err(|e| format!("{e:#}"))
+            });
             let _ = sender.send(Worker::Gradient {
                 revision,
                 serial,
                 state: Box::new(state),
                 result,
             });
-        });
+        }) {
+            self.session_mut().edit_busy = false;
+            self.session_mut().gradient_task = None;
+            self.apply_gradient();
+            self.message = Some(error);
+        }
     }
     fn specialized_filter_dialog(&self) -> bool {
         matches!(&self.dialog, Some(Dialog::Filter { kind } | Dialog::Adjustment { kind })
@@ -1385,20 +1501,41 @@ impl EditorApp {
         self.sample_cache = None;
         self.sample_point = None;
         self.sample_busy = Some(key);
+        self.start_color_sampler(key);
+    }
+
+    fn start_color_sampler(&mut self, key: (Uuid, u64)) {
         let doc = self.session().doc.clone();
         let sender = self.sender.clone();
-        std::thread::spawn(move || {
-            let sampler = Arc::new(render::CompositeSampler::new(&doc));
-            let _ = sender.send(Worker::ColorSample {
-                session: key.0,
-                serial: key.1,
-                sampler,
+        match gui_threads::spawn("颜色取样", move || {
+            let result = gui_threads::run("颜色取样", || {
+                Ok(Arc::new(render::CompositeSampler::new(&doc)))
             });
-        });
+            let event = match result {
+                Ok(sampler) => Worker::ColorSample {
+                    session: key.0,
+                    serial: key.1,
+                    sampler,
+                },
+                Err(error) => Worker::ColorSampleFailure {
+                    session: key.0,
+                    serial: key.1,
+                    error,
+                },
+            };
+            let _ = sender.send(event);
+        }) {
+            Ok(_) => self.sample_busy = Some(key),
+            Err(error) => {
+                self.sample_busy = None;
+                self.message = Some(error);
+            }
+        }
     }
 
     fn filter_canvas_preview_texture(&self) -> Option<egui::TextureId> {
-        if !self.specialized_filter_dialog()
+        if !(self.specialized_filter_dialog()
+            || matches!(&self.dialog, Some(Dialog::Filter { kind }) if kind == "Progressive Blur"))
             || !self.filter_ui.preview
             || self
                 .dialog_target
@@ -1531,6 +1668,7 @@ impl EditorApp {
     }
 
     fn dialog_preview(&mut self, ctx: &egui::Context, dialog: &Dialog) {
+        self.prepare_progressive_line();
         self.prepare_filter_sampler();
         if self.dialog_preview_busy || (self.specialized_filter_dialog() && !self.filter_ui.preview)
         {
@@ -1601,146 +1739,150 @@ impl EditorApp {
         let ctx = ctx.clone();
         let mask = self.dialog_mask;
         let source_cache = self.dialog_source_cache.clone();
-        std::thread::spawn(move || {
+        if let Err(error) = gui_threads::spawn("滤镜预览", move || {
             let mut sample = None;
             let mut graded_sample = None;
             let mut display_sample = None;
-            let result = (|| -> anyhow::Result<(Raster, usize)> {
-                let mut cache = source_cache
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("预览源缓存不可用"))?;
-                let prepared = if kind == "filter:Camera Raw Filter" {
-                    doc.clone()
-                } else {
-                    cache.prepare(&doc, 1000)
-                };
-                sample = prepared
-                    .active()
-                    .and_then(|l| l.image.clone())
-                    .or_else(|| Some(cache.render(&doc, 1000)));
-                if kind == "color-range" {
-                    let source = cache.render(&doc, 1000);
-                    sample = Some(source.clone());
-                    let colors = color_range_colors(&value);
-                    let fuzziness =
-                        crate::filters::number(&value, "fuzziness", 40.).clamp(0., 255.) as u8;
-                    let selected = selection::color_range(&source, &colors, fuzziness);
-                    let mut rgba = source.to_rgba();
-                    for (p, &amount) in rgba
-                        .as_chunks_mut::<4>()
-                        .0
-                        .iter_mut()
-                        .zip(selected.canvas_coverage().iter())
-                    {
-                        let a = amount as u32;
-                        p[0] = ((p[0] as u32 * (255 - a) + 255 * a) / 255) as u8;
-                        p[1] = (p[1] as u32 * (255 - a) / 255) as u8;
-                        p[2] = ((p[2] as u32 * (255 - a) + 220 * a) / 255) as u8;
-                    }
-                    return Ok((Raster::from_rgba(source.width, source.height, rgba), 0));
-                }
-                if kind == "jpeg" {
-                    let original = cache.render(&doc, 1200);
-                    let quality = value["quality"].as_u64().unwrap_or(90) as u8;
-                    let matte =
-                        std::array::from_fn(|i| value["matte"][i].as_u64().unwrap_or(255) as u8);
-                    return image_io::jpeg_preview(&original, quality, matte);
-                }
-                let mut preview = doc.clone();
-                if let Some(kind) = kind.strip_prefix("filter:") {
-                    preview = prepared;
-                    preview.selection = doc.selection.clone();
-                    let layer = preview
-                        .active()
-                        .ok_or_else(|| anyhow::anyhow!("Select a pixel layer"))?;
-                    let reduced = if mask {
-                        layer.mask.as_ref().map(|m| m.raster.clone())
+            let result = gui_threads::run("滤镜预览", || {
+                let result = (|| -> anyhow::Result<(Raster, usize)> {
+                    let mut cache = source_cache
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("预览源缓存不可用"))?;
+                    let prepared = if kind == "filter:Camera Raw Filter" {
+                        doc.clone()
                     } else {
-                        layer.image.clone()
+                        cache.prepare(&doc, 1000)
                     };
-                    sample = reduced.clone();
-                    let full = doc.active().and_then(|l| {
-                        if mask {
-                            l.mask.as_ref().map(|m| m.raster.clone())
+                    sample = prepared
+                        .active()
+                        .and_then(|l| l.image.clone())
+                        .or_else(|| Some(cache.render(&doc, 1000)));
+                    if kind == "color-range" {
+                        let source = cache.render(&doc, 1000);
+                        sample = Some(source.clone());
+                        let colors = color_range_colors(&value);
+                        let fuzziness =
+                            crate::filters::number(&value, "fuzziness", 40.).clamp(0., 255.) as u8;
+                        let selected = selection::color_range(&source, &colors, fuzziness);
+                        let mut rgba = source.to_rgba();
+                        for (p, &amount) in rgba
+                            .as_chunks_mut::<4>()
+                            .0
+                            .iter_mut()
+                            .zip(selected.canvas_coverage().iter())
+                        {
+                            let a = amount as u32;
+                            p[0] = ((p[0] as u32 * (255 - a) + 255 * a) / 255) as u8;
+                            p[1] = (p[1] as u32 * (255 - a) / 255) as u8;
+                            p[2] = ((p[2] as u32 * (255 - a) + 220 * a) / 255) as u8;
+                        }
+                        return Ok((Raster::from_rgba(source.width, source.height, rgba), 0));
+                    }
+                    if kind == "jpeg" {
+                        let original = cache.render(&doc, 1200);
+                        let quality = value["quality"].as_u64().unwrap_or(90) as u8;
+                        let matte = std::array::from_fn(|i| {
+                            value["matte"][i].as_u64().unwrap_or(255) as u8
+                        });
+                        return image_io::jpeg_preview(&original, quality, matte);
+                    }
+                    let mut preview = doc.clone();
+                    if let Some(kind) = kind.strip_prefix("filter:") {
+                        preview = prepared;
+                        preview.selection = doc.selection.clone();
+                        let layer = preview
+                            .active()
+                            .ok_or_else(|| anyhow::anyhow!("Select a pixel layer"))?;
+                        let reduced = if mask {
+                            layer.mask.as_ref().map(|m| m.raster.clone())
                         } else {
-                            l.image.clone()
-                        }
-                    });
-                    if let (Some(reduced), Some(full)) = (&reduced, &full) {
-                        crate::preview::scale_filter(
-                            &mut value,
-                            kind,
-                            reduced.width as f64 / full.width as f64,
-                        );
-                    } else if kind == "Vignette" && !mask {
-                        value["previewScale"] = json!(
-                            (1000.
-                                / (doc.width.max(doc.height) as f64)
-                                    .max(layer.transform.size[0])
-                                    .max(layer.transform.size[1]))
-                            .min(1.)
-                        );
-                    }
-                    let id = layer.id;
-                    let mut reuse_grade = false;
-                    if kind == "Camera Raw Filter" {
-                        value = crate::filter_panel::effective_camera_raw_settings(&value);
-                        if let Some(source) = &reduced {
-                            let scale = full
-                                .as_ref()
-                                .map_or(1., |full| source.width as f64 / full.width as f64);
-                            let mut grade = committed_filter_settings(kind, value.clone());
-                            crate::preview::scale_filter(&mut grade, kind, scale);
-                            reuse_grade = doc.selection.is_none()
-                                && camera_raw_preview_is_clean(&value, &grade);
-                            if !reuse_grade {
-                                graded_sample = Some(Arc::new(
-                                    crate::filters::apply_filter(source, kind, &grade)
-                                        .map_err(anyhow::Error::msg)?,
-                                ));
-                            }
-                        }
-                    }
-                    crate::filter_edit::apply(&mut preview, id, mask, kind, &value)?;
-                    if kind == "Camera Raw Filter" {
-                        display_sample = preview.active().and_then(|layer| {
+                            layer.image.clone()
+                        };
+                        sample = reduced.clone();
+                        let full = doc.active().and_then(|l| {
                             if mask {
-                                layer.mask.as_ref().map(|mask| mask.raster.clone())
+                                l.mask.as_ref().map(|m| m.raster.clone())
                             } else {
-                                layer.image.clone()
+                                l.image.clone()
                             }
                         });
+                        if let (Some(reduced), Some(full)) = (&reduced, &full) {
+                            crate::preview::scale_filter(
+                                &mut value,
+                                kind,
+                                reduced.width as f64 / full.width as f64,
+                            );
+                        } else if kind == "Vignette" && !mask {
+                            value["previewScale"] = json!(
+                                (1000.
+                                    / (doc.width.max(doc.height) as f64)
+                                        .max(layer.transform.size[0])
+                                        .max(layer.transform.size[1]))
+                                .min(1.)
+                            );
+                        }
+                        let id = layer.id;
+                        let mut reuse_grade = false;
+                        if kind == "Camera Raw Filter" {
+                            value = crate::filter_panel::effective_camera_raw_settings(&value);
+                            if let Some(source) = &reduced {
+                                let scale = full
+                                    .as_ref()
+                                    .map_or(1., |full| source.width as f64 / full.width as f64);
+                                let mut grade = committed_filter_settings(kind, value.clone());
+                                crate::preview::scale_filter(&mut grade, kind, scale);
+                                reuse_grade = doc.selection.is_none()
+                                    && camera_raw_preview_is_clean(&value, &grade);
+                                if !reuse_grade {
+                                    graded_sample = Some(Arc::new(
+                                        crate::filters::apply_filter(source, kind, &grade)
+                                            .map_err(anyhow::Error::msg)?,
+                                    ));
+                                }
+                            }
+                        }
+                        crate::filter_edit::apply(&mut preview, id, mask, kind, &value)?;
+                        if kind == "Camera Raw Filter" {
+                            display_sample = preview.active().and_then(|layer| {
+                                if mask {
+                                    layer.mask.as_ref().map(|mask| mask.raster.clone())
+                                } else {
+                                    layer.image.clone()
+                                }
+                            });
+                        }
+                        if reuse_grade {
+                            graded_sample = display_sample.clone();
+                        }
+                    } else if let Some(kind) = kind.strip_prefix("adjustment:") {
+                        let mut layer = Layer::new(kind, doc.width, doc.height);
+                        layer.adjustment = Some(value);
+                        let at = preview
+                            .active_layer_id
+                            .and_then(|id| preview.layers.iter().position(|l| l.id == id))
+                            .map_or(preview.layers.len(), |i| i + 1);
+                        preview.layers.insert(at, layer);
+                    } else if let Some(kind) = kind.strip_prefix("effect:")
+                        && let Some(layer) = preview.active_mut()
+                    {
+                        let mut effects = layer.effects.take().unwrap_or_else(|| json!({}));
+                        effects[kind] = value;
+                        layer.effects = Some(effects);
                     }
-                    if reuse_grade {
-                        graded_sample = display_sample.clone();
-                    }
-                } else if let Some(kind) = kind.strip_prefix("adjustment:") {
-                    let mut layer = Layer::new(kind, doc.width, doc.height);
-                    layer.adjustment = Some(value);
-                    let at = preview
-                        .active_layer_id
-                        .and_then(|id| preview.layers.iter().position(|l| l.id == id))
-                        .map_or(preview.layers.len(), |i| i + 1);
-                    preview.layers.insert(at, layer);
-                } else if let Some(kind) = kind.strip_prefix("effect:")
-                    && let Some(layer) = preview.active_mut()
-                {
-                    let mut effects = layer.effects.take().unwrap_or_else(|| json!({}));
-                    effects[kind] = value;
-                    layer.effects = Some(effects);
+                    Ok((
+                        crate::preview::PreviewCache::default()
+                            .render(&preview, 1000)
+                            .as_ref()
+                            .clone(),
+                        0,
+                    ))
+                })()
+                .map_err(|e| format!("{e:#}"));
+                if let Some(sample) = &graded_sample {
+                    crate::filter_panel::prepare_camera_raw_scopes(&ctx, sample);
                 }
-                Ok((
-                    crate::preview::PreviewCache::default()
-                        .render(&preview, 1000)
-                        .as_ref()
-                        .clone(),
-                    0,
-                ))
-            })()
-            .map_err(|e| format!("{e:#}"));
-            if let Some(sample) = &graded_sample {
-                crate::filter_panel::prepare_camera_raw_scopes(&ctx, sample);
-            }
+                result
+            });
             let _ = sender.send(Worker::DialogPreview {
                 generation,
                 sample,
@@ -1749,7 +1891,11 @@ impl EditorApp {
                 result,
             });
             ctx.request_repaint();
-        });
+        }) {
+            self.dialog_preview_busy = false;
+            self.dialog_preview_error = Some(error.clone());
+            self.message = Some(error);
+        }
     }
     fn raw_pointer_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
@@ -1996,6 +2142,7 @@ impl EditorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let started = Instant::now();
         if let Some(state) = &cc.wgpu_render_state {
+            crate::filters::bind_camera_raw_gpu(state.device.clone(), state.queue.clone());
             log::info!(
                 "graphics adapter={:?} limits={:?}",
                 state.adapter.get_info(),
@@ -2031,12 +2178,138 @@ impl EditorApp {
         if let Some((_, qa_started)) = &mut app.qa_ready {
             *qa_started = started;
         }
-        let _ = app.sender.context.set(cc.egui_ctx.clone());
+        app.sender.bind_context(cc.egui_ctx.clone());
         match agent_bridge::AgentBridge::start(cc.egui_ctx.clone()) {
             Ok(bridge) => app.agent_bridge = Some(bridge),
             Err(error) => app.message = Some(format!("Agent 接口启动失败：{error:#}")),
         }
         app
+    }
+    /// Reattach this editing session to a replacement native renderer.
+    pub fn recover_renderer(&mut self, cc: &eframe::CreationContext<'_>) {
+        self.finish_renderer_gestures();
+        self.navigator.reset_textures();
+        crate::filters::unbind_camera_raw_gpu();
+        if let Some(state) = &cc.wgpu_render_state {
+            crate::filters::bind_camera_raw_gpu(state.device.clone(), state.queue.clone());
+        }
+        // Texture handles belong to the previous Context, including CPU-preview uploads.
+        // Keep documents, history, CPU caches, receivers and background jobs in place.
+        self.gpu = None;
+        for session in &mut self.tabs {
+            session.texture = None;
+            session.gpu_id = None;
+            session.rendered = 0;
+            session.rendered_view = None;
+            session.preview_failed = None;
+            session.thumbnails.clear();
+            session.mask_thumbnails.clear();
+        }
+        self.raw_texture = None;
+        self.raw_view_texture = None;
+        self.dialog_texture = None;
+        // In-flight previews still arrive through the original receiver. Only request
+        // a replacement when there is no result already being produced for this key.
+        if !self.raw_busy {
+            self.raw_key = None;
+        }
+        if !self.dialog_preview_busy {
+            self.preview_key = None;
+        }
+        self.raw_mixer_drag = None;
+        self.raw_curve_drag = None;
+        self.raw_guide_start = None;
+        self.filter_ui.pointer_end();
+        self.window_motion = crate::window_motion::WindowMotion::new();
+        self.restore_maximized_after_frame = None;
+        self.sender.bind_context(cc.egui_ctx.clone());
+        if let Some(bridge) = &mut self.agent_bridge {
+            bridge.bind_context(cc.egui_ctx.clone());
+        }
+        crate::locale::install_fonts(&cc.egui_ctx);
+        crate::chrome::theme::apply_custom(
+            &cc.egui_ctx,
+            self.custom_theme
+                .as_ref()
+                .filter(|_| self.custom_theme_enabled),
+        );
+        cc.egui_ctx.set_theme(self.theme_preference);
+        // Recovery currently targets Glow, which has no WGPU compute canvas.
+        // Its CPU compositor reuses the retained preview caches on the next frame.
+        cc.egui_ctx.request_repaint();
+    }
+    fn finish_renderer_gestures(&mut self) {
+        if let Some(drag) = self.drag.take()
+            && self.drag_is_current(&drag)
+        {
+            if drag.mode.paints() {
+                self.finish_brush(drag.before, drag.last);
+            } else if drag.mode == Tool::Move || drag.outline_move {
+                if drag.outline_move {
+                    let session = self.session_mut();
+                    if session
+                        .history
+                        .record("Move selection outline", drag.before, &session.doc)
+                    {
+                        session.changed();
+                    }
+                } else if drag.distort
+                    && let Some((id, corners)) = distort_corners(&drag, self.mask_target)
+                {
+                    let before = drag.before;
+                    let mut after = before.clone();
+                    let mask = self.mask_target;
+                    // A failed replacement renderer may be followed immediately by
+                    // emergency backups and process exit. Finish this gesture here
+                    // so its final pixels cannot be stranded in a worker result.
+                    match crate::edit::free_distort(&mut after, id, corners, mask)
+                        .and_then(|()| self.check_workspace(&after))
+                    {
+                        Ok(()) => {
+                            let session = self.session_mut();
+                            session.doc = after;
+                            if session.history.record("Free distort", before, &session.doc) {
+                                session.changed();
+                            }
+                        }
+                        Err(error) => self.message = Some(error.to_string()),
+                    }
+                } else {
+                    if drag.pixel_move
+                        && let Some(id) = drag.before.active_layer_id
+                    {
+                        self.session_mut().doc = drag.before.clone();
+                        let offset = [drag.last[0] - drag.start[0], drag.last[1] - drag.start[1]];
+                        let mask = self.mask_target;
+                        if let Err(error) = crate::edit::move_selected_pixels(
+                            &mut self.session_mut().doc,
+                            id,
+                            mask,
+                            offset,
+                            drag.duplicate_pixels,
+                        ) {
+                            self.message = Some(error.to_string());
+                        }
+                    }
+                    let session = self.session_mut();
+                    if session
+                        .history
+                        .record("Transform", drag.before, &session.doc)
+                    {
+                        session.changed();
+                    }
+                }
+            }
+        }
+        if let Some(guide) = self.guide_drag.take() {
+            let session = self.session_mut();
+            if session.history.record("Guide", guide.before, &session.doc) {
+                session.changed();
+            }
+        }
+        // The document mutations above have now entered undo history. Ordinary
+        // gesture cleanup must not restore their pre-drag document snapshots.
+        self.settle_gestures();
     }
     pub fn defer_maximized_restore(&mut self, ctx: &egui::Context) {
         self.restore_maximized_after_frame = Some(ctx.cumulative_frame_nr());
@@ -2057,7 +2330,7 @@ impl EditorApp {
         let (sender, receiver) = mpsc::channel();
         let sender = WorkerSender {
             sender,
-            context: Arc::new(OnceLock::new()),
+            context: Arc::new(Mutex::new(None)),
         };
         let segment_sender = segmentation_worker(sender.clone());
         let shortcuts = load_shortcuts();
@@ -2122,6 +2395,7 @@ impl EditorApp {
             healing_mode: 0,
             shape_kind: "Rectangle".into(),
             corner_radius: 0.,
+            shape_smoothing: false,
             line_width: 4.,
             transform_percent: false,
             show_transform: true,
@@ -2220,6 +2494,17 @@ impl EditorApp {
             floating_layers: false,
             floating_tools: false,
             shortcuts_open: false,
+            command_palette: command_palette::CommandPalette::default(),
+            navigator: navigator::Navigator::default(),
+            navigator_visible: false,
+            canvas_only: false,
+            canvas_only_restore_fullscreen: None,
+            last_filter: None,
+            pending_filters: HashMap::new(),
+            export_dialog: None,
+            print_profile: None,
+            soft_proof: false,
+            gamut_warning: false,
             shortcuts,
             disk_changes: HashMap::new(),
             qa_ready: std::env::var_os("COMPOSITOR_QA_READY_PATH")
@@ -2251,6 +2536,7 @@ impl EditorApp {
             }
             app.floating_layers = saved["floatingLayers"].as_bool().unwrap_or(false);
             app.floating_tools = saved["floatingTools"].as_bool().unwrap_or(false);
+            app.navigator_visible = saved["navigatorVisible"].as_bool().unwrap_or(false);
             app.grid_spacing =
                 crate::filters::number(&saved, "gridSpacing", 64.).clamp(1., 10_000.);
             app.grid_subdivisions =
@@ -2268,6 +2554,12 @@ impl EditorApp {
                 app.grid_color = color;
             }
             app.jpeg_quality = saved["jpegQuality"].as_u64().unwrap_or(90).clamp(1, 100) as u8;
+            if let Ok(settings) =
+                serde_json::from_value::<image_io::RawDevelopSettings>(saved["rawSettings"].clone())
+                && settings.validate().is_ok()
+            {
+                app.raw_settings = settings;
+            }
         }
         if !smoke {
             app.session_mut().placeholder = true;
@@ -2297,6 +2589,18 @@ impl EditorApp {
         self.open_target(path, target);
     }
     fn open_target(&mut self, path: PathBuf, target: Option<Uuid>) {
+        if image_folder::is_plain_folder(&path) {
+            let sender = self.sender.clone();
+            match gui_threads::spawn("读取图像文件夹", move || {
+                let result =
+                    gui_threads::run("读取图像文件夹", || image_folder::images(&path));
+                let _ = sender.send(Worker::FolderImages { target, result });
+            }) {
+                Ok(_) => self.pending_io += 1,
+                Err(error) => self.message = Some(error),
+            }
+            return;
+        }
         if path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
@@ -2318,7 +2622,6 @@ impl EditorApp {
                 self.raw_queue.push_back((path, target));
                 return;
             }
-            self.raw_settings = Default::default();
             self.raw_texture = None;
             self.begin_dialog(Dialog::Raw {
                 path: path.clone(),
@@ -2336,6 +2639,24 @@ impl EditorApp {
             Err(error) => self.message = Some(error),
         }
     }
+    fn dialog_output_path(path: PathBuf, supported: &[&str]) -> Result<(PathBuf, String), String> {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !supported.contains(&extension.as_str()) {
+            let formats = supported
+                .iter()
+                .map(|extension| format!(".{extension}"))
+                .collect::<Vec<_>>()
+                .join("、");
+            return Err(format!("请使用 {formats} 扩展名，并重新选择保存位置"));
+        }
+        // Preserve the exact path whose replacement the native dialog confirmed.
+        // Adding or replacing its extension here could overwrite a different file.
+        Ok((path, extension))
+    }
     fn save(&mut self, save_as: bool) {
         if self.session().save_busy {
             return;
@@ -2351,36 +2672,37 @@ impl EditorApp {
                     if legacy_directory { "-单文件" } else { "" }
                 ))
                 .save_file()
-                .map(|p| {
-                    if !p
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("comp"))
-                    {
-                        p.with_extension("comp")
-                    } else {
-                        p
-                    }
-                })
         } else {
             self.session().path.clone()
         };
         let Some(path) = path else {
             return;
         };
+        let path = match Self::dialog_output_path(path, &["comp"]) {
+            Ok((path, _)) => path,
+            Err(error) => {
+                self.message = Some(error);
+                return;
+            }
+        };
         let d = self.session().doc.clone();
         let id = self.session().id;
         let revision = self.session().history.revision();
-        self.session_mut().save_busy = true;
         let sender = self.sender.clone();
-        std::thread::spawn(move || {
-            let result = project::save(&d, &path).map_err(|e| format!("{e:#}"));
+        match gui_threads::spawn("保存项目", move || {
+            let result = gui_threads::run("保存项目", || {
+                project::save(&d, &path).map_err(|e| format!("{e:#}"))
+            });
             let _ = sender.send(Worker::Save {
                 id,
                 revision,
                 path,
                 result,
             });
-        });
+        }) {
+            Ok(_) => self.session_mut().save_busy = true,
+            Err(error) => self.message = Some(error),
+        }
     }
     fn remember(&mut self, path: &Path) {
         self.recent.retain(|p| p != path);
@@ -2411,39 +2733,20 @@ impl EditorApp {
         };
         self.export_to_path(extension.to_owned(), path);
     }
-    fn export_other(&mut self) {
-        let Some(mut path) = rfd::FileDialog::new()
-            .set_title("导出图像")
-            .add_filter("PNG 图像", &["png"])
-            .add_filter("JPEG 图像", &["jpg", "jpeg"])
-            .add_filter("TIFF 图像", &["tif", "tiff"])
-            .add_filter("BMP 图像", &["bmp"])
-            .add_filter("GIF 图像", &["gif"])
-            .add_filter("WebP 图像", &["webp"])
-            .add_filter("PDF 文档（当前页面）", &["pdf"])
-            .set_file_name(format!(
-                "{}.png",
-                self.session().title().trim_end_matches(" *")
-            ))
-            .save_file()
-        else {
-            return;
+    fn export_to_path(&mut self, extension: String, path: PathBuf) {
+        let requested_extension = extension.as_str();
+        let supported = match extension.as_str() {
+            "jpg" | "jpeg" => &["jpg", "jpeg"][..],
+            "tif" | "tiff" => &["tif", "tiff"][..],
+            _ => std::slice::from_ref(&requested_extension),
         };
-        let extension = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default();
-        let extension = match extension.as_str() {
-            "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "gif" | "webp" | "pdf" => extension,
-            _ => {
-                path.set_extension("png");
-                "png".to_owned()
+        let (path, extension) = match Self::dialog_output_path(path, supported) {
+            Ok(output) => output,
+            Err(error) => {
+                self.message = Some(error);
+                return;
             }
         };
-        self.export_to_path(extension, path);
-    }
-    fn export_to_path(&mut self, extension: String, path: PathBuf) {
         let d = self.session().doc.clone();
         let pdf_size = pdf_ui::page_size(self.session());
         if extension == "pdf" {
@@ -2454,19 +2757,37 @@ impl EditorApp {
         let matte = [self.jpeg_matte[0], self.jpeg_matte[1], self.jpeg_matte[2]];
         let quality = self.jpeg_quality;
         self.message = Some("Rendering full-resolution export…".into());
-        self.pending_io += 1;
-        std::thread::spawn(move || {
-            let raster = render::render_document(&d);
-            let result =
+        match gui_threads::spawn("导出图像", move || {
+            let result = gui_threads::run("导出图像", || {
+                let raster = render::render_document(&d);
                 image_io::export_raster(&raster, &path, &extension, d.resolution, quality, matte)
                     .map(|_| path)
-                    .map_err(|e| format!("{e:#}"));
+                    .map_err(|e| format!("{e:#}"))
+            });
             let _ = sender.send(Worker::Export(result));
-        });
+        }) {
+            Ok(_) => self.pending_io += 1,
+            Err(error) => self.message = Some(error),
+        }
     }
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
+                Worker::FolderImages { target, result } => {
+                    self.pending_io = self.pending_io.saturating_sub(1);
+                    if target.is_some_and(|id| !self.tabs.iter().any(|tab| tab.id == id)) {
+                        self.message = Some("目标画布已关闭，已取消文件夹导入".into());
+                        continue;
+                    }
+                    match result {
+                        Ok(paths) => {
+                            for path in paths {
+                                self.open_target(path, target);
+                            }
+                        }
+                        Err(error) => self.message = Some(error),
+                    }
+                }
                 Worker::PdfInfo {
                     path,
                     target,
@@ -2477,6 +2798,7 @@ impl EditorApp {
                         Ok(info) => self.pdf_ui.enqueue(path, target, info),
                         Err(error) => self.message = Some(error),
                     }
+                    self.imports.complete();
                 }
                 Worker::PdfOpen {
                     path,
@@ -2489,6 +2811,7 @@ impl EditorApp {
                         Ok(pages) => self.install_pdf_pages(path, target, dpi, pages),
                         Err(error) => self.message = Some(error),
                     }
+                    self.imports.complete();
                 }
                 Worker::DiskChanged { target, stamp } => {
                     if self.tabs.iter().any(|s| {
@@ -2510,14 +2833,9 @@ impl EditorApp {
                             && serial == self.session().serial
                             && sampler.matches(&self.session().doc)
                         {
-                            let history_bytes = self
-                                .tabs
-                                .iter()
-                                .map(|s| s.history.retained_bytes(&s.doc) as u64)
-                                .sum::<u64>();
-                            if let Err(error) = crate::workspace_limits::ensure_workspace_budget(
-                                self.tabs.iter().map(|s| &s.doc),
-                                history_bytes.saturating_add(sampler.allocated_bytes() as u64),
+                            if let Err(error) = self.check_workspace_documents(
+                                std::iter::empty(),
+                                sampler.allocated_bytes() as u64,
                             ) {
                                 self.message = Some(error.to_string());
                                 continue;
@@ -2530,6 +2848,16 @@ impl EditorApp {
                             self.sample_cache = Some((session, sampler));
                             ctx.request_repaint();
                         }
+                    }
+                }
+                Worker::ColorSampleFailure {
+                    session,
+                    serial,
+                    error,
+                } => {
+                    if self.sample_busy == Some((session, serial)) {
+                        self.sample_busy = None;
+                        self.message = Some(error);
                     }
                 }
                 Worker::WarpPreview {
@@ -2561,19 +2889,24 @@ impl EditorApp {
                     match result {
                         Ok(import) => {
                             if !import.conversions.is_empty() {
-                                if self.pending_import.is_some() {
-                                    self.import_queue.push_back((path, import, target));
-                                } else {
-                                    self.report = import.conversions.clone();
-                                    self.pending_import = Some((path, import, target));
+                                match self.check_workspace(&import.document) {
+                                    Ok(()) if self.pending_import.is_some() => {
+                                        self.import_queue.push_back((path, import, target));
+                                    }
+                                    Ok(()) => {
+                                        self.report = import.conversions.clone();
+                                        self.pending_import = Some((path, import, target));
+                                    }
+                                    Err(error) => self.message = Some(error.to_string()),
                                 }
-                                continue;
+                            } else {
+                                self.install_import(path, import, target);
+                                ctx.request_repaint();
                             }
-                            self.install_import(path, import, target);
-                            ctx.request_repaint();
                         }
                         Err(e) => self.message = Some(e),
                     }
+                    self.imports.complete();
                 }
                 Worker::RawPreview { path, key, result } => {
                     self.raw_busy = false;
@@ -2594,6 +2927,7 @@ impl EditorApp {
                             Err(e) => self.message = Some(e),
                         }
                     }
+                    self.imports.complete();
                 }
                 Worker::DialogPreview {
                     generation,
@@ -2679,6 +3013,17 @@ impl EditorApp {
                     before,
                     result,
                 } => {
+                    let repeated = if self
+                        .pending_filters
+                        .get(&id)
+                        .is_some_and(|pending| pending.0 == revision && pending.1 == serial)
+                    {
+                        self.pending_filters
+                            .remove(&id)
+                            .map(|(_, _, kind, settings)| (kind, settings))
+                    } else {
+                        None
+                    };
                     let result = result.and_then(|doc| {
                         self.check_workspace(&doc)
                             .map(|_| doc)
@@ -2693,7 +3038,9 @@ impl EditorApp {
                                 } else {
                                     s.selected.retain(|id| d.layer(*id).is_some());
                                 }
-                                s.doc=d;if s.history.record(name,before,&s.doc){s.changed();}
+                                s.doc=d;if s.history.record(name,before,&s.doc){s.changed();
+                                    if let Some(repeated) = repeated { self.last_filter = Some(repeated); }
+                                }
                             }
                             Ok(_)=>self.message=Some("The document changed during processing. Reapply the operation to your current edits.".into()),
                             Err(e)=>self.message=Some(e),
@@ -2802,6 +3149,22 @@ impl EditorApp {
                         }
                     }
                 }
+                Worker::PreviewFailure {
+                    id,
+                    serial,
+                    view,
+                    error,
+                } => {
+                    if let Some(session) = self.tabs.iter_mut().find(|session| session.id == id) {
+                        session.preview_busy = false;
+                        if session.serial == serial && session.preview_view == Some(view) {
+                            // Retry when the image/view changes, a tab is reactivated, or
+                            // the renderer is restored; do not restart a failing job each frame.
+                            session.preview_failed = Some((serial, view));
+                            self.message = Some(error);
+                        }
+                    }
+                }
                 Worker::Export(result) => {
                     self.pending_io = self.pending_io.saturating_sub(1);
                     self.message = Some(match result {
@@ -2813,16 +3176,25 @@ impl EditorApp {
         }
     }
     fn render_canvas(&mut self, ctx: &egui::Context, view: crate::preview::ViewRequest) {
-        if self.session().rendered == self.session().serial
-            && self.session().rendered_view == Some(view)
+        if (self.session().rendered == self.session().serial
+            && self.session().rendered_view == Some(view))
+            || self.session().preview_failed == Some((self.session().serial, view))
+            || self.session().preview_busy
         {
             return;
         }
-        if self.session().preview_busy {
-            return;
-        }
         let d = self.display_document();
-        let gpu_id = self.gpu_frame(|gpu| gpu.and_then(|gpu| gpu.render_view(&d, view)));
+        let proof = self
+            .print_profile
+            .clone()
+            .filter(|_| self.soft_proof || self.gamut_warning);
+        let proof_colors = self.soft_proof;
+        let gamut_warning = self.gamut_warning;
+        let gpu_id = if render::has_deep_layers(&d) || proof.is_some() {
+            None
+        } else {
+            self.gpu_frame(|gpu| gpu.and_then(|gpu| gpu.render_view(&d, view)))
+        };
         if let Some(id) = gpu_id {
             let s = self.session_mut();
             s.gpu_id = Some(id);
@@ -2832,24 +3204,47 @@ impl EditorApp {
             let cache = self.session().preview_cache.clone();
             let id = self.session().id;
             let serial = self.session().serial;
-            self.session_mut().preview_busy = true;
             let sender = self.sender.clone();
             let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                let raster = cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .render_view(&d, view)
-                    .as_ref()
-                    .clone();
-                let _ = sender.send(Worker::Preview {
-                    id,
-                    serial,
-                    view,
-                    raster,
+            match gui_threads::spawn("画布预览", move || {
+                let result = gui_threads::run("画布预览", || {
+                    let raster = cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .render_view(&d, view)
+                        .as_ref()
+                        .clone();
+                    if let Some(profile) = proof {
+                        profile
+                            .proof(&raster, proof_colors, gamut_warning)
+                            .map_err(|error| format!("{error:#}"))
+                    } else {
+                        Ok(raster)
+                    }
                 });
+                let event = match result {
+                    Ok(raster) => Worker::Preview {
+                        id,
+                        serial,
+                        view,
+                        raster,
+                    },
+                    Err(error) => Worker::PreviewFailure {
+                        id,
+                        serial,
+                        view,
+                        error,
+                    },
+                };
+                let _ = sender.send(event);
                 ctx.request_repaint();
-            });
+            }) {
+                Ok(_) => self.session_mut().preview_busy = true,
+                Err(error) => {
+                    self.session_mut().preview_failed = Some((serial, view));
+                    self.message = Some(error);
+                }
+            }
         }
     }
     fn gpu_frame(
@@ -2874,6 +3269,7 @@ impl EditorApp {
         for session in &mut self.tabs {
             session.gpu_id = None;
             session.rendered_view = None;
+            session.preview_failed = None;
         }
         self.gpu = None;
     }
@@ -3013,6 +3409,8 @@ impl EditorApp {
             self.settle_gestures();
         }
         self.tabs.remove(index);
+        self.navigator
+            .retain_sessions(self.tabs.iter().map(|session| session.id));
         if self.tabs.is_empty() {
             let mut placeholder = Session::new(Document::new(1280, 800), None);
             placeholder.placeholder = true;
@@ -3027,6 +3425,7 @@ impl EditorApp {
             let session = self.session_mut();
             session.rendered = 0;
             session.gpu_id = None;
+            session.preview_failed = None;
         }
     }
     fn menu(&mut self, ctx: &egui::Context) -> Vec<Command> {
@@ -3040,12 +3439,13 @@ impl EditorApp {
                             ("新建…     Ctrl+N", Command::New),
                             ("打开…     Ctrl+O", Command::Open),
                             ("导入为图层…", Command::Import),
+                            ("导入图像文件夹…", Command::ImportFolder),
                             ("保存       Ctrl+S", Command::Save),
                             ("另存为…   Ctrl+Shift+S", Command::SaveAs),
                             ("导出 PNG…", Command::ExportPng),
                             ("导出 JPEG…", Command::ExportJpeg),
                             ("导出 TIFF…", Command::ExportTiff),
-                            ("导出其他格式…", Command::ExportOther),
+                            ("导出…（格式／尺寸／位深）", Command::ExportOther),
                             ("导出 PDF（可合并多页）…", Command::ExportPdf),
                             ("关闭      Ctrl+W", Command::Close),
                         ] {
@@ -3130,6 +3530,15 @@ impl EditorApp {
                             ("选择蒙版区域", Command::LoadMask),
                             ("模糊／羽化蒙版…", Command::BlurMask),
                             ("创建／释放剪贴蒙版", Command::Clip),
+                            ("转换为 8 位图层", Command::ConvertDepth(None)),
+                            (
+                                "转换为 16 位图层",
+                                Command::ConvertDepth(Some(crate::deep_pixels::Depth::U16)),
+                            ),
+                            (
+                                "转换为 HDR 图层",
+                                Command::ConvertDepth(Some(crate::deep_pixels::Depth::Hdr)),
+                            ),
                         ] {
                             if ui
                                 .add_enabled(self.command_available(c), egui::Button::new(label))
@@ -3205,6 +3614,8 @@ impl EditorApp {
                             ("修剪透明边缘", Command::Trim),
                             ("水平翻转画布", Command::FlipCanvasX),
                             ("垂直翻转画布", Command::FlipCanvasY),
+                            ("顺时针旋转画布 90°", Command::RotateCanvas(true)),
+                            ("逆时针旋转画布 90°", Command::RotateCanvas(false)),
                         ] {
                             if ui
                                 .add_enabled(self.command_available(c), egui::Button::new(label))
@@ -3216,6 +3627,16 @@ impl EditorApp {
                         }
                     });
                     ui.menu_button("滤镜", |ui| {
+                        if ui
+                            .add_enabled(
+                                self.command_available(Command::RepeatFilter),
+                                egui::Button::new("重复上次滤镜       Ctrl+F"),
+                            )
+                            .clicked()
+                        {
+                            actions.push(Command::RepeatFilter);
+                            ui.close();
+                        }
                         if ui
                             .add_enabled(!self.is_welcome(), egui::Button::new("Camera Raw 调色…"))
                             .clicked()
@@ -3245,6 +3666,7 @@ impl EditorApp {
                             ("标尺", Command::Rulers),
                             ("网格设置…", Command::GridSettings),
                             ("参考线…", Command::Guides),
+                            ("全屏画布       F", Command::CanvasOnly),
                         ] {
                             if ui
                                 .add_enabled(self.command_available(c), egui::Button::new(label))
@@ -3264,8 +3686,31 @@ impl EditorApp {
                             }
                         });
                         ui.checkbox(&mut self.pixel_grid, "像素网格");
+                        ui.checkbox(&mut self.navigator_visible, "导航器（300% 以上显示）");
                         ui.checkbox(&mut self.floating_layers, "浮动图层面板");
                         ui.checkbox(&mut self.floating_tools, "浮动工具面板");
+                        ui.separator();
+                        if ui.button("选择 CMYK 印刷配置…").clicked() {
+                            self.choose_print_profile();
+                        }
+                        if let Some(profile) = &self.print_profile {
+                            ui.label(profile.name());
+                        }
+                        let proof_changed = ui
+                            .add_enabled(
+                                self.print_profile.is_some(),
+                                egui::Checkbox::new(&mut self.soft_proof, "CMYK 软打样"),
+                            )
+                            .changed();
+                        let warning_changed = ui
+                            .add_enabled(
+                                self.print_profile.is_some(),
+                                egui::Checkbox::new(&mut self.gamut_warning, "印刷色域警告"),
+                            )
+                            .changed();
+                        if proof_changed || warning_changed {
+                            self.refresh_proof();
+                        }
                         ui.separator();
                         if ui.button("主题设置…").clicked() {
                             self.theme_settings_open = true;
@@ -3273,6 +3718,10 @@ impl EditorApp {
                         }
                     });
                     ui.menu_button("帮助", |ui| {
+                        if ui.button("搜索命令…       Ctrl+Shift+P").clicked() {
+                            actions.push(Command::Search);
+                            ui.close();
+                        }
                         if ui.button("开源软件许可证").clicked() {
                             self.open_source_licenses.open = true;
                             ui.close();
@@ -3340,6 +3789,12 @@ impl EditorApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Command> {
+        if self.export_dialog.is_some() {
+            return vec![];
+        }
+        if self.command_palette.is_open() {
+            return vec![];
+        }
         if self.selection_amount_dialog.is_some()
             || self.theme_settings_open
             || self.open_source_licenses.open
@@ -3373,6 +3828,16 @@ impl EditorApp {
         if ctx.wants_keyboard_input() {
             return vec![];
         }
+        if self.dialog.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F))
+        {
+            return vec![Command::CanvasOnly];
+        }
+        if self.canvas_only
+            && self.dialog.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+        {
+            return vec![Command::CanvasOnly];
+        }
         let mut actions = vec![];
         ctx.input_mut(|i| {
             enum Action {
@@ -3394,6 +3859,8 @@ impl EditorApp {
                 ("Select All", Command::SelectAll),
                 ("Deselect", Command::Deselect),
                 ("Close", Command::Close),
+                ("Repeat Last Filter", Command::RepeatFilter),
+                ("Search Commands", Command::Search),
             ] {
                 if let Some(chord) = self.shortcuts.get(name).and_then(|s| parse_shortcut(s)) {
                     bindings.push((chord, Action::Command(command)));
@@ -3608,7 +4075,7 @@ impl EditorApp {
                         &[
                             "comp", "json", "png", "jpg", "jpeg", "tif", "tiff", "svg", "psd",
                             "psb", "dng", "nef", "cr2", "cr3", "arw", "raf", "rw2", "orf", "heic",
-                            "heif", "bmp", "gif", "webp", "pdf",
+                            "heif", "bmp", "gif", "webp", "pdf", "exr", "hdr",
                         ],
                     )
                     .pick_file()
@@ -3628,11 +4095,19 @@ impl EditorApp {
                     self.open(path, matches!(c, Command::Import));
                 }
             }
+            Command::ImportFolder => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("导入图像文件夹")
+                    .pick_folder()
+                {
+                    self.open(path, !self.is_welcome());
+                }
+            }
             Command::Save => self.save(false),
             Command::SaveAs => self.save(true),
             Command::ExportPng => self.export("png"),
             Command::ExportTiff => self.export("tif"),
-            Command::ExportOther => self.export_other(),
+            Command::ExportOther => self.open_export_dialog(),
             Command::ExportPdf => self.begin_pdf_export(),
             Command::ExportJpeg => {
                 self.begin_dialog(Dialog::Jpeg);
@@ -3848,6 +4323,30 @@ impl EditorApp {
                     crate::edit::flip_canvas(d, matches!(c, Command::FlipCanvasX));
                 });
             }
+            Command::RotateCanvas(clockwise) => {
+                self.settle_gestures();
+                self.crop_rect = None;
+                self.crop_session = None;
+                self.session_mut().edit("Rotate canvas", |document| {
+                    crate::edit::rotate_canvas(document, clockwise);
+                });
+                self.session_mut().zoom = 0.;
+                self.session_mut().pan = Vec2::ZERO;
+            }
+            Command::ConvertDepth(depth) => {
+                if let Some(id) = self.session().doc.active_layer_id {
+                    self.settle_gestures();
+                    self.background_edit("转换图层位深", move |doc| {
+                        crate::edit::convert_layer_depth(doc, id, depth)
+                    });
+                }
+            }
+            Command::CanvasOnly => self.canvas_only = !self.canvas_only,
+            Command::RepeatFilter => {
+                if let Some((kind, settings)) = self.last_filter.clone() {
+                    self.filter(&kind, settings, self.mask_target);
+                }
+            }
             Command::Fit => {
                 self.session_mut().zoom = 0.;
                 self.session_mut().pan = Vec2::ZERO;
@@ -3872,6 +4371,7 @@ impl EditorApp {
                 self.crop_drag = None;
             }
             Command::Shortcuts => self.shortcuts_open = true,
+            Command::Search => self.open_command_palette(),
         }
         let s = self.session_mut();
         s.selected.retain(|id| s.doc.layer(*id).is_some());
@@ -3901,6 +4401,8 @@ const FINISHING: &[&str] = &[
     "Tonal Contrast",
     "Lens Correction",
     "Dither",
+    "Scanlines",
+    "Progressive Blur",
     "Remove Background",
 ];
 fn humanize_english(s: &str) -> String {
@@ -4235,8 +4737,8 @@ fn clipboard_sequence() -> u32 {
         0
     }
 }
-fn raw_settings_key(s: image_io::RawDevelopSettings) -> [u32; 4] {
-    [s.exposure, s.temperature, s.tint, s.boost].map(f32::to_bits)
+fn raw_settings_key(s: image_io::RawDevelopSettings) -> [u32; 7] {
+    s.key()
 }
 pub fn preferences_directory() -> PathBuf {
     preferences_path()
@@ -4270,61 +4772,70 @@ fn segmentation_worker(sender: WorkerSender) -> mpsc::Sender<SegmentRequest> {
                 } = &request.operation
                 {
                     let mut sample = None;
-                    let result = (|| -> anyhow::Result<(Raster, usize)> {
-                        if engine.is_none() {
-                            engine = Some(crate::segmentation::SegmentationEngine::load_default()?);
-                        }
-                        let source = request
-                            .before
-                            .layer(*layer)
-                            .and_then(|l| l.image.clone())
-                            .ok_or_else(|| anyhow::anyhow!("Select a pixel layer"))?;
-                        if preview_cache.as_ref().is_none_or(|(original, _, _)| {
-                            !original.ptr_eq(&Arc::downgrade(&source))
-                        }) {
-                            let mut preview_document = Document::new(source.width, source.height);
-                            let mut pixel_layer =
-                                Layer::raster("Subject preview", source.as_ref().clone());
-                            pixel_layer.id = *layer;
-                            preview_document.active_layer_id = Some(*layer);
-                            preview_document.layers = vec![pixel_layer];
-                            let prepared = crate::preview::prepare(&preview_document, 1000);
-                            let small = prepared.active().and_then(|l| l.image.clone()).unwrap();
-                            let prediction = engine.as_ref().unwrap().predict(&small)?;
-                            preview_cache = Some((Arc::downgrade(&source), small, prediction));
-                        }
-                        let (original, small, prediction) = preview_cache.as_ref().unwrap();
-                        let original = original
-                            .upgrade()
-                            .ok_or_else(|| anyhow::anyhow!("The subject source was released"))?;
-                        sample = Some(small.clone());
-                        let settings = crate::matte::preview_settings(
-                            settings,
-                            small.width as f64 / original.width as f64,
-                        );
-                        let alpha = crate::matte::refine(&prediction.alpha, small, &settings)?;
-                        let mut preview_document = request.before.clone();
-                        preview_document.layer_mut(*layer).unwrap().image = Some(small.clone());
-                        crate::matte::apply_subject_mask(&mut preview_document, *layer, &alpha)?;
-                        let layer = preview_document
-                            .layer(*layer)
-                            .ok_or_else(|| anyhow::anyhow!("The preview layer was removed"))?;
-                        let mut rgba = small.to_rgba();
-                        for (i, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                            let point = layer.transform.to_document([
-                                (i as u32 % small.width) as f64 / small.width as f64
-                                    + 0.5 / small.width as f64,
-                                (i as u32 / small.width) as f64 / small.height as f64
-                                    + 0.5 / small.height as f64,
-                            ]);
-                            pixel[3] = (pixel[3] as f64
-                                * render::raster_mask_coverage(layer, point))
-                            .round()
-                            .clamp(0., 255.) as u8;
-                        }
-                        Ok((Raster::from_rgba(small.width, small.height, rgba), 0))
-                    })()
-                    .map_err(|e| format!("{e:#}"));
+                    let result = gui_threads::run("抠图预览", || {
+                        (|| -> anyhow::Result<(Raster, usize)> {
+                            if engine.is_none() {
+                                engine =
+                                    Some(crate::segmentation::SegmentationEngine::load_default()?);
+                            }
+                            let source = request
+                                .before
+                                .layer(*layer)
+                                .and_then(|l| l.image.clone())
+                                .ok_or_else(|| anyhow::anyhow!("Select a pixel layer"))?;
+                            if preview_cache.as_ref().is_none_or(|(original, _, _)| {
+                                !original.ptr_eq(&Arc::downgrade(&source))
+                            }) {
+                                let mut preview_document =
+                                    Document::new(source.width, source.height);
+                                let mut pixel_layer =
+                                    Layer::raster("Subject preview", source.as_ref().clone());
+                                pixel_layer.id = *layer;
+                                preview_document.active_layer_id = Some(*layer);
+                                preview_document.layers = vec![pixel_layer];
+                                let prepared = crate::preview::prepare(&preview_document, 1000);
+                                let small =
+                                    prepared.active().and_then(|l| l.image.clone()).unwrap();
+                                let prediction = engine.as_ref().unwrap().predict(&small)?;
+                                preview_cache = Some((Arc::downgrade(&source), small, prediction));
+                            }
+                            let (original, small, prediction) = preview_cache.as_ref().unwrap();
+                            let original = original.upgrade().ok_or_else(|| {
+                                anyhow::anyhow!("The subject source was released")
+                            })?;
+                            sample = Some(small.clone());
+                            let settings = crate::matte::preview_settings(
+                                settings,
+                                small.width as f64 / original.width as f64,
+                            );
+                            let alpha = crate::matte::refine(&prediction.alpha, small, &settings)?;
+                            let mut preview_document = request.before.clone();
+                            preview_document.layer_mut(*layer).unwrap().image = Some(small.clone());
+                            crate::matte::apply_subject_mask(
+                                &mut preview_document,
+                                *layer,
+                                &alpha,
+                            )?;
+                            let layer = preview_document
+                                .layer(*layer)
+                                .ok_or_else(|| anyhow::anyhow!("The preview layer was removed"))?;
+                            let mut rgba = small.to_rgba();
+                            for (i, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                                let point = layer.transform.to_document([
+                                    (i as u32 % small.width) as f64 / small.width as f64
+                                        + 0.5 / small.width as f64,
+                                    (i as u32 / small.width) as f64 / small.height as f64
+                                        + 0.5 / small.height as f64,
+                                ]);
+                                pixel[3] = (pixel[3] as f64
+                                    * render::raster_mask_coverage(layer, point))
+                                .round()
+                                .clamp(0., 255.) as u8;
+                            }
+                            Ok((Raster::from_rgba(small.width, small.height, rgba), 0))
+                        })()
+                        .map_err(|e| format!("{e:#}"))
+                    });
                     let _ = sender.send(Worker::DialogPreview {
                         generation: *generation,
                         sample,
@@ -4342,48 +4853,54 @@ fn segmentation_worker(sender: WorkerSender) -> mpsc::Sender<SegmentRequest> {
                 }
                 .to_owned();
                 let mut doc = request.before.clone();
-                let result = (|| -> anyhow::Result<Document> {
-                    if engine.is_none() {
-                        engine = Some(crate::segmentation::SegmentationEngine::load_default()?);
-                    }
-                    let engine = engine.as_ref().unwrap();
-                    match request.operation {
-                        SegmentOperation::Selection { point, mode } => {
-                            let raster = crate::preview::PreviewCache::default().render(&doc, 1600);
-                            let predicted = engine.predict(&raster)?;
-                            let selection = if let Some(p) = point {
-                                predicted.object_at([
-                                    (p[0] * raster.width as f64 / doc.width as f64)
-                                        .floor()
-                                        .max(0.) as u32,
-                                    (p[1] * raster.height as f64 / doc.height as f64)
-                                        .floor()
-                                        .max(0.) as u32,
-                                ])?
-                            } else {
-                                predicted.selection()
-                            };
-                            let selection = scale_selection(&selection, doc.width, doc.height);
-                            doc.selection =
-                                Some(selection::combine(doc.selection.as_ref(), &selection, mode));
+                let result = gui_threads::run("主体处理", || {
+                    (|| -> anyhow::Result<Document> {
+                        if engine.is_none() {
+                            engine = Some(crate::segmentation::SegmentationEngine::load_default()?);
                         }
-                        SegmentOperation::Remove { layer, settings } => {
-                            let original = doc
-                                .layer(layer)
-                                .and_then(|l| l.image.clone())
-                                .ok_or_else(|| anyhow::anyhow!("Select a pixel layer"))?;
-                            let predicted = engine.predict(&original)?;
-                            let alpha =
-                                crate::matte::refine(&predicted.alpha, &original, &settings)?;
-                            crate::matte::apply_subject_mask(&mut doc, layer, &alpha)?;
+                        let engine = engine.as_ref().unwrap();
+                        match request.operation {
+                            SegmentOperation::Selection { point, mode } => {
+                                let raster =
+                                    crate::preview::PreviewCache::default().render(&doc, 1600);
+                                let predicted = engine.predict(&raster)?;
+                                let selection = if let Some(p) = point {
+                                    predicted.object_at([
+                                        (p[0] * raster.width as f64 / doc.width as f64)
+                                            .floor()
+                                            .max(0.) as u32,
+                                        (p[1] * raster.height as f64 / doc.height as f64)
+                                            .floor()
+                                            .max(0.) as u32,
+                                    ])?
+                                } else {
+                                    predicted.selection()
+                                };
+                                let selection = scale_selection(&selection, doc.width, doc.height);
+                                doc.selection = Some(selection::combine(
+                                    doc.selection.as_ref(),
+                                    &selection,
+                                    mode,
+                                ));
+                            }
+                            SegmentOperation::Remove { layer, settings } => {
+                                let original = doc
+                                    .layer(layer)
+                                    .and_then(|l| l.image.clone())
+                                    .ok_or_else(|| anyhow::anyhow!("Select a pixel layer"))?;
+                                let predicted = engine.predict(&original)?;
+                                let alpha =
+                                    crate::matte::refine(&predicted.alpha, &original, &settings)?;
+                                crate::matte::apply_subject_mask(&mut doc, layer, &alpha)?;
+                            }
+                            SegmentOperation::Preview { .. } => {
+                                unreachable!("Preview was handled above")
+                            }
                         }
-                        SegmentOperation::Preview { .. } => {
-                            unreachable!("Preview was handled above")
-                        }
-                    }
-                    Ok(doc)
-                })()
-                .map_err(|e| format!("{e:#}"));
+                        Ok(doc)
+                    })()
+                    .map_err(|e| format!("{e:#}"))
+                });
                 let _ = sender.send(Worker::Edit {
                     id: request.session,
                     revision: request.revision,
@@ -4512,6 +5029,8 @@ fn load_shortcuts() -> BTreeMap<String, String> {
         ("Swap colors", "X"),
         ("Default colors", "D"),
         ("Cycle tool mode", "Tab"),
+        ("Repeat Last Filter", "Ctrl+F"),
+        ("Search Commands", "Ctrl+Shift+P"),
     ] {
         shortcuts.entry(name.into()).or_insert(chord.into());
     }
@@ -4717,9 +5236,10 @@ impl EditorApp {
         let serial = self.session().serial;
         let name = name.to_owned();
         let sender = self.sender.clone();
-        self.session_mut().edit_busy = true;
-        std::thread::spawn(move || {
-            let result = operation(&mut d).map(|_| d).map_err(|e| format!("{e:#}"));
+        match gui_threads::spawn("后台编辑", move || {
+            let result = gui_threads::run("后台编辑", || {
+                operation(&mut d).map(|_| d).map_err(|e| format!("{e:#}"))
+            });
             let _ = sender.send(Worker::Edit {
                 id,
                 revision,
@@ -4728,7 +5248,10 @@ impl EditorApp {
                 before,
                 result,
             });
-        });
+        }) {
+            Ok(_) => self.session_mut().edit_busy = true,
+            Err(error) => self.message = Some(error),
+        }
     }
     fn apply(&mut self, name: &str, f: impl FnOnce(&mut Document) -> anyhow::Result<()>) {
         let before = self.session().doc.clone();
@@ -5058,6 +5581,27 @@ impl EditorApp {
                 * pixels_per_point)
                 .clamp(0.005, 8.);
         }
+        let navigator_input = self.export_dialog.is_none() && self.navigator_hit_test(ui, space);
+        let navigation =
+            if self.command_palette.is_open() || self.export_dialog.is_some() || navigator_input {
+                canvas_navigation::View {
+                    zoom: self.session().zoom,
+                    pan: self.session().pan,
+                    consumed: true,
+                }
+            } else {
+                canvas_navigation::update(
+                    ui,
+                    &response,
+                    space,
+                    self.session().id,
+                    self.session().zoom,
+                    self.session().pan,
+                    self.tool == Tool::Zoom && self.dialog.is_none(),
+                )
+            };
+        self.session_mut().zoom = navigation.zoom;
+        self.session_mut().pan = navigation.pan;
         let zoom = self.session().zoom / pixels_per_point;
         let size = Vec2::new(w * zoom, h * zoom);
         let mut rect = Rect::from_center_size(space.center() + self.session().pan, size);
@@ -5184,7 +5728,7 @@ impl EditorApp {
                 );
             }
         }
-        if self.rulers {
+        if self.rulers && !self.canvas_only {
             crate::canvas_chrome::rulers(&painter, space, rect, zoom);
         }
         if let Some([x, y, w, h]) = self.crop_rect {
@@ -5275,7 +5819,7 @@ impl EditorApp {
         if let Some(drag) = &self.drag {
             if matches!(
                 drag.mode,
-                Tool::Rectangle | Tool::Ellipse | Tool::Crop | Tool::Shape | Tool::Gradient
+                Tool::Rectangle | Tool::Ellipse | Tool::Crop | Tool::Gradient
             ) {
                 let bounds = if matches!(drag.mode, Tool::Rectangle | Tool::Ellipse) {
                     let [x, y, w, h] = selection_drag_box(drag, ui.input(|i| i.modifiers.shift));
@@ -5312,6 +5856,10 @@ impl EditorApp {
             ));
         }
         self.sample_text_color_canvas(ui, &response, rect);
+        if self.command_palette.is_open() || self.export_dialog.is_some() {
+            progressive_canvas::clear(ui.ctx());
+            return;
+        }
         if let Some(Dialog::Text { layer, mut origin }) = self.dialog.clone()
             && self
                 .dialog_target
@@ -5418,6 +5966,23 @@ impl EditorApp {
                 ui.colored_label(Color32::LIGHT_RED, tr(&error.to_string()));
             }
             return;
+        }
+        if self.navigator_ui(ui, space, rect) {
+            progressive_canvas::clear(ui.ctx());
+            return;
+        }
+        if self.progressive_canvas_ui(ui, &response, rect) {
+            return;
+        }
+        if navigation.consumed && self.drag.is_none() && self.guide_drag.is_none() {
+            return;
+        }
+        if self.tool == Tool::Zoom && response.hovered() {
+            ui.ctx().set_cursor_icon(if ui.input(|i| i.modifiers.alt) {
+                egui::CursorIcon::ZoomOut
+            } else {
+                egui::CursorIcon::ZoomIn
+            });
         }
         if self.specialized_filter_dialog()
             && response
@@ -5558,17 +6123,7 @@ impl EditorApp {
                         self.sample_cache = None;
                         let key = (self.session().id, self.session().serial);
                         if self.sample_busy != Some(key) {
-                            self.sample_busy = Some(key);
-                            let doc = self.session().doc.clone();
-                            let sender = self.sender.clone();
-                            std::thread::spawn(move || {
-                                let sampler = Arc::new(render::CompositeSampler::new(&doc));
-                                let _ = sender.send(Worker::ColorSample {
-                                    session: key.0,
-                                    serial: key.1,
-                                    sampler,
-                                });
-                            });
+                            self.start_color_sampler(key);
                         }
                     }
                     let color = self
@@ -5696,7 +6251,7 @@ impl EditorApp {
                     _ => {}
                 }
             }
-            if response.drag_started() {
+            if response.drag_started_by(egui::PointerButton::Primary) {
                 let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
                 let start = [
                     ((press.x - rect.left()) / zoom) as f64,
@@ -5850,7 +6405,7 @@ impl EditorApp {
                     }
                 }
             }
-            if response.dragged() {
+            if response.dragged_by(egui::PointerButton::Primary) {
                 if let Some(handle) = self.gradient_handle {
                     if let Some(g) = &mut self.gradient {
                         if handle == 0 {
@@ -6081,7 +6636,7 @@ impl EditorApp {
                 }
             }
         }
-        if response.drag_stopped() {
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
             if self.gradient_handle.take().is_some()
                 && let Some(state) = self.gradient.clone()
             {
@@ -6191,21 +6746,8 @@ impl EditorApp {
                         self.dialog_value = json!({"content":"文字","fontName":"Segoe UI","fontSize":48,"red":self.foreground[0]as f64/255.,"green":self.foreground[1]as f64/255.,"blue":self.foreground[2]as f64/255.,"alignment":"Left","tracking":0,"leading":0,"boxSize":[w.max(25.),h.max(25.)]});
                     }
                     Tool::Shape => {
-                        let kind = match self.shape_kind.as_str() {
-                            "Ellipse" => crate::edit::ShapeKind::Ellipse,
-                            "Line" => crate::edit::ShapeKind::Line,
-                            _ => crate::edit::ShapeKind::Rectangle,
-                        };
-                        let color = self.foreground;
-                        let radius = self.corner_radius;
-                        let width = self.line_width;
-                        let (rect, ends) = crate::edit::shape_drag_geometry(
-                            kind, drag.start, drag.last, shift, alt, width,
-                        );
-                        self.background_edit("New shape", move |d| {
-                            crate::edit::add_shape(d, kind, rect, color, radius, width, ends)
-                                .map(|_| ())
-                        });
+                        let draft = self.shape_draft(&drag, shift, alt);
+                        self.background_edit("New shape", move |d| draft.commit(d).map(|_| ()));
                     }
                     Tool::Gradient => {
                         let Some(id) = self.session().doc.active_layer_id else {
@@ -6233,8 +6775,12 @@ impl EditorApp {
                 }
             }
         }
+        // Paint after processing this frame's pointer, so draft geometry and
+        // modifier changes are visible immediately and match release/commit.
+        self.paint_shape_draft(ui, &painter, rect, zoom);
     }
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.prepare_progressive_line();
         self.pdf_dialogs(ctx);
         if let Some(dialog) = self.dialog.clone() {
             if self.dialog_target.is_none() {
@@ -6385,6 +6931,29 @@ impl EditorApp {
                                             .text("增强"),
                                     )
                                     .changed();
+                                changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.raw_settings.noise_reduction,
+                                            0.0..=1.0,
+                                        )
+                                        .text("传感器降噪"),
+                                    )
+                                    .changed();
+                                changed |= ui
+                                    .checkbox(
+                                        &mut self.raw_settings.highlight_recovery,
+                                        "恢复部分过曝的高光",
+                                    )
+                                    .changed();
+                                ui.add_enabled(
+                                    false,
+                                    egui::Checkbox::new(
+                                        &mut self.raw_settings.lens_correction,
+                                        "自动镜头校正",
+                                    ),
+                                )
+                                .on_disabled_hover_text("当前 RAW 解码器未提供镜头配置数据");
                                 if self.raw_busy {
                                     ui.spinner();
                                 }
@@ -6787,6 +7356,18 @@ impl EditorApp {
                                                 .or(self.dialog_sample.as_deref()),
                                             self.dialog_sample.as_deref(),
                                         );
+                                        match crate::filter_panel::take_camera_raw_section_reset(
+                                            ui.ctx(),
+                                        )
+                                        .as_deref()
+                                        {
+                                            Some("mixer") => {
+                                                self.raw_point_selection = None;
+                                                self.raw_mixer_drag = None;
+                                            }
+                                            Some("geometry") => self.raw_guide_start = None,
+                                            _ => {}
+                                        }
                                         ui.collapsing("色彩分级色轮", |ui| {
                                             crate::raw_interaction::show_grading_wheels(
                                                 ui,
@@ -7106,8 +7687,10 @@ impl EditorApp {
                         let revision = s.history.revision();
                         let serial = s.serial;
                         s.reload_busy = true;
-                        std::thread::spawn(move || {
-                            let result = project::load(&path).map_err(|e| format!("{e:#}"));
+                        if let Err(error) = gui_threads::spawn("重新载入", move || {
+                            let result = gui_threads::run("重新载入", || {
+                                project::load(&path).map_err(|e| format!("{e:#}"))
+                            });
                             let _ = sender.send(Worker::Reload {
                                 id,
                                 stamp,
@@ -7116,7 +7699,10 @@ impl EditorApp {
                                 force: true,
                                 result,
                             });
-                        });
+                        }) {
+                            s.reload_busy = false;
+                            self.message = Some(error);
+                        }
                     }
                 }
                 self.external_pending = None;
@@ -7198,6 +7784,9 @@ impl EditorApp {
         }
     }
     fn filter(&mut self, kind: &str, value: Value, mask: bool) {
+        if self.session().edit_busy {
+            return;
+        }
         let Some(id) = self.session().doc.active_layer_id else {
             return;
         };
@@ -7210,9 +7799,19 @@ impl EditorApp {
         }
         let value = committed_filter_settings(kind, value);
         let kind = kind.to_owned();
+        let request = (
+            self.session().id,
+            self.session().history.revision(),
+            self.session().serial,
+        );
+        let repeated = (kind.clone(), value.clone());
         self.background_edit(&kind.clone(), move |d| {
             crate::filter_edit::apply(d, id, mask, &kind, &value)
         });
+        if self.session().edit_busy {
+            self.pending_filters
+                .insert(request.0, (request.1, request.2, repeated.0, repeated.1));
+        }
     }
     fn watch(&mut self) {
         self.disk_changes.retain(|id, (target, _)| {
@@ -7243,8 +7842,10 @@ impl EditorApp {
                 let serial = s.serial;
                 let sender = self.sender.clone();
                 s.reload_busy = true;
-                std::thread::spawn(move || {
-                    let result = project::load(&path).map_err(|e| format!("{e:#}"));
+                if let Err(error) = gui_threads::spawn("重新载入", move || {
+                    let result = gui_threads::run("重新载入", || {
+                        project::load(&path).map_err(|e| format!("{e:#}"))
+                    });
                     let _ = sender.send(Worker::Reload {
                         id,
                         stamp,
@@ -7253,7 +7854,10 @@ impl EditorApp {
                         force: false,
                         result,
                     });
-                });
+                }) {
+                    s.reload_busy = false;
+                    self.message = Some(error);
+                }
             }
         }
     }
@@ -7272,7 +7876,9 @@ impl EditorApp {
                 })
             })
             .collect();
-        self.watcher.sync(targets);
+        if let Err(error) = self.watcher.sync(targets) {
+            self.message = Some(error);
+        }
     }
     fn repaint_delay(&self, time: f64) -> Option<Duration> {
         let animation = self
@@ -7400,6 +8006,7 @@ impl EditorApp {
         }
         if self.exit_pending {
             self.pdf_ui.cancel();
+            self.export_dialog = None;
         }
         if self.exit_pending && self.pending_io > 0 {
             self.message = Some("正在等待文件读写完成后关闭…".into());
@@ -7460,13 +8067,14 @@ impl eframe::App for EditorApp {
         eframe::set_value(
             storage,
             "editor",
-            &json!({"themePreference":self.theme_preference,"customTheme":self.custom_theme,"customThemeEnabled":self.custom_theme_enabled,"floatingLayers":self.floating_layers,"floatingTools":self.floating_tools,"gridSpacing":self.grid_spacing,"gridSubdivisions":self.grid_subdivisions,"rulers":self.rulers,"grid":self.grid,"snap":self.snap,"snapTargets":self.snap_targets,"sampleRing":self.show_sample_ring,"transformAutoSelect":self.transform_auto_select,"locksTransformRatio":self.locks_transform_ratio,"gridColor":self.grid_color,"jpegQuality":self.jpeg_quality}),
+            &json!({"themePreference":self.theme_preference,"customTheme":self.custom_theme,"customThemeEnabled":self.custom_theme_enabled,"floatingLayers":self.floating_layers,"floatingTools":self.floating_tools,"navigatorVisible":self.navigator_visible,"gridSpacing":self.grid_spacing,"gridSubdivisions":self.grid_subdivisions,"rulers":self.rulers,"grid":self.grid,"snap":self.snap,"snapTargets":self.snap_targets,"sampleRing":self.show_sample_ring,"transformAutoSelect":self.transform_auto_select,"locksTransformRatio":self.locks_transform_ratio,"gridColor":self.grid_color,"jpegQuality":self.jpeg_quality,"rawSettings":self.raw_settings}),
         );
     }
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let export_modal_open = self.export_dialog.is_some();
         self.restore_window_after_first_frame(ctx);
         self.window_motion.refresh_system_preference();
         crate::chrome::theme::set_animations(ctx, self.window_motion.animations_enabled());
@@ -7503,8 +8111,21 @@ impl eframe::App for EditorApp {
             .busy_since
             .is_some_and(|start| start.elapsed() >= Duration::from_millis(250));
         self.handle_window_close(ctx);
+        if self.canvas_only && self.canvas_only_restore_fullscreen.is_none() {
+            self.canvas_only_restore_fullscreen =
+                Some(ctx.input(|input| input.viewport().fullscreen.unwrap_or(false)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        } else if !self.canvas_only
+            && let Some(previous) = self.canvas_only_restore_fullscreen.take()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(previous));
+        }
         let before_theme = self.theme_preference;
-        let mut commands = self.menu(ctx);
+        let mut commands = if self.canvas_only {
+            vec![]
+        } else {
+            self.menu(ctx)
+        };
         self.show_theme_settings(ctx);
         self.open_source_licenses.show(ctx);
         if before_theme != self.theme_preference || self.theme_settings_dirty {
@@ -7514,23 +8135,25 @@ impl eframe::App for EditorApp {
             }
             self.theme_settings_dirty = false;
         }
-        commands.extend(self.workspace_toolbar(ctx));
-        commands.extend(self.tool_header(ctx));
-        self.status_ui(ctx, show_busy);
+        if !self.canvas_only {
+            commands.extend(self.workspace_toolbar(ctx));
+            commands.extend(self.tool_header(ctx));
+            self.status_ui(ctx, show_busy);
+        }
         commands.extend(self.shortcuts(ctx));
-        if self.floating_tools {
+        if !self.canvas_only && self.floating_tools {
             egui::Window::new("工具")
                 .id(egui::Id::new("Tools"))
                 .default_pos([12., 150.])
                 .show(ctx, |ui| self.tools_ui(ui));
-        } else {
+        } else if !self.canvas_only {
             egui::SidePanel::left("tools")
                 .exact_width(crate::chrome::metrics::RAIL_WIDTH)
                 .frame(egui::Frame::NONE.fill(ctx.style().visuals.panel_fill))
                 .resizable(false)
                 .show(ctx, |ui| self.tools_ui(ui));
         }
-        if self.floating_layers {
+        if !self.canvas_only && self.floating_layers {
             egui::Window::new("图层")
                 .id(egui::Id::new("Layers"))
                 .default_pos([970., 150.])
@@ -7539,7 +8162,7 @@ impl eframe::App for EditorApp {
                 .show(ctx, |ui| {
                     commands.extend(self.layers_ui(ui));
                 });
-        } else {
+        } else if !self.canvas_only {
             egui::SidePanel::right("layers")
                 .default_width(crate::chrome::metrics::LAYERS_DEFAULT_WIDTH)
                 .min_width(crate::chrome::metrics::LAYERS_MIN_WIDTH)
@@ -7587,10 +8210,16 @@ impl eframe::App for EditorApp {
         for command in save_actions {
             self.command(command);
         }
+        self.command_palette_ui(ctx);
         self.dialogs(ctx);
+        self.show_export_dialog(ctx);
         self.show_selection_amount_dialog(ctx);
         self.show_color_picker(ctx);
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        let dropped = if export_modal_open || self.export_dialog.is_some() {
+            Vec::new()
+        } else {
+            ctx.input(|i| i.raw.dropped_files.clone())
+        };
         for f in dropped {
             if let Some(path) = f.path {
                 self.open(path, ctx.input(|i| i.modifiers.shift));

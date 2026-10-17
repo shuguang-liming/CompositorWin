@@ -11,6 +11,48 @@ use serde_json::json;
 use std::{fs, sync::Arc};
 use uuid::Uuid;
 
+fn assert_project_move_settled(original: &std::path::Path, moved: &std::path::Path) {
+    let timeout = if cfg!(windows) {
+        std::time::Duration::from_millis(500)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let parent = original.parent().unwrap();
+    loop {
+        let entries = fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        let original_state = fs::symlink_metadata(original);
+        let moved_state = fs::symlink_metadata(moved);
+        let original_missing = matches!(
+            original_state.as_ref(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        let moved_is_file = moved_state
+            .as_ref()
+            .is_ok_and(|metadata| metadata.is_file());
+        if original_missing && moved_is_file && entries.is_empty() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let details = entries
+                .iter()
+                .map(|path| (path, fs::symlink_metadata(path)))
+                .collect::<Vec<_>>();
+            panic!(
+                "Project move did not settle: original={original:?}, moved={moved:?}, \
+                 original_metadata={original_state:?}, moved_metadata={moved_state:?}, \
+                 remaining_entries={details:?}"
+            );
+        }
+        // Recheck the exact move outcome; never remove or ignore a remaining entry.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn legacy_packages_v1_through_v11_migrate_to_single_files_without_losing_identity_or_alpha() {
     let directory = tempfile::tempdir().unwrap();
@@ -242,7 +284,7 @@ fn moving_one_project_file_preserves_layers_masks_text_transforms_and_exported_p
     let destination = tempfile::tempdir().unwrap();
     let moved = destination.path().join("移动 后的工程.comp");
     fs::rename(&original_path, &moved).unwrap();
-    assert_eq!(fs::read_dir(original_directory.path()).unwrap().count(), 0);
+    assert_project_move_settled(&original_path, &moved);
     let reopened = image_io::import(&moved).unwrap().document;
     assert_eq!(reopened, document);
     assert!(reopened.layer(text_id).unwrap().text.is_some());

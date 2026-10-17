@@ -108,16 +108,8 @@ fn camera_raw_same_input_as_original_c() {
     let raster = Raster::from_rgba(8, 8, straight);
     let cases = [
         (
-            "cameraBasic",
-            json!({"temperature":40,"tint":10,"exposure":0.7,"contrast":25,"highlights":-20,"shadows":30,"whites":15,"blacks":-10,"vibrance":40,"saturation":-15}),
-        ),
-        (
             "cameraEffects",
             json!({"texture":50,"clarity":30,"dehaze":20,"glow":35,"glowStyle":"Bloom","glowRange":15,"glowSpread":20,"glowWarmth":25,"vignetteAmount":-30,"vignetteMidpoint":40,"vignetteRoundness":20,"vignetteFeather":60,"vignetteHighlights":35}),
-        ),
-        (
-            "cameraCalibration",
-            json!({"calibration":{"shadowTint":30,"redHue":40,"redSaturation":20,"greenHue":-30,"greenSaturation":25,"blueHue":50,"blueSaturation":-15}}),
         ),
         (
             "cameraDetail",
@@ -144,17 +136,22 @@ fn camera_raw_same_input_as_original_c() {
 #[test]
 fn healing_and_content_fill_match_original_c() {
     let f = fixture();
-    let original = bytes(&f, "healInput");
-    let mask = bytes(&f, "healMask");
+    let latest: Value =
+        serde_json::from_str(include_str!("reference/patch_match_1_5_3.json")).unwrap();
     for mode in 0..3 {
-        let mut p = original.clone();
+        // Content-Aware now uses upstream 1.5.3's PatchMatch reconstruction;
+        // the unchanged proximity/texture modes retain their original oracle.
+        let reference = if mode == 0 { &latest } else { &f };
+        let mut p = bytes(reference, "healInput");
+        let mask = bytes(reference, "healMask");
         compositor::brush::spot_heal(&mut p, &mask, 24, 24, 0.75, mode, 123456);
         let key = format!("heal{mode}");
-        compare(&key, &p, &bytes(&f, &key), 0);
+        compare(&key, &p, &bytes(reference, &key), 0);
     }
-    let mut p = original;
+    let mut p = bytes(&latest, "healInput");
+    let mask = bytes(&latest, "healMask");
     assert!(compositor::brush::content_fill(&mut p, &mask, 24, 24));
-    compare("contentFill", &p, &bytes(&f, "contentFill"), 0);
+    compare("contentFill", &p, &bytes(&latest, "contentFill"), 0);
 }
 #[test]
 fn ten_nonfont_dither_styles_match_original_c() {
@@ -177,5 +174,29 @@ fn ten_nonfont_dither_styles_match_original_c() {
         let output = filters::apply_filter(&source, "Dither", &json!({"dither":{"style":name,"levels":4,"diffusion":80,"density":20,"contrast":15,"cellSize":4,"angle":0.3f64.to_degrees(),"lightOnDark":true,"colors":"Two Colors","dark":{"red":10./255.,"green":20./255.,"blue":30./255.},"light":{"red":220./255.,"green":230./255.,"blue":240./255.},"dots":40,"wobble":3,"pixelSize":1,"lineSpacing":4,"glow":0}})).unwrap();
         let key = format!("dither{style}");
         compare(&key, &output.to_rgba(), &bytes(&f, &key), 0);
+    }
+}
+
+#[test]
+fn camera_raw_1_5_3_matches_upstream_c() {
+    let f: Value = serde_json::from_str(include_str!("reference/camera_raw_1_5_3.json")).unwrap();
+    for case in f["cases"].as_array().unwrap() {
+        let mut straight = bytes(case, "input");
+        pixels::unpremultiply(&mut straight);
+        let raster = Raster::from_rgba(
+            case["width"].as_u64().unwrap() as u32,
+            case["height"].as_u64().unwrap() as u32,
+            straight,
+        );
+        let result =
+            filters::apply_filter(&raster, "Camera Raw Filter", &case["settings"]).unwrap();
+        let mut actual = result.to_rgba();
+        pixels::premultiply(&mut actual);
+        compare(
+            case["name"].as_str().unwrap(),
+            &actual,
+            &bytes(case, "expected"),
+            1,
+        );
     }
 }

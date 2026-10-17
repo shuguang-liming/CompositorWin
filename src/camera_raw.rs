@@ -4,6 +4,23 @@ use crate::pixels;
 use rayon::prelude::*;
 use serde_json::Value;
 
+#[path = "camera_raw_lookup.rs"]
+mod lookup;
+
+pub(super) fn bind_gpu(device: wgpu::Device, queue: wgpu::Queue) {
+    lookup::bind_gpu(device, queue);
+}
+pub(super) fn discard_gpu_buffers() {
+    lookup::discard_gpu_buffers();
+}
+pub(super) fn unbind_gpu() {
+    lookup::unbind_gpu();
+}
+
+pub(super) fn neutralize(color: [f64; 3]) -> Option<[f64; 2]> {
+    lookup::neutralize(color)
+}
+
 fn map_colors(p: &mut [u8], f: impl Fn([f64; 3]) -> [f64; 3] + Sync) {
     if p.len() < 65_536 {
         super::map_colors(p, f);
@@ -207,18 +224,16 @@ pub fn apply(p: &mut [u8], w: usize, h: usize, s: &Value) -> Result<(), String> 
     }
     let scale = number(s, "previewScale", 1.0).max(0.01);
     if matches!(number(s, "clipping", 0.) as i32, 1 | 2) {
-        basic_grade(p, s);
+        apply_color(p, w, h, s, false);
         return Ok(());
     }
     if boolean(&s["detail"], "showSharpenMask", false) {
-        basic_grade(p, s);
+        apply_color(p, w, h, s, false);
         detail(p, w, h, &s["detail"], scale);
         return Ok(());
     }
     geometry(p, w, h, &s["geometry"])?;
-    calibration(p, &s["calibration"]);
-    basic_grade(p, s);
-    curve_color(p, s);
+    apply_color(p, w, h, s, true);
     effects(p, w, h, s, scale);
     pixels::grain(
         p,
@@ -241,92 +256,47 @@ pub fn apply(p: &mut [u8], w: usize, h: usize, s: &Value) -> Result<(), String> 
     );
     Ok(())
 }
-pub fn basic_grade(p: &mut [u8], s: &Value) {
-    let warm = number(s, "temperature", 0.0) / 100.0;
-    let magenta = number(s, "tint", 0.0) / 100.0;
-    let gains = [
-        1.0 + 0.35 * warm + 0.15 * magenta,
-        1.0 - 0.3 * magenta,
-        1.0 - 0.35 * warm + 0.15 * magenta,
-    ];
-    let exposure = 2f64.powf(number(s, "exposure", 0.0));
-    let contrast = 1.0 + number(s, "contrast", 0.0) / 100.0;
-    let highlight = number(s, "highlights", 0.0) / 100.0;
-    let shadow = number(s, "shadows", 0.0) / 100.0;
-    let white = number(s, "whites", 0.0) / 100.0;
-    let black = number(s, "blacks", 0.0) / 100.0;
-    let vibrance = number(s, "vibrance", 0.0) / 100.0;
-    let saturation = number(s, "saturation", 0.0) / 100.0;
-    let clipping = number(s, "clipping", 0.0) as i32;
-    map_colors(p, |c| {
-        let mut c = std::array::from_fn(|i| {
-            (0.5 + (linear_to_srgb((srgb_to_linear(c[i]) * gains[i] * exposure).clamp(0.0, 1.0))
-                - 0.5)
-                * contrast)
-                .clamp(0.0, 1.0)
-        });
-        let y = lum(c);
-        let t = ((y - 0.5) / 0.5).clamp(0.0, 1.0);
-        let target = y + highlight * t * t * if highlight >= 0.0 { 1.0 - y } else { y - 0.5 };
-        scale_lum(&mut c, target);
-        let y = lum(c);
-        let t = ((0.5 - y) / 0.5).clamp(0.0, 1.0);
-        let target = y + shadow * t * t * if shadow >= 0.0 { 0.5 - y } else { y };
-        scale_lum(&mut c, target);
-        let y = lum(c);
-        scale_lum(
-            &mut c,
-            if y <= 0.75 {
-                y
-            } else {
-                0.75 + (y - 0.75) * (1.0 + white)
-            },
-        );
-        let y = lum(c);
-        scale_lum(
-            &mut c,
-            if y >= 0.25 {
-                y
-            } else {
-                0.25 + (y - 0.25) * (1.0 - black)
-            },
-        );
-        let max = c[0].max(c[1]).max(c[2]);
-        let min = c[0].min(c[1]).min(c[2]);
-        let chroma = max - min;
-        let sat = if max <= 1e-8 { 0.0 } else { chroma / max };
-        let hue = hsl(c)[0] * 360.0;
-        let skin = if (10.0..=50.0).contains(&hue) {
-            (if hue <= 30.0 {
-                (hue - 10.0) / 20.0
-            } else {
-                (50.0 - hue) / 20.0
-            }) * ((sat - 0.15) / 0.35).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let amount = vibrance
-            * (1.0 - sat)
-            * if vibrance > 0.0 {
-                1.0 - 0.7 * skin
-            } else {
-                1.0
-            };
-        let y = lum(c);
-        for v in &mut c {
-            *v = (y + (*v - y) * (1.0 + amount)).clamp(0.0, 1.0);
+fn apply_color(p: &mut [u8], w: usize, h: usize, s: &Value, full: bool) {
+    let visualize = s["mixer"]["points"]
+        .as_array()
+        .is_some_and(|points| points.iter().any(|p| boolean(p, "visualize", false)));
+    let folded = full
+        && !visualize
+        && s["mixer"]["points"].as_array().is_none_or(Vec::is_empty)
+        && number(&s["curve"], "refineSaturation", 0.) == 0.;
+    let brightness = if number(s, "contrast", 0.) != 0. || number(s, "highlights", 0.) != 0. {
+        lookup::brightness(p, w, h)
+    } else {
+        lookup::Brightness {
+            brightest: 128.,
+            log_brightest: 128.,
         }
-        let y = lum(c);
-        for v in &mut c {
-            *v = (y + (*v - y) * (1.0 + saturation)).clamp(0.0, 1.0);
-        }
-        if clipping == 1 {
-            c = c.map(|v| if v >= 254.5 / 255.0 { 1.0 } else { 0.0 });
-        } else if clipping == 2 {
-            c = c.map(|v| if v <= 0.5 / 255.0 { 0.0 } else { 1.0 });
-        }
-        c
-    });
+    };
+    if full && number(&s["calibration"], "shadowTint", 0.) != 0. {
+        calibration(p, &s["calibration"]);
+    }
+    let color = lookup::prepare(s, brightness, folded);
+    if let Some(before) = color.before.as_deref() {
+        lookup::apply(p, Some(before), 0);
+    }
+    lookup::apply_shadows(
+        p,
+        w,
+        h,
+        number(s, "shadows", 0.),
+        number(s, "previewScale", 1.),
+    );
+    let clipping = number(s, "clipping", 0.) as i32;
+    if color.after.is_some() || clipping != 0 {
+        lookup::apply(p, color.after.as_deref(), clipping);
+    }
+    if full && !folded {
+        curve_color(p, s, &color);
+    }
+}
+#[cfg(test)]
+fn basic_grade(p: &mut [u8], s: &Value) {
+    apply_color(p, p.len() / 4, 1, s, false);
 }
 fn calibration(p: &mut [u8], s: &Value) {
     let scale = match string(s, "process", "Version 6") {
@@ -338,167 +308,82 @@ fn calibration(p: &mut [u8], s: &Value) {
         _ => 1.0,
     };
     let tint = number(s, "shadowTint", 0.0) / 100.0 * scale;
-    let hue = ["redHue", "greenHue", "blueHue"]
-        .map(|key| number(s, key, 0.0) / 100.0 * 15.0 / 360.0 * scale);
-    let saturation = ["redSaturation", "greenSaturation", "blueSaturation"]
-        .map(|key| number(s, key, 0.0) / 100.0 * 0.45 * scale);
     map_colors(p, |c| {
-        let [mut h, mut sat, l] = hsl(c);
+        let [mut h, sat, l] = hsl(c);
         if l < 0.35 {
             h += tint * 0.06;
-        }
-        let max = c[0].max(c[1]).max(c[2]);
-        let min = c[0].min(c[1]).min(c[2]);
-        if max - min > 1e-5 {
-            let index = if c[0] >= c[1] && c[0] >= c[2] {
-                0
-            } else if c[1] >= c[0] && c[1] >= c[2] {
-                1
-            } else {
-                2
-            };
-            h += hue[index];
-            sat = (sat * (1.0 + saturation[index])).clamp(0.0, 1.0);
         }
         rgb(h, sat, l)
     });
 }
-fn curve_color(p: &mut [u8], settings: &Value) {
-    let s = &settings["curve"];
-    let mixer = &settings["mixer"];
-    let grading = &settings["grading"];
-    let refine = number(s, "refineSaturation", 0.0) / 100.0;
-    let bend = |t: f64, lower: f64, low: f64, upper: f64, high: f64| {
-        if t < lower && lower > 0.0 {
-            lower * (t / lower).powf(2f64.powf(-low / 100.0 * 1.66))
-        } else if t > upper && upper < 1.0 {
-            1.0 - (1.0 - upper) * ((1.0 - t) / (1.0 - upper)).powf(2f64.powf(high / 100.0 * 1.66))
+fn curve_color(p: &mut [u8], settings: &Value, color: &lookup::PreparedColor) {
+    let tables = lookup::curve_tables(settings);
+    let refine = number(&settings["curve"], "refineSaturation", 0.) / 100.;
+    // Point-color parameters cross Swift's Float boundary before the C kernel.
+    let points: Vec<[f64; 9]> = settings["mixer"]["points"]
+        .as_array()
+        .map(|points| {
+            points
+                .iter()
+                .map(|p| {
+                    [
+                        (number(p, "hue", 0.) / 360.) as f32 as f64,
+                        number(p, "saturation", 0.) as f32 as f64,
+                        number(p, "luminance", 0.) as f32 as f64,
+                        (number(p, "hueShift", 0.) / 100.) as f32 as f64,
+                        (number(p, "saturationShift", 0.) / 100.) as f32 as f64,
+                        (number(p, "luminanceShift", 0.) / 100.) as f32 as f64,
+                        (number(p, "hueRange", 30.) / 360.) as f32 as f64,
+                        number(p, "saturationRange", 0.4) as f32 as f64,
+                        number(p, "luminanceRange", 0.4) as f32 as f64,
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let visualize = settings["mixer"]["points"]
+        .as_array()
+        .and_then(|points| points.iter().position(|p| boolean(p, "visualize", false)));
+    let point_weight = |[h, s, l]: [f64; 3], point: &[f64; 9]| {
+        let hue = 1. - circular(h, point[0]) / point[6].max(0.01f32 as f64);
+        let sat = 1. - (s - point[1]).abs() / point[7].max(0.01f32 as f64);
+        let lum = 1. - (l - point[2]).abs() / point[8].max(0.01f32 as f64);
+        if hue < 0. || sat < 0. || lum < 0. {
+            0.
         } else {
-            t
+            hue * sat * lum
         }
     };
-    let anchors = PreparedCurve::from_points(
-        (0..=32)
-            .map(|i| {
-                let x = i as f64 / 32.0;
-                let y = bend(
-                    bend(
-                        x,
-                        number(s, "shadowSplit", 25.0) / 100.0,
-                        number(s, "shadows", 0.0),
-                        number(s, "lightSplit", 75.0) / 100.0,
-                        number(s, "highlights", 0.0),
-                    ),
-                    number(s, "darkSplit", 50.0) / 100.0,
-                    number(s, "darks", 0.0),
-                    number(s, "darkSplit", 50.0) / 100.0,
-                    number(s, "lights", 0.0),
-                );
-                [x, y]
-            })
-            .collect(),
-    );
-    let master = PreparedCurve::new(&s["rgb"]);
-    let channels = ["red", "green", "blue"].map(|key| PreparedCurve::new(&s[key]));
-    let tone = |v: f64| master.value(anchors.value(v));
-    let centers = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 270.0, 300.0];
-    let bands: [[f64; 3]; 8] = std::array::from_fn(|i| {
-        ["hue", "saturation", "luminance"].map(|key| mixer[key][i].as_f64().unwrap_or(0.0) / 100.0)
-    });
-    let split = 0.5 - number(grading, "balance", 0.0) / 100.0 * 0.2;
-    let reach = 0.12 + number(grading, "blending", 50.0) / 100.0 * 0.38;
-    let wheels = ["shadows", "midtones", "highlights", "global"].map(|key| {
-        let wheel = &grading[key];
-        (
-            number(wheel, "saturation", 0.0) / 100.0,
-            number(wheel, "luminance", 0.0) / 100.0,
-            rgb(number(wheel, "hue", 0.0) / 360.0, 1.0, 0.5),
-        )
-    });
     map_colors(p, |c| {
-        let mut curved = c.map(tone);
-        if refine < 0.0 {
+        let mut curved = c.map(|v| lookup::lut_at(&tables[0], v));
+        if refine < 0. {
             let mut brightness = c;
-            scale_lum(&mut brightness, tone(lum(c)));
+            scale_lum(&mut brightness, lookup::lut_at(&tables[0], lum(c)));
             for i in 0..3 {
                 curved[i] += (brightness[i] - curved[i]) * (-refine);
             }
-        } else if refine > 0.0 {
+        } else if refine > 0. {
             let y = lum(curved);
-            curved = curved.map(|v| (y + (v - y) * (1.0 + refine)).clamp(0.0, 1.0));
+            curved = curved.map(|v| (y + (v - y) * (1. + refine)).clamp(0., 1.));
         }
-        let mut c = std::array::from_fn(|i| channels[i].value(curved[i]));
+        let mut c = std::array::from_fn(|i| lookup::lut_at(&tables[i + 1], curved[i]));
+        if let Some(table) = color.mixer.as_deref() {
+            c = lookup::sample(table, c);
+        }
         let [mut h, mut sat, mut l] = hsl(c);
         let original = [h, sat, l];
-        let mut delta = [0.0; 3];
-        let mut weight = 0.0;
-        for (i, center) in centers.iter().enumerate() {
-            let w = 1.0 - circular(h, center / 360.0) / (40.0 / 360.0);
-            if w <= 0.0 {
-                continue;
-            }
-            delta[0] += bands[i][0] * w * 30.0 / 360.0;
-            delta[1] += bands[i][1] * w;
-            delta[2] += bands[i][2] * w * 0.25;
-            weight += w;
-        }
-        if weight > 1.0 {
-            for d in &mut delta {
-                *d /= weight;
-            }
-        }
-        h = (h + delta[0]).rem_euclid(1.0);
-        sat = (sat * (1.0 + delta[1])).clamp(0.0, 1.0);
-        l = (l + delta[2]).clamp(0.0, 1.0);
-        let point_weight = |h: f64, sat: f64, l: f64, point: &Value| {
-            let hue = 1.0
-                - circular(h, number(point, "hue", 0.0) / 360.0)
-                    / (number(point, "hueRange", 30.0) / 360.0).max(0.01);
-            let sat = 1.0
-                - (sat - number(point, "saturation", 0.0)).abs()
-                    / number(point, "saturationRange", 0.4).max(0.01);
-            let l = 1.0
-                - (l - number(point, "luminance", 0.0)).abs()
-                    / number(point, "luminanceRange", 0.4).max(0.01);
-            if hue < 0.0 || sat < 0.0 || l < 0.0 {
-                0.0
-            } else {
-                hue * sat * l
-            }
-        };
-        if let Some(points) = mixer["points"].as_array() {
-            for point in points {
-                let w = point_weight(h, sat, l, point);
-                h += number(point, "hueShift", 0.0) / 100.0 * w * 30.0 / 360.0;
-                sat = (sat * (1.0 + number(point, "saturationShift", 0.0) / 100.0 * w))
-                    .clamp(0.0, 1.0);
-                l = (l + number(point, "luminanceShift", 0.0) / 100.0 * w * 0.25).clamp(0.0, 1.0);
-            }
+        for point in &points {
+            let weight = point_weight([h, sat, l], point);
+            h += point[3] * weight * (30. / 360.);
+            sat = (sat * (1. + point[4] * weight)).clamp(0., 1.);
+            l = (l + point[5] * weight * 0.25).clamp(0., 1.);
         }
         c = rgb(h, sat, l);
-        let y = lum(c);
-        let mut weights = [
-            ((split + reach - y) / (reach * 2.0).max(0.05)).clamp(0.0, 1.0),
-            (1.0 - (y - split).abs() / (0.35 + reach)).clamp(0.0, 1.0),
-            ((y - (split - reach)) / (reach * 2.0).max(0.05)).clamp(0.0, 1.0),
-            1.0,
-        ];
-        let sum = weights[..3].iter().sum::<f64>();
-        if sum > 1e-4 {
-            for w in &mut weights[..3] {
-                *w /= sum;
-            }
+        if let Some(table) = color.grading.as_deref() {
+            c = lookup::sample(table, c);
         }
-        for (index, &(ws, wl, tint)) in wheels.iter().enumerate() {
-            for i in 0..3 {
-                c[i] = (c[i] + (tint[i] - 0.5) * ws * weights[index] * 0.85).clamp(0.0, 1.0);
-            }
-            let y = lum(c);
-            scale_lum(&mut c, y + wl * 0.25 * weights[index]);
-        }
-        if let Some(points) = mixer["points"].as_array()
-            && let Some(point) = points.iter().find(|p| boolean(p, "visualize", false))
-            && point_weight(original[0], original[1], original[2], point) <= 0.05
+        if let Some(index) = visualize
+            && point_weight(original, &points[index]) <= 0.05
         {
             c = c.map(|v| v * 0.35);
         }

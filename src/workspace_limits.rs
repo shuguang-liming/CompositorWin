@@ -18,11 +18,11 @@ pub struct WorkspaceUsage {
 }
 
 pub fn workspace_usage<'a>(documents: impl IntoIterator<Item = &'a Document>) -> WorkspaceUsage {
-    fn allocation(buffer: &Arc<Vec<u8>>, seen: &mut HashSet<usize>) -> u64 {
+    fn allocation<T>(buffer: &Arc<Vec<T>>, seen: &mut HashSet<usize>) -> u64 {
         if buffer.capacity() == 0 || !seen.insert(Arc::as_ptr(buffer) as usize) {
             return 0;
         }
-        buffer.capacity() as u64
+        (buffer.capacity() * std::mem::size_of::<T>()) as u64
     }
 
     let mut seen = HashSet::new();
@@ -44,6 +44,16 @@ pub fn workspace_usage<'a>(documents: impl IntoIterator<Item = &'a Document>) ->
                     usage.raster_bytes = usage
                         .raster_bytes
                         .saturating_add(allocation(tile, &mut seen));
+                }
+                if let Some(deep) = &raster.deep {
+                    usage.raster_bytes = usage
+                        .raster_bytes
+                        .saturating_add(allocation(&deep.base, &mut seen));
+                    for tile in deep.tiles.values() {
+                        usage.raster_bytes = usage
+                            .raster_bytes
+                            .saturating_add(allocation(tile, &mut seen));
+                    }
                 }
             }
         }
@@ -86,7 +96,28 @@ fn budget_for_memory(physical_bytes: Option<u64>) -> u64 {
 /// One third of installed RAM, bounded to 256 MiB..6 GiB; 512 MiB if detection fails.
 /// The remainder covers the OS, GPU/preview caches and temporary decoding/rendering buffers.
 pub fn workspace_budget_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(budget) = TEST_WORKSPACE_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
     budget_for_memory(physical_memory_bytes())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_WORKSPACE_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_workspace_budget<T>(budget: u64, operation: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_WORKSPACE_BUDGET.with(|value| value.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_WORKSPACE_BUDGET.with(|value| value.replace(Some(budget))));
+    operation()
 }
 
 /// `retained_history_bytes` is an upper bound supplied by the session histories.
@@ -196,6 +227,7 @@ mod tests {
             height: 32,
             pixels: Arc::new(bytes),
             tiles: Default::default(),
+            deep: None,
         }));
         assert_eq!(workspace_usage([&document]).current_bytes, capacity as u64);
         assert!(check_workspace_budget([&document], 0, 4096).is_err());

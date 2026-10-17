@@ -7,6 +7,45 @@ fn property_drag_value(value: &mut f64) -> egui::DragValue<'_> {
     egui::DragValue::new(value).update_while_editing(false)
 }
 
+/// A middle-button grab changes only the list offset, never the row selection.
+fn layer_list_middle_scroll(
+    ui: &egui::Ui,
+    rect: Rect,
+    scroll_id: egui::Id,
+    enabled: bool,
+) -> Option<f32> {
+    let drag_key = scroll_id.with("middle-drag");
+    let (focused, down, pressed, position, origin) = ui.input(|input| {
+        (
+            input.focused,
+            input.pointer.button_down(egui::PointerButton::Middle),
+            input.pointer.button_pressed(egui::PointerButton::Middle),
+            input.pointer.latest_pos(),
+            input.pointer.press_origin(),
+        )
+    });
+    if !enabled || !focused || !down {
+        ui.ctx().data_mut(|data| data.remove::<f32>(drag_key));
+        return None;
+    }
+    let mut previous = ui.ctx().data(|data| data.get_temp::<f32>(drag_key));
+    if pressed {
+        previous = origin
+            .filter(|point| rect.contains(*point) && ui.rect_contains_pointer(rect))
+            .map(|point| point.y);
+    }
+    let (Some(previous), Some(position)) = (previous, position) else {
+        return None;
+    };
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(drag_key, position.y));
+    let offset = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+        .unwrap_or_default()
+        .offset
+        .y;
+    Some(offset - (position.y - previous))
+}
+
 const EFFECT_KINDS: [&str; 6] = [
     "stroke",
     "shadow",
@@ -389,22 +428,45 @@ impl EditorApp {
         ui.add_enabled_ui(!welcome, |ui| self.layer_appearance_ui(ui));
         ui.separator();
         let list_height = (ui.available_height() - 49.).max(1.);
-        egui::ScrollArea::vertical()
-            .id_salt(self.layer_panel_key("list"))
+        let list_key = self.layer_panel_key("list");
+        let list_rect = Rect::from_min_size(
+            ui.available_rect_before_wrap().min,
+            Vec2::new(ui.available_width(), list_height),
+        );
+        let middle_offset = layer_list_middle_scroll(
+            ui,
+            list_rect,
+            // ScrollArea hashes id_salt even when the supplied salt is an Id.
+            ui.make_persistent_id(egui::Id::new(list_key)),
+            !welcome && ui.is_enabled(),
+        );
+        let mut list = egui::ScrollArea::vertical()
+            .id_salt(list_key)
             .auto_shrink([false, false])
             .max_height(list_height)
             .min_scrolled_height(list_height)
-            .show(ui, |ui| {
-                if welcome {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(30.);
-                        ui.label("暂无图层");
-                        ui.label(egui::RichText::new("创建画布或导入图像。").size(11.).weak());
-                    });
-                } else {
-                    self.layer_rows_ui(ui, &before, &mut actions, &mut layer_drops);
-                }
+            .scroll_source(egui::scroll_area::ScrollSource {
+                // Primary drags reorder rows; middle drags are handled above.
+                drag: false,
+                ..egui::scroll_area::ScrollSource::ALL
             });
+        if let Some(offset) = middle_offset {
+            list = list.vertical_scroll_offset(offset);
+        }
+        list.show(ui, |ui| {
+            if welcome {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.);
+                    ui.label("暂无图层");
+                    ui.label(egui::RichText::new("创建画布或导入图像。").size(11.).weak());
+                });
+            } else {
+                self.layer_rows_ui(ui, &before, &mut actions, &mut layer_drops);
+            }
+        });
+        if middle_offset.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
         ui.separator();
         let create_mask = ui
             .add_enabled_ui(!welcome, |ui| self.layer_footer_ui(ui, &mut actions))
@@ -573,7 +635,7 @@ impl EditorApp {
             } else {
                 node.visible
             };
-            if eye.drag_started() {
+            if eye.drag_started_by(egui::PointerButton::Primary) {
                 self.visibility_sweep = Some((!node.visible, before.clone(), HashSet::new()));
             }
             if let Some((desired, _, visited)) = &mut self.visibility_sweep {
@@ -815,6 +877,7 @@ impl EditorApp {
                     name_rect,
                     egui::Label::new(egui::RichText::new(name).size(13.).color(color))
                         .truncate()
+                        .selectable(false)
                         .sense(Sense::click_and_drag()),
                 );
                 drag_response = drag_response.union(label.clone());
@@ -854,6 +917,7 @@ impl EditorApp {
                         .color(color.gamma_multiply(0.65)),
                 )
                 .truncate()
+                .selectable(false)
                 .sense(Sense::click_and_drag()),
             );
             drag_response = drag_response.union(dimensions_response.clone());
@@ -913,10 +977,12 @@ impl EditorApp {
                 } else {
                     vec![node.id]
                 };
-                drag_response.dnd_set_drag_payload(LayerPayload {
-                    document: self.session().id,
-                    ids,
-                });
+                if drag_response.drag_started_by(egui::PointerButton::Primary) {
+                    drag_response.dnd_set_drag_payload(LayerPayload {
+                        document: self.session().id,
+                        ids,
+                    });
+                }
                 if let Some(payload) = drag_response.dnd_release_payload::<LayerPayload>() {
                     let parent = if node.group
                         && drag_response
@@ -1394,7 +1460,7 @@ impl EditorApp {
                     for (key, channel) in ["red", "green", "blue"].into_iter().zip(color) {
                         value[key] = json!(channel);
                     }
-                    let kind = value["kind"].as_str().unwrap_or("Rectangle");
+                    let kind = value["kind"].as_str().unwrap_or("Rectangle").to_owned();
                     let key = if kind == "Line" {
                         "lineWidth"
                     } else {
@@ -1410,6 +1476,17 @@ impl EditorApp {
                             )
                             .changed();
                         value[key] = json!(amount);
+                    }
+                    if kind == "Rectangle" {
+                        let mut smoothing = value["smoothing"].as_bool().unwrap_or(false);
+                        if ui.checkbox(&mut smoothing, "平滑圆角").changed() {
+                            changed = true;
+                            if smoothing {
+                                value["smoothing"] = json!(true);
+                            } else if let Some(value) = value.as_object_mut() {
+                                value.remove("smoothing");
+                            }
+                        }
                     }
                     if changed {
                         shape_edit = Some((l.id, value));
@@ -1568,6 +1645,208 @@ impl EditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layers_frame(
+        app: &mut EditorApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+        focused: bool,
+    ) -> (f32, egui::CursorIcon) {
+        let mut offset = 0.;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500., 520.))),
+                events,
+                focused,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let scroll_id =
+                        ui.make_persistent_id(egui::Id::new(app.layer_panel_key("list")));
+                    app.restored_layers_ui(ui);
+                    offset = egui::scroll_area::State::load(ctx, scroll_id)
+                        .unwrap()
+                        .offset
+                        .y;
+                });
+            },
+        );
+        (offset, output.platform_output.cursor_icon)
+    }
+
+    fn populated_layers_app() -> EditorApp {
+        let mut doc = Document::new(8, 8);
+        for index in 0..40 {
+            crate::edit::add_layer(&mut doc, format!("图层 {index}"));
+        }
+        let mut app = EditorApp::create(None, None);
+        app.tabs = vec![Session::new(doc, None)];
+        app.current = 0;
+        app
+    }
+
+    fn pointer_button(position: Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: position,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn middle_drag_scrolls_list_without_selecting_hiding_or_dragging_layers() {
+        // Exercise both an eye widget and the row label, whose generic drag
+        // handlers previously also accepted the middle button.
+        for x in [26., 200.] {
+            let mut app = populated_layers_app();
+            let original = app.session().doc.clone();
+            let selected = app.session().selected.clone();
+            let context = egui::Context::default();
+            layers_frame(&mut app, &context, vec![], true);
+            layers_frame(&mut app, &context, vec![], true);
+            let start = Pos2::new(x, 300.);
+            let (offset, cursor) = layers_frame(
+                &mut app,
+                &context,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    pointer_button(start, egui::PointerButton::Middle, true),
+                ],
+                true,
+            );
+            assert_eq!(offset, 0.);
+            assert_eq!(cursor, egui::CursorIcon::Grabbing);
+            let (offset, _) = layers_frame(
+                &mut app,
+                &context,
+                vec![egui::Event::PointerMoved(Pos2::new(x, 250.))],
+                true,
+            );
+            assert!((offset - 50.).abs() < 0.01);
+            let outside = Pos2::new(600., 210.);
+            let (offset, _) = layers_frame(
+                &mut app,
+                &context,
+                vec![egui::Event::PointerMoved(outside)],
+                true,
+            );
+            assert!((offset - 90.).abs() < 0.01);
+            layers_frame(
+                &mut app,
+                &context,
+                vec![pointer_button(outside, egui::PointerButton::Middle, false)],
+                true,
+            );
+            let (offset, _) = layers_frame(
+                &mut app,
+                &context,
+                vec![egui::Event::PointerMoved(Pos2::new(x, 100.))],
+                true,
+            );
+            assert!((offset - 90.).abs() < 0.01);
+            assert_eq!(app.session().doc, original);
+            assert_eq!(app.session().selected, selected);
+            assert!(app.session().history.undo_name().is_none());
+            assert!(!egui::DragAndDrop::has_any_payload(&context));
+        }
+    }
+
+    #[test]
+    fn middle_scroll_is_list_only_stops_on_focus_loss_and_keeps_wheel_primary_drag() {
+        let mut app = populated_layers_app();
+        let context = egui::Context::default();
+        layers_frame(&mut app, &context, vec![], true);
+        layers_frame(&mut app, &context, vec![], true);
+        let header = Pos2::new(200., 30.);
+        let list = Pos2::new(200., 300.);
+        layers_frame(
+            &mut app,
+            &context,
+            vec![
+                egui::Event::PointerMoved(header),
+                pointer_button(header, egui::PointerButton::Middle, true),
+            ],
+            true,
+        );
+        let (offset, _) = layers_frame(
+            &mut app,
+            &context,
+            vec![egui::Event::PointerMoved(list)],
+            true,
+        );
+        assert_eq!(offset, 0.);
+        layers_frame(
+            &mut app,
+            &context,
+            vec![pointer_button(list, egui::PointerButton::Middle, false)],
+            true,
+        );
+        layers_frame(
+            &mut app,
+            &context,
+            vec![pointer_button(list, egui::PointerButton::Middle, true)],
+            true,
+        );
+        let (offset, _) = layers_frame(
+            &mut app,
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(200., 250.))],
+            true,
+        );
+        assert!((offset - 50.).abs() < 0.01);
+        layers_frame(&mut app, &context, vec![], false);
+        let (after_focus, _) = layers_frame(
+            &mut app,
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(200., 200.))],
+            true,
+        );
+        assert_eq!(after_focus, offset);
+        layers_frame(
+            &mut app,
+            &context,
+            vec![
+                pointer_button(list, egui::PointerButton::Middle, false),
+                egui::Event::PointerMoved(list),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0., -60.),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            true,
+        );
+        let mut after_wheel = 0.;
+        for _ in 0..12 {
+            after_wheel = layers_frame(&mut app, &context, vec![], true).0;
+        }
+        assert!(after_wheel > after_focus);
+        let active = app.session().doc.active_layer_id;
+        for pressed in [true, false] {
+            layers_frame(
+                &mut app,
+                &context,
+                vec![pointer_button(list, egui::PointerButton::Primary, pressed)],
+                true,
+            );
+        }
+        assert_ne!(app.session().doc.active_layer_id, active);
+        layers_frame(
+            &mut app,
+            &context,
+            vec![pointer_button(list, egui::PointerButton::Primary, true)],
+            true,
+        );
+        layers_frame(
+            &mut app,
+            &context,
+            vec![egui::Event::PointerMoved(Pos2::new(200., 250.))],
+            true,
+        );
+        assert!(egui::DragAndDrop::payload::<LayerPayload>(&context).is_some());
+    }
 
     fn mask_x_frame(
         app: &mut EditorApp,
