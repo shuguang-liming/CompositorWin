@@ -11,7 +11,7 @@
   <img src="assets/readme-windows.svg" alt="Windows 10 22H2 / Windows 11 x64">
   <img src="assets/readme-rust.svg" alt="使用 Rust 开发">
   <img src="assets/readme-local.svg" alt="图像在本地编辑">
-  <a href="LICENSES.md"><img src="assets/readme-license.svg" alt="主程序 MIT 许可证；第三方组件分别适用各自许可证"></a>
+  <a href="LICENSE.md"><img src="assets/readme-license.svg" alt="主程序 Apache-2.0 许可证；原项目和第三方组件分别适用各自许可证"></a>
 </p>
 
 <p align="center">
@@ -318,12 +318,12 @@ Python 仅用于这个调用示例，其他语言也可直接启动进程。控�
 
 </details>
 
-应用保留原项目 [robbietilton/Compositor](https://github.com/robbietilton/Compositor) 的版权和 MIT 许可。在软件中打开“帮助 → 开源软件许可证”，点击组件名称可在线查看许可证，点击“随附原文”可离线阅读原始版权和许可；应用、模型、依赖和字体仍分别适用各自许可证。发行包的 [LICENSES.md](LICENSES.md) 提供简短入口说明，完整原文保存在软件内。
+CompositorWin 主程序采用 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) 开源，原项目 [robbietilton/Compositor](https://github.com/robbietilton/Compositor) 的版权和 MIT 许可完整保留。在软件中打开“帮助 → 开源软件许可证”，点击组件名称可在线查看许可证，点击“随附原文”可离线阅读原始版权和许可；原项目、模型、依赖和字体仍分别适用各自许可证。发行包的 [LICENSES.md](LICENSES.md) 提供简短入口说明，完整原文保存在软件内。
 <!-- USER-GUIDE-END -->
 
 ## 致谢与开源许可
 
-Windows 版基于 [robbietilton/Compositor](https://github.com/robbietilton/Compositor) 的设计与项目工作，使用 Rust、egui 与 wgpu 实现。保留原作者 **Wonder Assembly LLC** 的版权及 MIT 许可；U²-Netp 模型、字体与第三方依赖分别遵循各自许可证。
+CompositorWin 主程序及 Windows 移植新增代码采用 **Apache License 2.0**，许可证见 [LICENSE.md](LICENSE.md)。Windows 版基于 [robbietilton/Compositor](https://github.com/robbietilton/Compositor) 的设计与项目工作，使用 Rust、egui 与 wgpu 实现。原项目代码保留原作者 **Wonder Assembly LLC** 的版权及 MIT 许可；U²-Netp 模型、字体与其他第三方依赖分别遵循各自许可证。
 
 完整版权与许可原文统一在 [LICENSES.md](LICENSES.md)。软件内可打开 **帮助 → 开源软件许可证**，通过在线链接查看各组件许可，也可按需展开随附原文。
 

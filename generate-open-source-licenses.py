@@ -77,8 +77,11 @@ def generate(source_bundle):
     identities = {entry["path"]: index for index, entry in enumerate(ranges)}
     package = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]
     version = package["version"]
+    require(package["license"] == "Apache-2.0", "The application license must match the Apache-2.0 declaration")
+    require(originals.get("CompositorWin-LICENSE.md") == (ROOT / "LICENSE.md").read_bytes(), "The bundled application license differs from LICENSE.md")
     components = [
-        component("Compositor / CompositorWin", version, "MIT", "https://github.com/robbietilton/Compositor", [identities["LICENSE"]], [{"name": "MIT", "url": "https://spdx.org/licenses/MIT.html"}]),
+        component("CompositorWin", version, package["license"], "https://github.com/shuguang-liming/CompositorWin", [identities["CompositorWin-LICENSE.md"]], [{"name": "Apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0"}]),
+        component("Compositor (original project)", "", "MIT", "https://github.com/robbietilton/Compositor", [identities["LICENSE"]], [{"name": "MIT", "url": "https://spdx.org/licenses/MIT.html"}]),
         component("U²-Netp model", "", "Apache-2.0", "https://github.com/xuebinqin/U-2-Net", [identities["LICENSE-U2NET.txt"]], [{"name": "Apache-2.0", "url": "https://spdx.org/licenses/Apache-2.0.html"}]),
     ]
     nsis = "installer-licenses/NSIS-3.11-COPYING.txt"
@@ -127,7 +130,8 @@ def package_index(index):
         "选择“随附原文”可离线查看该组件的完整许可和版权声明。\n\n"
         "完整原文已压缩内嵌在 compositor.exe 中，按需解压，不需要另外附带大段文本。"
         "压缩不改变原始字节或许可条款；各组件仍分别适用自己的许可证。\n\n"
-        "- 应用：MIT，https://spdx.org/licenses/MIT.html\n"
+        "- CompositorWin 主程序：Apache-2.0，https://www.apache.org/licenses/LICENSE-2.0\n"
+        "- 原 Compositor 项目：MIT，https://spdx.org/licenses/MIT.html\n"
         "- 原项目：https://github.com/robbietilton/Compositor\n"
         "- U²-Net 模型：Apache-2.0，https://spdx.org/licenses/Apache-2.0.html\n"
         "- 模型项目：https://github.com/xuebinqin/U-2-Net\n"

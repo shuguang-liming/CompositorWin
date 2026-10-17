@@ -294,9 +294,17 @@ mod tests {
                 source.sha256
             );
         }
-        let application = original_text(&index.originals[0]).unwrap();
-        assert!(application.contains("Copyright (c) 2026 Wonder Assembly LLC"));
-        assert!(application.contains("MIT License"));
+        let application = &index.components[0];
+        assert_eq!(application.name, "CompositorWin");
+        assert_eq!(application.license, "Apache-2.0");
+        let text = original_text(&index.originals[application.originals[0]]).unwrap();
+        assert!(text.contains("Apache License"));
+        assert!(text.contains("Version 2.0, January 2004"));
+        let original = &index.components[1];
+        assert_eq!(original.license, "MIT");
+        let text = original_text(&index.originals[original.originals[0]]).unwrap();
+        assert!(text.contains("Copyright (c) 2026 Wonder Assembly LLC"));
+        assert!(text.contains("MIT License"));
     }
 
     #[test]
@@ -386,7 +394,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut window = LicenseWindow {
             open: true,
-            query: "Compositor".into(),
+            query: "CompositorWin".into(),
             selected_source: None,
         };
         frame(&ctx, &mut window, vec![]);
@@ -397,12 +405,12 @@ mod tests {
             &format!("{} {}", component.name, component.version),
         );
         let output = click(&ctx, &mut window, position);
-        assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::OpenUrl(url) if url.url == "https://spdx.org/licenses/MIT.html")));
+        assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::OpenUrl(url) if url.url == "https://www.apache.org/licenses/LICENSE-2.0")));
         assert!(window.selected_source.is_none());
         let output = frame(&ctx, &mut window, vec![]);
         let position = center(&output, "随附原文");
         let output = click(&ctx, &mut window, position);
-        assert_eq!(window.selected_source, Some(0));
+        assert_eq!(window.selected_source, Some(component.originals[0]));
         assert!(
             !output
                 .platform_output
@@ -410,7 +418,8 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, egui::OutputCommand::OpenUrl(_)))
         );
-        let text = original_text(&license_index().unwrap().originals[0]).unwrap();
-        assert!(text.contains("Permission is hereby granted"));
+        let index = license_index().unwrap();
+        let text = original_text(&index.originals[component.originals[0]]).unwrap();
+        assert!(text.contains("Apache License"));
     }
 }
