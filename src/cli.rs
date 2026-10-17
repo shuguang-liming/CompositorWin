@@ -22,7 +22,7 @@ use std::{
 use uuid::Uuid;
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-const SKILL: &str = include_str!("../SKILL.md");
+const SKILL: &str = include_str!("../skills/compositor-editor/SKILL.md");
 
 #[derive(Debug)]
 struct CliError {

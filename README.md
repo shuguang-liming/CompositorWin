@@ -274,7 +274,7 @@ Python 仅用于这个调用示例，其他语言也可直接启动进程。控�
 
 ### 让 AI 教你使用软件
 
-发行包根目录的 [`USER_AGENT_SKILL.md`](USER_AGENT_SKILL.md) 是面向普通用户的中文教学技能。它专门回答界面、快捷键、导入、保存、导出、PDF 图片化编辑、图层、蒙版、抠图、Camera Raw、主题和 CLI 的使用问题，会先检查实际程序是否支持所需功能。
+发行包根目录的 `USER_AGENT_SKILL.md` 是面向普通用户的中文教学技能。它专门回答界面、快捷键、导入、保存、导出、PDF 图片化编辑、图层、蒙版、抠图、Camera Raw、主题和 CLI 的使用问题，会先检查实际程序是否支持所需功能。
 
 把这个文件复制到你使用的 Agent 技能目录，并放在名为 `compositor-user-guide` 的文件夹中：
 
@@ -327,6 +327,8 @@ CompositorWin 主程序及 Windows 移植新增代码采用 **Apache License 2.0
 
 完整版权与许可原文统一在 [LICENSES.md](LICENSES.md)。软件内可打开 **帮助 → 开源软件许可证**，通过在线链接查看各组件许可，也可按需展开随附原文。
 
+源码中的 Agent 技能分别见[编辑操作技能](skills/compositor-editor/SKILL.md)与[中文教学技能](skills/compositor-guide/SKILL.md)。
+
 ## 开发
 
 在根目录运行 Cargo。需要 Rust 1.99.0 MSVC、Microsoft C++ Build Tools、Windows SDK 和 MASM；打包与运行库审计使用 Python 3.11+。脚本使用 PATH 中的 Cargo 和现有 `CARGO_HOME`／`RUSTUP_HOME`，不固定安装目录。离线模式需要提前缓存锁定依赖。
@@ -334,25 +336,25 @@ CompositorWin 主程序及 Windows 移植新增代码采用 **Apache License 2.0
 ```powershell
 $env:RUST_TEST_THREADS = '1'
 New-Item -ItemType Directory -Force build/validation/current | Out-Null
-.\build.ps1 -Action All -Offline -Jobs 1 *> build/validation/current/all.log
+.\project.ps1 Build -Action All -Offline -Jobs 1 *> build/validation/current/all.log
 ```
 
 `All` 依次运行 fmt、所有目标 check、严格 Clippy、测试和 Release 构建；EXE 在 `build/rust/release/compositor.exe`。也可以直接运行 `cargo check --locked --all-targets` 或 `cargo test --locked`。低内存机器使用 `-j 1` 限制编译并发。
 
-`build.ps1` 的 Release、All 和 Package 构建只为 Release 临时追加 `-C target-feature=+crt-static`，随后恢复原编译环境；check/test 使用原有参数与缓存。若直接调用 Cargo，需自行保留已有编译参数并追加静态 CRT 配置，再运行 `cargo build --locked --release --bin compositor`；发行前的运行库审计会拒绝直接或延迟依赖外部 CRT DLL 的 EXE。
+所有开发脚本已合并为根目录的 `project.ps1`，运行 `.\project.ps1 Help` 查看命令。`Build` 的 Release、All 和 Package 构建只为 Release 临时追加 `-C target-feature=+crt-static`，随后恢复原编译环境；check/test 使用原有参数与缓存。若直接调用 Cargo，需自行保留已有编译参数并追加静态 CRT 配置，再运行 `cargo build --locked --release --bin compositor`；发行前的运行库审计会拒绝直接或延迟依赖外部 CRT DLL 的 EXE。
 
 完成新 EXE 的实际 GUI 检查后，审计并打包到新名称：
 
 ```powershell
-python -B -X utf8 audit-runtime.py
-.\build.ps1 -Action Package -Offline -Jobs 1 -PackageName Compositor-Windows-next
-.\verify-package.ps1 -PackageName Compositor-Windows-next
-.\package-installer.ps1 -CompilerPath 'D:\Tools\nsis-3.11\makensis.exe' -PackageName Compositor-Windows-next -InstallerName Compositor-Windows-next-Setup-x64.exe
+.\project.ps1 AuditRuntime
+.\project.ps1 Build -Action Package -Offline -Jobs 1 -PackageName Compositor-Windows-next
+.\project.ps1 VerifyPackage -PackageName Compositor-Windows-next
+.\project.ps1 PackageInstaller -CompilerPath 'D:\Tools\nsis-3.11\makensis.exe' -PackageName Compositor-Windows-next -InstallerName Compositor-Windows-next-Setup-x64.exe
 ```
 
 发行包写入 `dist/`，已存在的同名包会保留。打包从本 README 提取使用说明，校验软件内压缩保存的完整许可原文，并生成简短的 `LICENSES.md` 入口说明；在线许可证在“帮助 → 开源软件许可证”中查看。安装包使用官方 NSIS 3.11 便携编译器；上方路径替换为本机 `makensis.exe`，不需要把编译器分发给用户。先验证便携包，再生成 `dist/Compositor-Windows-Setup-x64.exe`。安装脚本固定当前用户目录，卸载按登记文件验证归属后逐个移除，保留修改后的文件和用户数据。
 
-Windows EXE 的图标和版本资源由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译，无新增运行依赖。原版高清图标与多尺寸 ICO 在 `assets/`，需要重新生成时运行 `python generate-icon.py`（仅此开发步骤需要 Pillow）。构建记录与临时文件写入 `build/`，两者均被 Git 忽略。现有发行程序与源码检查记录是不同交付身份，不将旧程序测试当作新构建验证。
+Windows EXE 的图标和版本资源由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译，无新增运行依赖。原版高清图标与多尺寸 ICO 在 `assets/`，需要重新生成时运行 `.\project.ps1 GenerateIcon`（仅此开发步骤需要 Pillow）。许可资源校验运行 `.\project.ps1 GenerateLicenses --check`。Python 工具已内嵌在统一脚本中，相关子命令仍需要 Python 3.11+；可用全局参数 `-PythonPath` 指定解释器。构建记录与临时文件统一写入 `build/`，发行包写入 `dist/`，均被 Git 忽略。现有发行程序与源码检查记录是不同交付身份，不将旧程序测试当作新构建验证。
 
 | 内容 | 位置 |
 |---|---|
@@ -360,9 +362,14 @@ Windows EXE 的图标和版本资源由 `build.rs` 调用 Windows SDK 的 `rc.ex
 | 模型、图标、WGSL | `assets/` |
 | 测试及参考数据 | `tests/` |
 | 基准与开发例程 | `examples/` |
-| 配置、构建、打包及审计工具 | 根目录 |
+| 格式与主题文档 | `docs/` |
+| Agent 操作与教学技能 | `skills/` |
+| 安装配置与运行库索引 | `packaging/` |
+| 构建、打包、校验与资源生成 | 根目录 `project.ps1` |
+| 编译缓存、临时文件与验证记录 | `build/`，不提交 Git |
+| 安装包与便携发行包 | `dist/`，不提交 Git |
 
-`.comp` 默认写入单文件容器 v1，内嵌清单仍为版本 11；兼容读取旧目录包版本 1–11。原 macOS 程序不直接读取 Windows 单文件容器。字段语义与 Agent 写入规则见 [PROJECT_FORMAT.md](PROJECT_FORMAT.md)。原 macOS 工程仅供参考，普通构建和测试不编译或调用原 Swift/C 应用。可选 C oracle 重新生成工具需要显式指定原工程；测试使用已保存的参考数据。
+`.comp` 默认写入单文件容器 v1，内嵌清单仍为版本 11；兼容读取旧目录包版本 1–11。原 macOS 程序不直接读取 Windows 单文件容器。字段语义与 Agent 写入规则见 [PROJECT_FORMAT.md](docs/PROJECT_FORMAT.md)。原 macOS 工程仅供参考，普通构建和测试不编译或调用原 Swift/C 应用。可选 C oracle 重新生成工具需要显式指定原工程；测试使用已保存的参考数据。
 
 ## 模型开发
 

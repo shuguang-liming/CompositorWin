@@ -2,20 +2,30 @@
 import contextlib
 import argparse
 import hashlib
-import importlib.util
 import io
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import re
+import shutil
+import types
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("embedded_licenses", ROOT / "generate-open-source-licenses.py")
-GENERATOR = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(GENERATOR)
+def load_project_tool(name):
+    # Test the same readable source and in-memory loader used by project.ps1.
+    script = (ROOT / "project.ps1").read_text(encoding="utf-8-sig")
+    bootstrap = re.search(r"(?ms)^# <PROJECT-PYTHON-BOOTSTRAP>\n\$script:ProjectPythonBootstrap = @'\n(.*?)\n'@\n# </PROJECT-PYTHON-BOOTSTRAP>", script).group(1)
+    loader = types.ModuleType("project_loader")
+    with patch.object(sys, "argv", ["project-loader", str(ROOT)]):
+        exec(compile(bootstrap, str(ROOT / "project.ps1") + "::bootstrap", "exec"), loader.__dict__)
+    return loader.project_module(name)
+
+
+GENERATOR = load_project_tool("generate-open-source-licenses")
 
 
 class EmbeddedLicenseTests(unittest.TestCase):
@@ -31,7 +41,7 @@ class EmbeddedLicenseTests(unittest.TestCase):
         self.directory = Path(self.temporary.name)
 
     def run_cli(self, *arguments):
-        return subprocess.run([sys.executable, "-B", "-X", "utf8", str(ROOT / "generate-open-source-licenses.py"), *map(str, arguments)], cwd=ROOT, capture_output=True, encoding="utf-8")
+        return subprocess.run([shutil.which("pwsh") or shutil.which("powershell"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "project.ps1"), "GenerateLicenses", "-PythonPath", sys.executable, *map(str, arguments)], cwd=ROOT, capture_output=True, encoding="utf-8")
 
     def test_all_originals_and_compiler_notices_are_byte_exact(self):
         index, bundle = GENERATOR.unpack(self.resource)

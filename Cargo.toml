@@ -7,7 +7,7 @@ description = "Compositor desktop image editor for Windows"
 
 [[example]]
 name = "prepare-model"
-path = "prepare-model.rs"
+path = "examples/prepare-model.rs"
 
 [lib]
 name = "compositor"
