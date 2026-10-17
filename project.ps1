@@ -1618,6 +1618,15 @@ Python subcommands accept --help. PowerShell subcommands retain their named opti
 '@
         return
     }
+    # Keep child-process temporary files and build output inside this workspace.
+    $commandRoot = Get-ProjectRoot $PSScriptRoot
+    $commandTemp = Resolve-ProjectPath $commandRoot 'build/temp'
+    $commandTarget = Resolve-ProjectPath $commandRoot 'build/rust'
+    [IO.Directory]::CreateDirectory($commandTemp) | Out-Null
+    $env:TEMP = $commandTemp
+    $env:TMP = $commandTemp
+    $env:CARGO_TARGET_DIR = $commandTarget
+
     if ($pythonCommands.ContainsKey($Name)) {
         if ($Options.Count) { throw "Use --options for Python subcommand ${Name}: $($Options.Keys -join ', ')" }
         Invoke-ProjectPython -Name $pythonCommands[$Name] -Arguments $Arguments

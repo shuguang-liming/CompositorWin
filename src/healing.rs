@@ -4,7 +4,7 @@ use crate::pixels;
 const RING: u8 = 1;
 const HOLE: u8 = 2;
 
-fn solve(value: &mut [f32], role: &[u8], w: usize, h: usize, depth: u32) {
+pub(crate) fn solve(value: &mut [f32], role: &[u8], w: usize, h: usize, depth: u32) {
     let mut iterations = 300;
     if w > 32 && h > 32 && depth < 16 {
         let cw = w.div_ceil(2);
@@ -162,6 +162,38 @@ pub fn spot_heal(
     if b[2] <= b[0] {
         return;
     }
+    let mode = if mode == 0 {
+        let mut filled = rgba.to_vec();
+        match crate::patch_match::fill(&mut filled, coverage, w, h, seed) {
+            Ok(true) => {
+                for y in b[1]..b[3] {
+                    for x in b[0]..b[2] {
+                        let amount = f64::from(coverage[y * w + x]) / 255. * f64::from(opacity);
+                        if amount <= 0. {
+                            continue;
+                        }
+                        let p = (y * w + x) * 4;
+                        let alpha = f64::from(rgba[p + 3])
+                            + (f64::from(filled[p + 3]) - f64::from(rgba[p + 3])) * amount;
+                        rgba[p + 3] = alpha.clamp(0., 255.).round() as u8;
+                        for c in 0..3 {
+                            let value = f64::from(rgba[p + c])
+                                + (f64::from(filled[p + c]) - f64::from(rgba[p + c])) * amount;
+                            rgba[p + c] = value.clamp(0., f64::from(rgba[p + 3])).round() as u8;
+                        }
+                    }
+                }
+                return;
+            }
+            Ok(false) => 1,
+            Err(error) => {
+                log::error!("内容识别修复失败：{error:#}");
+                return;
+            }
+        }
+    } else {
+        mode
+    };
     let ring = ((b[2] - b[0]).max(b[3] - b[1]) / 8).clamp(2, 16);
     let wx = b[0].saturating_sub(ring);
     let wy = b[1].saturating_sub(ring);

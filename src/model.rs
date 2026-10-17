@@ -64,6 +64,9 @@ pub struct Raster {
     pub height: u32,
     pub pixels: Arc<Vec<u8>>,
     pub tiles: BTreeMap<(u32, u32), Arc<Vec<u8>>>,
+    /// Authoritative high-precision pixels. Byte buffers remain derived views
+    /// for tools that work at screen precision; untouched low bits stay here.
+    pub deep: Option<Arc<crate::deep_pixels::DeepRaster>>,
 }
 impl Raster {
     pub fn blank(width: u32, height: u32) -> Self {
@@ -72,6 +75,7 @@ impl Raster {
             height,
             pixels: Arc::new(Vec::new()),
             tiles: BTreeMap::new(),
+            deep: None,
         }
     }
     pub fn from_rgba(width: u32, height: u32, pixels: Vec<u8>) -> Self {
@@ -81,6 +85,7 @@ impl Raster {
             height,
             pixels: Arc::new(pixels),
             tiles: BTreeMap::new(),
+            deep: None,
         }
     }
     pub fn solid(width: u32, height: u32, color: [u8; 4]) -> Self {
@@ -89,6 +94,66 @@ impl Raster {
             height,
             pixels: Arc::new(color.to_vec()),
             tiles: BTreeMap::new(),
+            deep: None,
+        }
+    }
+    pub fn from_deep(deep: crate::deep_pixels::DeepRaster) -> Self {
+        Self {
+            width: deep.width,
+            height: deep.height,
+            pixels: Arc::new(deep.preview_rgba8()),
+            tiles: BTreeMap::new(),
+            deep: Some(Arc::new(deep)),
+        }
+    }
+    pub fn get_f32(&self, x: u32, y: u32) -> [f32; 4] {
+        self.deep.as_ref().map_or_else(
+            || self.get(x, y).map(|v| v as f32 / 255.),
+            |deep| deep.get(x, y),
+        )
+    }
+    pub fn set_f32(&mut self, x: u32, y: u32, color: [f32; 4]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        if let Some(mut deep) = self.deep.take() {
+            Arc::make_mut(&mut deep).set(x, y, color);
+            self.set(x, y, deep.preview_pixel(x, y));
+            self.deep = Some(deep);
+        } else {
+            self.set(x, y, color.map(|v| (v.clamp(0., 1.) * 255.).round() as u8));
+        }
+    }
+    pub fn sample_f32(&self, x: f64, y: f64, sampling: Sampling) -> [f32; 4] {
+        if let Some(deep) = &self.deep {
+            match sampling {
+                Sampling::Nearest => deep.sample_nearest(x, y),
+                Sampling::High => deep.sample_cubic(x, y),
+                _ => deep.sample(x, y),
+            }
+        } else if sampling == Sampling::High {
+            let pixel = crate::render::sample_premultiplied(self, x, y, sampling);
+            if pixel[3] > 0. {
+                [
+                    (pixel[0] / pixel[3]) as f32,
+                    (pixel[1] / pixel[3]) as f32,
+                    (pixel[2] / pixel[3]) as f32,
+                    pixel[3] as f32,
+                ]
+            } else {
+                [0.; 4]
+            }
+        } else {
+            let pixel = if sampling == Sampling::Nearest {
+                if x < -0.5 || y < -0.5 {
+                    [0; 4]
+                } else {
+                    self.get(x.round() as u32, y.round() as u32)
+                }
+            } else {
+                crate::brush::sample(self, x, y)
+            };
+            pixel.map(|v| v as f32 / 255.)
         }
     }
     pub fn get(&self, x: u32, y: u32) -> [u8; 4] {
@@ -117,8 +182,11 @@ impl Raster {
         }
     }
     pub fn set(&mut self, x: u32, y: u32, color: [u8; 4]) {
-        if x >= self.width || y >= self.height {
+        if x >= self.width || y >= self.height || self.get(x, y) == color {
             return;
+        }
+        if let Some(deep) = self.deep.as_mut() {
+            Arc::make_mut(deep).set(x, y, color.map(|v| v as f32 / 255.));
         }
         let key = (x / TILE_SIZE, y / TILE_SIZE);
         let tile = self
@@ -141,6 +209,13 @@ impl Raster {
                 .iter()
                 .all(|(x, _)| *x < self.width && *x / TILE_SIZE == key.0)
         );
+        let deep_changes = self.deep.as_ref().map(|_| {
+            pixels
+                .iter()
+                .filter(|&&(x, color)| self.get(x, y) != color)
+                .copied()
+                .collect::<Vec<_>>()
+        });
         let row = ((y % TILE_SIZE) * TILE_SIZE * 4) as usize;
         let tile = match self.tiles.entry(key) {
             std::collections::btree_map::Entry::Occupied(entry) => {
@@ -176,6 +251,14 @@ impl Raster {
             let i = row + (x % TILE_SIZE) as usize * 4;
             tile[i..i + 4].copy_from_slice(&color);
         }
+        if let Some(changes) = deep_changes
+            && let Some(deep) = self.deep.as_mut()
+        {
+            let deep = Arc::make_mut(deep);
+            for (x, color) in changes {
+                deep.set(x, y, color.map(|v| v as f32 / 255.));
+            }
+        }
     }
     pub fn to_rgba(&self) -> Vec<u8> {
         if self.tiles.is_empty() && self.pixels.len() == 4 {
@@ -210,10 +293,14 @@ impl Raster {
         data
     }
     pub fn materialized(&self) -> Self {
-        Self::from_rgba(self.width, self.height, self.to_rgba())
+        let mut out = Self::from_rgba(self.width, self.height, self.to_rgba());
+        out.deep = self.deep.clone();
+        out
     }
     pub fn byte_len(&self) -> usize {
-        self.pixels.len() + self.tiles.values().map(|x| x.len()).sum::<usize>()
+        self.pixels.len()
+            + self.tiles.values().map(|x| x.len()).sum::<usize>()
+            + self.deep.as_ref().map_or(0, |deep| deep.byte_len())
     }
 }
 
@@ -245,6 +332,9 @@ impl Eq for Raster {}
 impl PartialEq for Raster {
     fn eq(&self, other: &Self) -> bool {
         if self.width != other.width || self.height != other.height {
+            return false;
+        }
+        if self.deep != other.deep {
             return false;
         }
         if self.pixels == other.pixels && self.tiles == other.tiles {
@@ -898,5 +988,28 @@ mod tests {
         let p = [0.23, 0.86];
         let q = t.from_document(t.to_document(p));
         assert!((q[0] - p[0]).abs() < 1e-9 && (q[1] - p[1]).abs() < 1e-9);
+    }
+    #[test]
+    fn deep_raster_edits_keep_untouched_low_bits_in_the_same_tile() {
+        let deep = crate::deep_pixels::DeepRaster::from_u16(
+            2,
+            1,
+            vec![30001, 30002, 30003, 40001, 31001, 31002, 31003, 41001],
+        )
+        .unwrap();
+        let mut raster = Raster::from_deep(deep);
+        let before = raster.clone();
+        raster.set(0, 0, [255, 0, 0, 255]);
+        assert_eq!(
+            raster.deep.as_ref().unwrap().get_bits(1, 0),
+            [31001, 31002, 31003, 41001]
+        );
+        assert_eq!(
+            before.deep.as_ref().unwrap().get_bits(0, 0),
+            [30001, 30002, 30003, 40001]
+        );
+        raster.set_f32(0, 0, [0.50001, 0.5, 0.5, 1.]);
+        assert_ne!(raster.deep.as_ref().unwrap().get_bits(0, 0)[0], 32896);
+        assert_eq!(raster.materialized().deep, raster.deep);
     }
 }

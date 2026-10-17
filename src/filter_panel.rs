@@ -1,6 +1,7 @@
 //! Typed parameter controls for filters, adjustment layers, Camera Raw, and layer effects.
 use crate::{filters, locale::text, model::Raster};
 use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use std::ops::RangeInclusive;
 
@@ -371,6 +372,43 @@ pub fn show_with_original_sample(
     let mut changed = false;
     ui.push_id(kind, |ui| match kind {
         "Gaussian Blur" => changed |= number(ui, settings, "blurRadius", "半径", 0.1..=250.0, 10.0),
+        "Progressive Blur" => {
+            changed |= toggle(ui, settings, "progressiveRadial", "径向模糊", false);
+            changed |= number(
+                ui,
+                settings,
+                "progressiveFrom",
+                "起点模糊",
+                0.0..=250.0,
+                0.0,
+            );
+            changed |= number(ui, settings, "progressiveTo", "终点模糊", 0.0..=250.0, 20.0);
+            changed |= toggle(ui, settings, "progressiveInverted", "反转方向", false);
+            ui.separator();
+            ui.label("在画布拖动控制线，或调整起点、终点的文档坐标。");
+            for (key, label) in [("progressiveStart", "起点"), ("progressiveEnd", "终点")] {
+                if settings[key].is_object() {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        for axis in ["x", "y"] {
+                            let mut coordinate = filters::number(&settings[key], axis, 0.);
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut coordinate)
+                                        .prefix(format!("{axis}: "))
+                                        .speed(1.)
+                                        .range(-1_000_000_000.0..=1_000_000_000.0),
+                                )
+                                .changed()
+                            {
+                                settings[key][axis] = json!(coordinate);
+                                changed = true;
+                            }
+                        }
+                    });
+                }
+            }
+        }
         "Motion Blur" => {
             changed |= controls(
                 ui,
@@ -522,6 +560,7 @@ pub fn show_with_original_sample(
             changed |= number(ui, settings, "distortion", "畸变", -100.0..=100.0, 0.0)
         }
         "Dither" => changed |= dither(ui, section(settings, "dither")),
+        "Scanlines" => changed |= scanlines(ui, section(settings, "scanlines")),
         "Camera Raw Filter" => {
             changed |= camera_raw(ui, section(settings, "cameraRaw"), sample, original_sample)
         }
@@ -1652,6 +1691,39 @@ fn curve_editor(ui: &mut egui::Ui, points: &mut Value, extent: f64) -> bool {
     }
     changed
 }
+fn scanlines(ui: &mut egui::Ui, s: &mut Value) -> bool {
+    let mut changed = controls(
+        ui,
+        s,
+        &[
+            ("lineSpacing", "扫描线间距", 2., 32., 4.),
+            ("thickness", "线条厚度", 5., 100., 70.),
+            ("glow", "辉光", 0., 100., 0.),
+            ("dots", "点状纹理", 0., 100., 0.),
+            ("displace", "亮度位移", -100., 100., 0.),
+            ("smoothness", "位移平滑", 0., 100., 50.),
+            ("threshold", "亮度阈值", 0., 100., 0.),
+            ("wobble", "波动", 0., 64., 0.),
+            ("split", "颜色分离", 0., 16., 0.),
+            ("density", "密度", -100., 100., 0.),
+            ("contrast", "对比度", -100., 100., 0.),
+            ("blackLevel", "黑电平", 0., 100., 0.),
+        ],
+    );
+    changed |= choice(
+        ui,
+        s,
+        "colors",
+        "配色",
+        &["Black & White", "Two Colors", "Original"],
+    );
+    if filters::string(s, "colors", "Black & White") == "Two Colors" {
+        changed |= color(ui, &mut s["dark"], "屏幕颜色", [0.; 3]);
+        changed |= color(ui, &mut s["light"], "线条颜色", [1.; 3]);
+    }
+    changed
+}
+
 fn dither(ui: &mut egui::Ui, s: &mut Value) -> bool {
     let mut changed = choice(
         ui,
@@ -1845,6 +1917,122 @@ fn raw_section_title(key: &str) -> &str {
     }
 }
 
+const CAMERA_RAW_RESET_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "light",
+        &[
+            "exposure",
+            "contrast",
+            "highlights",
+            "shadows",
+            "whites",
+            "blacks",
+        ],
+    ),
+    (
+        "color",
+        &[
+            "whiteBalance",
+            "temperature",
+            "tint",
+            "vibrance",
+            "saturation",
+        ],
+    ),
+    (
+        "effects",
+        &[
+            "texture",
+            "clarity",
+            "dehaze",
+            "glow",
+            "glowStyle",
+            "glowRange",
+            "glowSpread",
+            "glowWarmth",
+            "vignetteAmount",
+            "vignetteStyle",
+            "vignetteMidpoint",
+            "vignetteRoundness",
+            "vignetteFeather",
+            "vignetteHighlights",
+            "grainAmount",
+            "grainSize",
+            "grainRoughness",
+            "seed",
+        ],
+    ),
+    ("curve", &["curve"]),
+    ("mixer", &["mixer"]),
+    ("grading", &["grading"]),
+    ("detail", &["detail"]),
+    ("optics", &["optics"]),
+    ("geometry", &["geometry"]),
+    ("calibration", &["calibration"]),
+];
+
+fn raw_default_matches(value: &Value, default: &Value) -> bool {
+    match (value, default) {
+        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        (Value::Object(left), Value::Object(right)) => right.iter().all(|(key, default)| {
+            left.get(key)
+                .is_none_or(|value| raw_default_matches(value, default))
+        }),
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(value, default)| raw_default_matches(value, default))
+        }
+        _ => value == default,
+    }
+}
+
+fn camera_raw_section_is_default(raw: &Value, section: &str, defaults: &Value) -> bool {
+    CAMERA_RAW_RESET_FIELDS
+        .iter()
+        .find(|(key, _)| *key == section)
+        .is_none_or(|(_, fields)| {
+            fields.iter().all(|field| {
+                raw.get(*field)
+                    .is_none_or(|value| raw_default_matches(value, &defaults[*field]))
+            })
+        })
+}
+
+/// Restore a section's choices and midpoint defaults as well as its amount sliders.
+pub fn reset_camera_raw_section(settings: &mut Value, section: &str) -> bool {
+    let Some((_, fields)) = CAMERA_RAW_RESET_FIELDS
+        .iter()
+        .find(|(key, _)| *key == section)
+    else {
+        return false;
+    };
+    let raw = if settings.get("cameraRaw").is_some() {
+        &mut settings["cameraRaw"]
+    } else {
+        settings
+    };
+    if !raw.is_object() {
+        return false;
+    }
+    let before = raw.clone();
+    let defaults = filters::camera_raw_defaults();
+    for field in *fields {
+        raw[*field] = defaults[*field].clone();
+    }
+    if !filters::boolean(&raw["_enabledSections"], section, true) {
+        raw["_enabledSections"][section] = json!(true);
+    }
+    *raw != before
+}
+
+/// Consume one panel reset so the editor can clear a selected color point or guide draft.
+pub fn take_camera_raw_section_reset(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|data| data.remove_temp(egui::Id::new("camera-raw-section-reset")))
+}
+
 fn camera_raw(
     ui: &mut egui::Ui,
     s: &mut Value,
@@ -1853,6 +2041,7 @@ fn camera_raw(
 ) -> bool {
     let mut changed = false;
     let mut diagnostic = 0;
+    let defaults = filters::camera_raw_defaults();
     egui::CollapsingHeader::new("启用分区")
         .id_salt("Enabled sections")
         .show(ui, |ui| {
@@ -1875,28 +2064,46 @@ fn camera_raw(
                     .enumerate()
                     {
                         let mut enabled = filters::boolean(&s["_enabledSections"], key, true);
-                        if ui
-                            .checkbox(
-                                &mut enabled,
-                                match key {
-                                    "light" => "光线",
-                                    "color" => "颜色",
-                                    "effects" => "效果",
-                                    "curve" => "色调曲线",
-                                    "mixer" => "混色器",
-                                    "grading" => "颜色分级",
-                                    "detail" => "细节",
-                                    "optics" => "光学",
-                                    "geometry" => "几何",
-                                    "calibration" => "校准",
-                                    _ => label,
-                                },
-                            )
-                            .changed()
-                        {
-                            s["_enabledSections"][key] = json!(enabled);
-                            changed = true;
-                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .checkbox(
+                                    &mut enabled,
+                                    match key {
+                                        "light" => "光线",
+                                        "color" => "颜色",
+                                        "effects" => "效果",
+                                        "curve" => "色调曲线",
+                                        "mixer" => "混色器",
+                                        "grading" => "颜色分级",
+                                        "detail" => "细节",
+                                        "optics" => "光学",
+                                        "geometry" => "几何",
+                                        "calibration" => "校准",
+                                        _ => label,
+                                    },
+                                )
+                                .changed()
+                            {
+                                s["_enabledSections"][key] = json!(enabled);
+                                changed = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !enabled || !camera_raw_section_is_default(s, key, &defaults),
+                                    egui::Button::new("重置").small(),
+                                )
+                                .on_hover_text("将这个分区恢复默认值，保留其他分区的调整")
+                                .clicked()
+                            {
+                                changed |= reset_camera_raw_section(s, key);
+                                ui.data_mut(|data| {
+                                    data.insert_temp(
+                                        egui::Id::new("camera-raw-section-reset"),
+                                        key.to_owned(),
+                                    )
+                                });
+                            }
+                        });
                         if i % 2 == 1 {
                             ui.end_row();
                         }
@@ -2207,7 +2414,7 @@ fn camera_raw(
     changed | set_raw_diagnostic(s, diagnostic)
 }
 
-/// Gray-world linear-light balance using the same two channel-gain axes as Camera Raw.
+/// Average in linear light, then neutralize using Camera Raw's measured white-balance tables.
 pub fn auto_white_balance(sample: &Raster) -> Option<[f64; 2]> {
     let mut sum = [0.; 3];
     let mut count = 0.;
@@ -2227,20 +2434,7 @@ pub fn auto_white_balance(sample: &Raster) -> Option<[f64; 2]> {
     if count == 0. {
         return None;
     }
-    let [r, g, b] = sum.map(|v| v / count);
-    if r <= 1e-4 || g <= 1e-4 || b <= 1e-4 {
-        return None;
-    }
-    let (a1, b1, c1) = (0.35 * r, 0.15 * r + 0.3 * g, g - r);
-    let (a2, b2, c2) = (-0.35 * b, 0.15 * b + 0.3 * g, g - b);
-    let determinant = a1 * b2 - a2 * b1;
-    if determinant.abs() <= 1e-8 {
-        return None;
-    }
-    Some([
-        (c1 * b2 - c2 * b1) / determinant * 100.,
-        (a1 * c2 - a2 * c1) / determinant * 100.,
-    ])
+    filters::neutralize_camera_raw_color(sum.map(|v| filters::linear_to_srgb(v / count)))
 }
 fn histogram_bins(sample: &Raster) -> [[u64; 256]; 4] {
     let mut bins = [[0; 256]; 4];
@@ -2393,7 +2587,8 @@ pub fn camera_raw_native_preview(
 }
 
 fn cached_histogram_bins(ui: &egui::Ui, sample: &Raster) -> std::sync::Arc<[[u64; 256]; 4]> {
-    let id = egui::Id::new("camera-raw-histogram-cache");
+    // Levels and its Auto action use every pixel, independently of display scopes.
+    let id = egui::Id::new("filter-levels-histogram-cache");
     if let Some((previous, bins)) =
         ui.data(|data| data.get_temp::<(ScopeSample, std::sync::Arc<[[u64; 256]; 4]>)>(id))
         && previous.matches(sample)
@@ -2406,22 +2601,11 @@ fn cached_histogram_bins(ui: &egui::Ui, sample: &Raster) -> std::sync::Arc<[[u64
 }
 
 pub fn prepare_camera_raw_scopes(ctx: &egui::Context, sample: &Raster) {
-    let histogram = std::sync::Arc::new(histogram_bins(sample));
-    let vectorscope = std::sync::Arc::new(vectorscope_bins(sample));
-    ctx.data_mut(|data| {
-        data.insert_temp(
-            egui::Id::new("camera-raw-histogram-cache"),
-            (ScopeSample::new(sample), histogram),
-        );
-        data.insert_temp(
-            egui::Id::new("camera-raw-vectorscope-cache"),
-            (ScopeSample::new(sample), vectorscope),
-        );
-    });
+    cached_camera_raw_scopes(ctx, sample);
 }
 
 pub fn histogram(ui: &mut egui::Ui, sample: &Raster) {
-    let bins = cached_histogram_bins(ui, sample);
+    let bins = cached_camera_raw_scopes(ui.ctx(), sample).histogram;
     let (response, painter) =
         ui.allocate_painter(Vec2::new(ui.available_width(), 110.), Sense::hover());
     let rect = response.rect.shrink(3.);
@@ -2451,49 +2635,107 @@ pub fn histogram(ui: &mut egui::Ui, sample: &Raster) {
     }
 }
 
-fn vectorscope_bins(sample: &Raster) -> [u64; 64 * 64] {
-    let mut bins = [0; 64 * 64];
-    for y in 0..sample.height {
-        for x in 0..sample.width {
-            let p = sample.get(x, y);
-            if p[3] == 0 {
-                continue;
-            }
-            let [r, g, b] = std::array::from_fn::<_, 3, _>(|c| p[c] as f64 / 255.);
-            let max = r.max(g).max(b);
-            let min = r.min(g).min(b);
-            let chroma = max - min;
-            if chroma <= 1e-4 || max <= 1e-4 {
-                continue;
-            }
-            let hue = if max == r {
-                (g - b) / chroma
-            } else if max == g {
-                2. + (b - r) / chroma
-            } else {
-                4. + (r - g) / chroma
-            };
-            let angle = (hue / 6.).rem_euclid(1.) * std::f64::consts::TAU;
-            let saturation = chroma / max;
-            let column = ((0.5 + angle.cos() * saturation * 0.48) * 64.).clamp(0., 63.) as usize;
-            let row = ((0.5 + angle.sin() * saturation * 0.48) * 64.).clamp(0., 63.) as usize;
-            bins[row * 64 + column] += p[3] as u64;
-        }
-    }
-    bins
+#[derive(Clone)]
+struct CameraRawScopes {
+    histogram: std::sync::Arc<[[u64; 256]; 4]>,
+    vectorscope: std::sync::Arc<[u64; 64 * 64]>,
 }
 
-fn cached_vectorscope_bins(ui: &egui::Ui, sample: &Raster) -> std::sync::Arc<[u64; 64 * 64]> {
-    let id = egui::Id::new("camera-raw-vectorscope-cache");
+fn camera_raw_scope_step(width: u32, height: u32) -> usize {
+    if u64::from(width) * u64::from(height) <= 4_000_000 {
+        4
+    } else {
+        8
+    }
+}
+
+/// Display statistics only: the graded image and native preview stay full resolution.
+/// Match the original's sixteen bands, sampling every fourth/eighth pixel each way.
+fn camera_raw_scope_bins(sample: &Raster, step: usize) -> ([[u64; 256]; 4], [u64; 64 * 64]) {
+    let rows = sample.height.div_ceil(16);
+    // Keep band storage on the heap; large array-valued Rayon reductions can
+    // overflow the smaller worker stacks provided by Windows.
+    let mut parts = vec![0_u64; 16 * (4 * 256 + 64 * 64)];
+    parts
+        .par_chunks_mut(4 * 256 + 64 * 64)
+        .enumerate()
+        .for_each(|(band, counts)| {
+            let band = band as u32;
+            let (histogram, bins) = counts.split_at_mut(4 * 256);
+            let end = ((band + 1) * rows).min(sample.height);
+            for y in (band * rows..end).step_by(step) {
+                for x in (0..sample.width).step_by(step) {
+                    let p = sample.get(x, y);
+                    if p[3] == 0 {
+                        continue;
+                    }
+                    let weight = u64::from(p[3]);
+                    for c in 0..3 {
+                        histogram[c * 256 + p[c] as usize] += weight * 3;
+                        histogram[3 * 256 + p[c] as usize] += weight;
+                    }
+                    let [r, g, b] = std::array::from_fn::<_, 3, _>(|c| p[c] as f64 / 255.);
+                    let max = r.max(g).max(b);
+                    let min = r.min(g).min(b);
+                    let chroma = max - min;
+                    if chroma <= 1e-4 || max <= 1e-4 {
+                        continue;
+                    }
+                    let hue = if max == r {
+                        (g - b) / chroma
+                    } else if max == g {
+                        2. + (b - r) / chroma
+                    } else {
+                        4. + (r - g) / chroma
+                    };
+                    let angle = (hue / 6.).rem_euclid(1.) * std::f64::consts::TAU;
+                    let saturation = chroma / max;
+                    let column =
+                        ((0.5 + angle.cos() * saturation * 0.48) * 64.).clamp(0., 63.) as usize;
+                    let row =
+                        ((0.5 + angle.sin() * saturation * 0.48) * 64.).clamp(0., 63.) as usize;
+                    bins[row * 64 + column] += weight;
+                }
+            }
+        });
+    let mut histogram = [[0; 256]; 4];
+    let mut bins = [0; 64 * 64];
+    for part in parts.as_chunks::<{ 4 * 256 + 64 * 64 }>().0 {
+        for (channel, next) in histogram
+            .iter_mut()
+            .zip(part[..4 * 256].as_chunks::<256>().0)
+        {
+            for (bin, count) in channel.iter_mut().zip(next) {
+                *bin += count;
+            }
+        }
+        for (bin, count) in bins.iter_mut().zip(&part[4 * 256..]) {
+            *bin += count;
+        }
+    }
+    (histogram, bins)
+}
+
+fn cached_camera_raw_scopes(ctx: &egui::Context, sample: &Raster) -> CameraRawScopes {
+    let id = egui::Id::new("camera-raw-scopes-cache");
     if let Some((previous, bins)) =
-        ui.data(|data| data.get_temp::<(ScopeSample, std::sync::Arc<[u64; 64 * 64]>)>(id))
+        ctx.data(|data| data.get_temp::<(ScopeSample, CameraRawScopes)>(id))
         && previous.matches(sample)
     {
         return bins;
     }
-    let bins = std::sync::Arc::new(vectorscope_bins(sample));
-    ui.data_mut(|data| data.insert_temp(id, (ScopeSample::new(sample), bins.clone())));
+    let (histogram, vectorscope) =
+        camera_raw_scope_bins(sample, camera_raw_scope_step(sample.width, sample.height));
+    let bins = CameraRawScopes {
+        histogram: std::sync::Arc::new(histogram),
+        vectorscope: std::sync::Arc::new(vectorscope),
+    };
+    ctx.data_mut(|data| data.insert_temp(id, (ScopeSample::new(sample), bins.clone())));
     bins
+}
+
+fn cached_vectorscope_bins(ui: &egui::Ui, sample: &Raster) -> std::sync::Arc<[u64; 64 * 64]> {
+    cached_camera_raw_scopes(ui.ctx(), sample).vectorscope
 }
 
 fn vectorscope(ui: &mut egui::Ui, sample: &Raster) {
@@ -2656,6 +2898,99 @@ mod restored_ui_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_raw_resets_each_complete_section_and_preserves_all_others() {
+        fn edited(value: &Value) -> Value {
+            match value {
+                Value::Number(value) => json!(value.as_f64().unwrap() + 7.),
+                Value::String(value) => json!(format!("edited {value}")),
+                Value::Bool(value) => json!(!value),
+                Value::Array(values) => Value::Array(values.iter().map(edited).collect()),
+                Value::Object(values) => Value::Object(
+                    values
+                        .iter()
+                        .map(|(key, value)| (key.clone(), edited(value)))
+                        .collect(),
+                ),
+                _ => value.clone(),
+            }
+        }
+        let defaults = filters::camera_raw_defaults();
+        let mut original = edited(&defaults);
+        original["mixer"]["points"] = json!([{"hue": 30, "hueShift": 17}]);
+        original["geometry"]["guides"] = json!([{"startX": 0.1, "endX": 0.9}]);
+        original["customMetadata"] = json!("retained");
+        for (section, _) in CAMERA_RAW_RESET_FIELDS {
+            original["_enabledSections"][*section] = json!(false);
+        }
+        for (section, _) in CAMERA_RAW_RESET_FIELDS {
+            let mut wrapped =
+                json!({"cameraRaw": original, "kind": "Camera Raw Filter", "recordMetadata": 17});
+            assert!(reset_camera_raw_section(&mut wrapped, section));
+            let reset = &wrapped["cameraRaw"];
+            assert!(camera_raw_section_is_default(reset, section, &defaults));
+            assert_eq!(reset["_enabledSections"][*section], true);
+            for (other, fields) in CAMERA_RAW_RESET_FIELDS {
+                let source = if other == section {
+                    &defaults
+                } else {
+                    &original
+                };
+                for field in *fields {
+                    assert_eq!(
+                        reset[*field], source[*field],
+                        "resetting {section} changed {other}.{field}"
+                    );
+                }
+                if other != section {
+                    assert_eq!(reset["_enabledSections"][*other], false);
+                }
+            }
+            assert_eq!(reset["customMetadata"], "retained");
+            assert_eq!(reset["showShadowClipping"], original["showShadowClipping"]);
+            assert_eq!(wrapped["recordMetadata"], 17);
+            assert!(!reset_camera_raw_section(&mut wrapped, section));
+        }
+    }
+
+    #[test]
+    fn camera_raw_reset_restores_effect_choices_and_accepts_neutral_float_numbers() {
+        let defaults = filters::camera_raw_defaults();
+        let mut raw = defaults.clone();
+        raw["glowStyle"] = json!("Bloom");
+        raw["vignetteStyle"] = json!("Paint Overlay");
+        raw["vignetteMidpoint"] = json!(1.);
+        raw["vignetteFeather"] = json!(3.);
+        raw["grainSize"] = json!(99.);
+        assert!(reset_camera_raw_section(&mut raw, "effects"));
+        assert_eq!(raw, defaults);
+        raw["exposure"] = json!(0.0);
+        raw["curve"]["rgb"][0]["x"] = json!(0.0);
+        assert!(camera_raw_section_is_default(&raw, "light", &defaults));
+        assert!(camera_raw_section_is_default(&raw, "curve", &defaults));
+        let before = raw.clone();
+        assert!(!reset_camera_raw_section(&mut raw, "unknown"));
+        assert_eq!(raw, before);
+    }
+
+    #[test]
+    fn camera_raw_panel_reset_event_is_consumed_once_without_persisted_fields() {
+        let ctx = egui::Context::default();
+        assert!(take_camera_raw_section_reset(&ctx).is_none());
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("camera-raw-section-reset"),
+                "geometry".to_owned(),
+            )
+        });
+        assert_eq!(
+            take_camera_raw_section_reset(&ctx).as_deref(),
+            Some("geometry")
+        );
+        assert!(take_camera_raw_section_reset(&ctx).is_none());
+    }
+
     #[test]
     fn camera_raw_section_eyes_preserve_slider_values_and_neutralize_only_the_group() {
         let mut raw = filters::camera_raw_defaults();
@@ -2801,18 +3136,26 @@ mod tests {
         }
     }
     #[test]
-    fn gray_world_balance_matches_camera_raw_channel_gains() {
-        let input = Raster::solid(16, 16, [150, 120, 100, 255]);
-        let [temperature, tint] = auto_white_balance(&input).unwrap();
-        let gains = [
-            1. + 0.35 * temperature / 100. + 0.15 * tint / 100.,
-            1. - 0.3 * tint / 100.,
-            1. - 0.35 * temperature / 100. + 0.15 * tint / 100.,
-        ];
-        let corrected = [150, 120, 100].map(|v| filters::srgb_to_linear(v as f64 / 255.));
-        let corrected = std::array::from_fn::<_, 3, _>(|i| corrected[i] * gains[i]);
-        assert!((corrected[0] - corrected[1]).abs() < 1e-9);
-        assert!((corrected[1] - corrected[2]).abs() < 1e-9);
+    fn gray_world_balance_neutralizes_the_measured_camera_raw_renderer() {
+        for color in [
+            [150, 120, 100, 255],
+            [100, 120, 150, 255],
+            [100, 150, 100, 255],
+        ] {
+            let input = Raster::solid(16, 16, color);
+            let [temperature, tint] = auto_white_balance(&input).unwrap();
+            let mut settings = filters::camera_raw_defaults();
+            settings["temperature"] = json!(temperature);
+            settings["tint"] = json!(tint);
+            let corrected = filters::apply_filter(&input, "Camera Raw Filter", &settings)
+                .unwrap()
+                .get(0, 0);
+            assert!(
+                corrected[..3].iter().max().unwrap() - corrected[..3].iter().min().unwrap() <= 1,
+                "{color:?} -> {corrected:?} at {temperature}/{tint}"
+            );
+            assert_eq!(corrected[3], color[3]);
+        }
         assert!(auto_white_balance(&Raster::blank(2, 2)).is_none());
     }
     #[test]
@@ -2841,13 +3184,13 @@ mod tests {
                 255, 0, 0, 0,
             ],
         );
-        let bins = vectorscope_bins(&image);
+        let bins = camera_raw_scope_bins(&image, 1).1;
         assert_eq!(bins[32 * 64 + 62], 340); // red: right
         assert_eq!(bins[58 * 64 + 16], 255); // green: upper left when rendered
         assert_eq!(bins[5 * 64 + 16], 128); // blue: lower left when rendered
         assert_eq!(bins.iter().sum::<u64>(), 723);
         assert_eq!(bins.iter().filter(|&&count| count > 0).count(), 3);
-        let pale_red = vectorscope_bins(&Raster::solid(1, 1, [255, 128, 128, 255]));
+        let pale_red = camera_raw_scope_bins(&Raster::solid(1, 1, [255, 128, 128, 255]), 1).1;
         assert_eq!(pale_red[32 * 64 + 47], 255);
     }
 
@@ -2867,15 +3210,79 @@ mod tests {
                     &scope,
                     &cached_vectorscope_bins(ui, &sample)
                 ));
-                sample.set(1, 1, [0, 0, 255, 128]);
+                sample.set(0, 0, [0, 0, 255, 128]);
                 let edited_histogram = cached_histogram_bins(ui, &sample);
                 let edited_scope = cached_vectorscope_bins(ui, &sample);
                 assert!(!std::sync::Arc::ptr_eq(&histogram, &edited_histogram));
                 assert!(!std::sync::Arc::ptr_eq(&scope, &edited_scope));
                 assert_eq!(edited_histogram[2][255], 128 * 3);
                 assert_eq!(edited_scope[5 * 64 + 16], 128);
-                assert_eq!(scope[32 * 64 + 62], 6 * 255);
+                assert_eq!(scope[32 * 64 + 62], 2 * 255);
             });
+        });
+    }
+
+    #[test]
+    fn camera_raw_scope_sampling_matches_original_band_alignment_and_keeps_source() {
+        assert_eq!(camera_raw_scope_step(2_000, 2_000), 4);
+        assert_eq!(camera_raw_scope_step(2_001, 2_000), 8);
+        assert_eq!(camera_raw_scope_step(u32::MAX, u32::MAX), 8);
+        let mut image = Raster::solid(9, 33, [64, 64, 64, 255]);
+        image.set(0, 3, [255, 0, 0, 128]); // The second band's first sampled row.
+        image.set(1, 0, [0, 0, 255, 255]); // Outside the display sampling grid.
+        let before = image.clone();
+        let (histogram, scope) = camera_raw_scope_bins(&image, 4);
+        assert_eq!(histogram[0][255], 128 * 3);
+        assert_eq!(histogram[2][255], 0);
+        assert_eq!(histogram[0].iter().sum::<u64>(), (32 * 255 + 128) * 3);
+        assert_eq!(scope[32 * 64 + 62], 128);
+        assert_eq!(scope.iter().sum::<u64>(), 128);
+        assert_eq!(histogram_bins(&image)[2][255], 255 * 3);
+        assert!(same_scope_sample(&before, &image));
+        assert_eq!(before, image);
+        let (histogram, scope) = camera_raw_scope_bins(&Raster::blank(0, 0), 4);
+        assert!(histogram.iter().flatten().all(|&count| count == 0));
+        assert!(scope.iter().all(|&count| count == 0));
+    }
+
+    #[test]
+    fn camera_raw_scope_cache_shares_both_graphs_without_changing_levels_statistics() {
+        let ctx = egui::Context::default();
+        let image = Raster::solid(9, 33, [255, 0, 0, 255]);
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                prepare_camera_raw_scopes(ctx, &image);
+                let cached = cached_camera_raw_scopes(ctx, &image);
+                let reused = cached_camera_raw_scopes(ctx, &image);
+                assert!(std::sync::Arc::ptr_eq(&cached.histogram, &reused.histogram));
+                assert!(std::sync::Arc::ptr_eq(
+                    &cached.vectorscope,
+                    &reused.vectorscope
+                ));
+                assert!(std::sync::Arc::ptr_eq(
+                    &cached.vectorscope,
+                    &cached_vectorscope_bins(ui, &image)
+                ));
+                assert_eq!(cached.histogram[0][255], 33 * 255 * 3);
+                assert_eq!(cached_histogram_bins(ui, &image)[0][255], 297 * 255 * 3);
+            });
+        });
+    }
+
+    #[test]
+    fn camera_raw_scope_bands_fit_small_windows_worker_stacks() {
+        let image = Raster::solid(129, 33, [255, 0, 0, 255]);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .stack_size(512 * 1024)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for _ in 0..8 {
+                let (histogram, scope) = camera_raw_scope_bins(&image, 4);
+                assert_eq!(histogram[0][255], 33 * 11 * 255 * 3);
+                assert_eq!(scope[32 * 64 + 62], 33 * 11 * 255);
+            }
         });
     }
 }

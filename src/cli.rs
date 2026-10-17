@@ -87,7 +87,7 @@ pub fn document_info(doc: &Document) -> Value {
         "layers":doc.layers.iter().map(|l| json!({"id":l.id,"name":l.name,"visible":l.visible,
             "parentId":l.parent_id,"isGroup":l.is_group,"opacity":l.opacity,"blendMode":l.blend_mode,
             "transform":l.transform,"clippingSourceId":l.mask_source_id,
-            "image":l.image.as_ref().map(|r| json!({"width":r.width,"height":r.height})),
+            "image":l.image.as_ref().map(|r| json!({"width":r.width,"height":r.height,"depth":r.deep.as_ref().map_or("8-bit",|d|if d.depth==crate::deep_pixels::Depth::Hdr {"HDR"}else{"16-bit"})})),
             "mask":l.mask.as_ref().map(|m| json!({"enabled":m.enabled,"linked":m.linked,"placement":m.placement,"width":m.raster.width,"height":m.raster.height})),
             "text":l.text,"shape":l.shape,"adjustment":l.adjustment,"effects":l.effects})).collect::<Vec<_>>()})
 }
@@ -235,6 +235,10 @@ struct ExportParams {
     quality: u8,
     #[serde(default = "matte")]
     matte: [u8; 3],
+    #[serde(default)]
+    bit_depth: Option<u8>,
+    #[serde(default)]
+    cmyk_profile: Option<PathBuf>,
 }
 fn quality() -> u8 {
     90
@@ -543,6 +547,10 @@ fn export(
         ));
     }
     ensure!((1..=100).contains(&p.quality), "JPEG quality 范围是 1–100");
+    ensure!(
+        p.bit_depth.is_none_or(|depth| [8, 16].contains(&depth)),
+        "bitDepth 必须为 8 或 16"
+    );
     if let Some(max_side) = p.max_side {
         ensure!(
             max_side > 0 && max_side <= crate::model::MAX_SIDE,
@@ -557,27 +565,64 @@ fn export(
         .to_ascii_lowercase();
     ensure!(
         [
-            "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp", "pdf"
+            "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "webp", "pdf", "exr"
         ]
         .contains(&format.as_str()),
-        "导出格式支持 PNG、JPEG、TIFF、BMP、GIF、WebP、PDF"
+        "导出格式支持 PNG、JPEG、TIFF、BMP、GIF、WebP、PDF、EXR"
     );
-    let raster = p.max_side.map_or_else(
+    ensure!(
+        p.bit_depth != Some(16) || ["png", "tif", "tiff"].contains(&format.as_str()),
+        "16 位整数导出只支持 PNG 或 TIFF；HDR 请使用 EXR"
+    );
+    ensure!(
+        p.cmyk_profile.is_none()
+            || ["jpg", "jpeg", "tif", "tiff", "pdf"].contains(&format.as_str()),
+        "CMYK 导出只支持 JPEG、TIFF 或 PDF"
+    );
+    ensure!(
+        p.cmyk_profile.is_none() || p.bit_depth != Some(16),
+        "CMYK 输出使用 8 位墨色通道"
+    );
+    let mut raster = p.max_side.map_or_else(
         || render::render_document(doc),
         |side| render::render_preview(doc, side),
     );
+    if let Some(depth) = p.bit_depth {
+        if depth == 8 {
+            raster = Raster::from_rgba(raster.width, raster.height, raster.to_rgba());
+        } else {
+            let mut doc = Document::new(raster.width, raster.height);
+            let layer = Layer::raster("Export", raster);
+            let id = layer.id;
+            doc.layers = vec![layer];
+            crate::edit::convert_layer_depth(&mut doc, id, Some(crate::deep_pixels::Depth::U16))?;
+            raster = doc.layers[0].image.as_ref().unwrap().as_ref().clone();
+        }
+    }
     if let Some(parent) = p.path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    export_document_raster(
-        doc,
-        &raster,
-        &p.path,
-        &format,
-        p.quality,
-        p.matte,
-        physical_size,
-    )?;
+    if let Some(profile) = &p.cmyk_profile {
+        let profile = crate::color_management::CmykProfile::load(profile)?;
+        crate::print_export::export(
+            &raster,
+            &p.path,
+            &format,
+            &profile,
+            doc.resolution,
+            p.quality,
+        )?;
+    } else {
+        export_document_raster(
+            doc,
+            &raster,
+            &p.path,
+            &format,
+            p.quality,
+            p.matte,
+            physical_size,
+        )?;
+    }
     Ok(
         json!({"path":absolute(&p.path)?,"format":format,"width":raster.width,"height":raster.height,"bytes":fs::metadata(&p.path)?.len(),"sha256":fingerprint(&p.path)?}),
     )
@@ -619,10 +664,11 @@ pub fn capabilities() -> Value {
             "new":{"width":1024,"height":768},"inspect":{},
             "apply":{"operations":[{"op":"add_layer","name":"背景"}]},"undo":{},"redo":{},
             "save":{"path":"edited.comp","overwrite":false},
-            "export":{"path":"preview.png","maxSide":1024,"quality":90,"matte":[255,255,255],"overwrite":false},"close":{"discard":false}},
+            "export":{"path":"preview.png","maxSide":1024,"quality":90,"matte":[255,255,255],"overwrite":false,"bitDepth":16,"cmykProfile":null},"close":{"discard":false}},
         "operations":crate::automation::capabilities(),"filters":crate::filters::FILTERS.iter().map(|name| json!({"name":name,"settings":crate::filters::default_settings(name)})).collect::<Vec<_>>(),
-        "project":{"readVersions":[1,11],"writeVersion":11,"container":"single-file","containerVersion":1,"legacyDirectoryRead":true,"selectionPersisted":false,"historyPersisted":false},
-        "exportFormats":["png","jpeg","tiff","bmp","gif","webp","pdf"],
+        "project":{"readVersions":[1,14],"writeVersion":11,"writeVersions":{"8-bit":11,"16-bit":12,"HDR":13,"smoothCorners":14},"container":"single-file","containerVersion":1,"legacyDirectoryRead":true,"selectionPersisted":false,"historyPersisted":false},
+        "exportFormats":["png","jpeg","tiff","bmp","gif","webp","pdf","exr"],
+        "color":{"workingSpace":"extended-sRGB","layerDepths":["8-bit","16-bit","HDR"],"exportOptions":{"bitDepth":[8,16],"cmykProfile":"path to a validated CMYK printer ICC profile; JPEG, TIFF or PDF only"}},
         "pdf":{"editing":"rasterized_pages","pageNumbering":"one_based","openRequires":["page","dpi"],"dpiRange":[72,600],"export":"one flattened raster page per document; maxSide preserves physical page size","liveOpen":"Use the GUI PDF import dialog; live controls existing documents only","limitations":"Original PDF text, vectors, forms and signatures are not preserved"},
         "limits":{"requestBytes":MAX_REQUEST_BYTES,"operationsPerBatch":1000},
         "concurrency":"apply is one atomic in-memory transaction; save checks the opened source fingerprint; shared GUI changes require expectedRevision",
@@ -859,6 +905,8 @@ fn one_shot(command: &str, args: Vec<OsString>) -> Result<Value> {
             let output = PathBuf::from(args.required("output")?);
             let max_side = args.number("max-side")?;
             let quality = args.number("quality")?.unwrap_or(90);
+            let bit_depth = args.number("bit-depth")?;
+            let cmyk_profile = args.take("cmyk-profile").map(PathBuf::from);
             ensure!(quality <= 100 && quality > 0, "quality 范围是 1–100");
             let overwrite = args.take("overwrite").is_some();
             let params = args.open_params(&input)?;
@@ -867,7 +915,7 @@ fn one_shot(command: &str, args: Vec<OsString>) -> Result<Value> {
             s.request("open", params)?;
             s.request(
                 "export",
-                json!({"path":output,"maxSide":max_side,"quality":quality,"overwrite":overwrite}),
+                json!({"path":output,"maxSide":max_side,"quality":quality,"overwrite":overwrite,"bitDepth":bit_depth,"cmykProfile":cmyk_profile}),
             )
         }
         "live" => {
@@ -1172,6 +1220,70 @@ mod tests {
         let err = s.request("save", json!({"path":path})).unwrap_err();
         assert_eq!(failure(Value::Null, &err)["error"]["code"], "conflict");
         assert_eq!(project::load(&path).unwrap().layers[0].name, "external");
+    }
+
+    #[test]
+    fn cli_high_precision_export_preserves_source_and_validates_options() {
+        use crate::deep_pixels::{DeepRaster, Depth};
+        let folder = tempfile::tempdir().unwrap();
+        let source = folder.path().join("低位颜色.comp");
+        let mut document = Document::new(2, 1);
+        let bits = vec![30001, 40002, 50003, 65535, 30117, 40118, 50119, 32768];
+        document.layers[0].image = Some(std::sync::Arc::new(Raster::from_deep(
+            DeepRaster::from_u16(2, 1, bits.clone()).unwrap(),
+        )));
+        project::save(&document, &source).unwrap();
+        let output = folder.path().join("导出16位.png");
+        one_shot(
+            "export",
+            vec![
+                source.as_os_str().into(),
+                "--output".into(),
+                output.as_os_str().into(),
+                "--bit-depth".into(),
+                "16".into(),
+            ],
+        )
+        .unwrap();
+        let decoded = image_io::decode_image(&output).unwrap();
+        assert_eq!(decoded.deep.unwrap().to_bits(), bits);
+        assert_eq!(project::load(&source).unwrap(), document);
+        let mut session = Session::default();
+        session.request("open", json!({"path":source})).unwrap();
+        let revision = session.opened().unwrap().history.revision();
+        for params in [
+            json!({"path":folder.path().join("bad.jpg"),"bitDepth":16}),
+            json!({"path":folder.path().join("bad.png"),"cmykProfile":"missing.icc"}),
+            json!({"path":folder.path().join("bad.tiff"),"bitDepth":16,"cmykProfile":"missing.icc"}),
+        ] {
+            let target = PathBuf::from(params["path"].as_str().unwrap());
+            assert!(session.request("export", params).is_err());
+            assert!(!target.exists());
+        }
+        session
+            .request(
+                "apply",
+                json!({"operations":[{"op":"convert_depth","depth":"HDR"}]}),
+            )
+            .unwrap();
+        assert_ne!(session.opened().unwrap().history.revision(), revision);
+        assert_eq!(
+            session.opened().unwrap().document.layers[0]
+                .image
+                .as_ref()
+                .unwrap()
+                .deep
+                .as_ref()
+                .unwrap()
+                .depth,
+            Depth::Hdr
+        );
+        let exr = folder.path().join("CLI浮点.exr");
+        session.request("export", json!({"path":exr})).unwrap();
+        assert_eq!(
+            image_io::decode_image(&exr).unwrap().deep.unwrap().depth,
+            Depth::Hdr
+        );
     }
 
     #[test]

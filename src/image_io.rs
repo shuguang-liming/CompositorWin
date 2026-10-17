@@ -5,21 +5,28 @@ use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader};
 use rayon::prelude::*;
 use std::{
     fs::{self, File},
-    io::{BufReader, Cursor, Read, Write},
+    io::{BufReader, Cursor, Read, Seek, Write},
     path::Path,
 };
 use uuid::Uuid;
+
+#[path = "raw_develop.rs"]
+mod raw_develop;
 
 pub struct ImportResult {
     pub document: Document,
     pub conversions: Vec<String>,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RawDevelopSettings {
     pub exposure: f32,
     pub temperature: f32,
     pub tint: f32,
     pub boost: f32,
+    pub noise_reduction: f32,
+    pub lens_correction: bool,
+    pub highlight_recovery: bool,
 }
 impl Default for RawDevelopSettings {
     fn default() -> Self {
@@ -28,7 +35,49 @@ impl Default for RawDevelopSettings {
             temperature: 5000.0,
             tint: 0.0,
             boost: 1.0,
+            noise_reduction: 0.0,
+            lens_correction: false,
+            highlight_recovery: false,
         }
+    }
+}
+impl RawDevelopSettings {
+    pub fn key(self) -> [u32; 7] {
+        [
+            self.exposure.to_bits(),
+            self.temperature.to_bits(),
+            self.tint.to_bits(),
+            self.boost.to_bits(),
+            self.noise_reduction.to_bits(),
+            self.lens_correction as u32,
+            self.highlight_recovery as u32,
+        ]
+    }
+
+    /// rawloader 0.37 exposes no lens profile or correction opcodes.
+    pub const fn supports_lens_correction() -> bool {
+        false
+    }
+
+    pub(crate) fn validate(self) -> Result<()> {
+        ensure!(
+            self.exposure.is_finite()
+                && (-20.0..=20.0).contains(&self.exposure)
+                && self.temperature.is_finite()
+                && (1000.0..=50000.0).contains(&self.temperature)
+                && self.tint.is_finite()
+                && (-150.0..=150.0).contains(&self.tint)
+                && self.boost.is_finite()
+                && (0.0..=2.0).contains(&self.boost)
+                && self.noise_reduction.is_finite()
+                && (0.0..=1.0).contains(&self.noise_reduction),
+            "RAW 显影参数无效"
+        );
+        ensure!(
+            !self.lens_correction,
+            "当前 RAW 解码器未提供镜头配置数据，暂不支持按相机镜头配置自动校正"
+        );
+        Ok(())
     }
 }
 
@@ -159,54 +208,33 @@ pub fn decode_image(path: &Path) -> Result<Raster> {
             .saturating_add(64 * 1024 * 1024),
     );
     reader.limits(limits);
+    let format = reader.format();
     let mut decoder = reader.into_decoder()?;
     let (w, h) = decoder.dimensions();
     size(w, h)?;
+    let precision_cost = match decoder.color_type() {
+        image::ColorType::Rgb32F | image::ColorType::Rgba32F => 6,
+        image::ColorType::L16
+        | image::ColorType::La16
+        | image::ColorType::Rgb16
+        | image::ColorType::Rgba16 => 3,
+        _ => 1,
+    };
+    crate::deep_io::check_size(w, h, precision_cost)?;
     let orientation = decoder.orientation()?;
     let profile = decoder.icc_profile()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
+    if matches!(
+        format,
+        Some(image::ImageFormat::OpenExr | image::ImageFormat::Hdr)
+    ) {
+        return crate::deep_io::from_linear(image, format == Some(image::ImageFormat::OpenExr));
+    }
     if profile.is_none() {
         image.apply_color_space(image::metadata::Cicp::SRGB, Default::default())?;
     }
-    let mut rgba = image.into_rgba8();
-    if let Some(profile) = profile {
-        convert_icc(&profile, rgba.as_mut())?;
-    }
-    Ok(Raster::from_rgba(
-        rgba.width(),
-        rgba.height(),
-        rgba.into_raw(),
-    ))
-}
-fn convert_icc(profile: &[u8], pixels: &mut [u8]) -> Result<()> {
-    let input = moxcms::ColorProfile::new_from_slice(profile).context("嵌入的 ICC 色彩配置无效")?;
-    let output = moxcms::ColorProfile::new_srgb();
-    let layout = match input.color_space {
-        moxcms::DataColorSpace::Rgb => moxcms::Layout::Rgba,
-        moxcms::DataColorSpace::Gray => moxcms::Layout::GrayAlpha,
-        _ => anyhow::bail!("嵌入的 ICC 配置使用了 Rust 栅格解码器不支持的色彩空间"),
-    };
-    let transform = input
-        .create_transform_8bit(layout, &output, moxcms::Layout::Rgba, Default::default())
-        .context("不支持嵌入的 ICC 色彩配置")?;
-    // One row-size buffer avoids duplicating the whole image during color conversion.
-    let mut converted = vec![0; 65536];
-    for chunk in pixels.chunks_mut(65536) {
-        if layout == moxcms::Layout::GrayAlpha {
-            let gray = chunk
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .flat_map(|p| [p[0], p[3]])
-                .collect::<Vec<_>>();
-            transform.transform(&gray, &mut converted[..chunk.len()])?;
-        } else {
-            transform.transform(chunk, &mut converted[..chunk.len()])?;
-        }
-        chunk.copy_from_slice(&converted[..chunk.len()]);
-    }
-    Ok(())
+    crate::deep_io::from_dynamic(image, profile.as_deref())
 }
 
 pub fn decode_svg(path: &Path, fitting: Option<[u32; 2]>) -> Result<Raster> {
@@ -279,26 +307,44 @@ fn develop_raw_worker(
     settings: RawDevelopSettings,
     limit: Option<u32>,
 ) -> Result<Raster> {
+    settings.validate()?;
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Keep preflight and decoding on the same file, without a concurrent
+        // writer or path replacement invalidating the checked sensor layout.
+        options.share_mode(1); // FILE_SHARE_READ
+    }
+    let mut file = options.open(path)?;
     ensure!(
-        settings.exposure.is_finite()
-            && (-20.0..=20.0).contains(&settings.exposure)
-            && settings.temperature.is_finite()
-            && (1000.0..=50000.0).contains(&settings.temperature)
-            && settings.tint.is_finite()
-            && (-150.0..=150.0).contains(&settings.tint)
-            && settings.boost.is_finite()
-            && (0.0..=2.0).contains(&settings.boost),
-        "RAW 显影参数无效"
-    );
-    ensure!(
-        fs::metadata(path)?.len() <= 512 * 1024 * 1024,
+        file.metadata()?.len() <= 512 * 1024 * 1024,
         "RAW 编码文件超过 512 MiB"
     );
-    let dummy =
-        rawloader::decode_dummy(&mut File::open(path)?).context("不支持此 RAW 相机或压缩格式")?;
-    size(u32::try_from(dummy.width)?, u32::try_from(dummy.height)?)?;
-    let raw = rawloader::decode_file(path)?;
+    let dummy = rawloader::decode_dummy(&mut file).context("不支持此 RAW 相机或压缩格式")?;
+    // Unsupported component counts must be rejected before rawloader allocates
+    // width * height * cpp samples; an allocation abort bypasses thread joining.
+    raw_sample_count(&dummy)?;
+    if limit.is_none() {
+        crate::deep_io::check_size(u32::try_from(dummy.width)?, u32::try_from(dummy.height)?, 3)?;
+    }
+    file.rewind()?;
+    let raw = rawloader::decode(&mut file)?;
     develop_sensor(&raw, settings, limit)
+}
+
+fn raw_sample_count(raw: &rawloader::RawImage) -> Result<usize> {
+    size(u32::try_from(raw.width)?, u32::try_from(raw.height)?)?;
+    ensure!(raw.cpp == 1 || raw.cpp == 3, "不支持此 RAW 分量数量");
+    ensure!(
+        raw.cpp == 3 || raw.cfa.is_valid(),
+        "RAW 没有可支持的彩色滤光阵列"
+    );
+    raw.width
+        .checked_mul(raw.height)
+        .and_then(|n| n.checked_mul(raw.cpp))
+        .context("RAW 尺寸溢出")
 }
 
 fn develop_sensor(
@@ -306,17 +352,8 @@ fn develop_sensor(
     settings: RawDevelopSettings,
     limit: Option<u32>,
 ) -> Result<Raster> {
-    size(u32::try_from(raw.width)?, u32::try_from(raw.height)?)?;
-    ensure!(raw.cpp == 1 || raw.cpp == 3, "不支持此 RAW 分量数量");
-    ensure!(
-        raw.cpp == 3 || raw.cfa.is_valid(),
-        "RAW 没有可支持的彩色滤光阵列"
-    );
-    let expected = raw
-        .width
-        .checked_mul(raw.height)
-        .and_then(|n| n.checked_mul(raw.cpp))
-        .context("RAW 尺寸溢出")?;
+    settings.validate()?;
+    let expected = raw_sample_count(raw)?;
     ensure!(
         match &raw.data {
             rawloader::RawImageData::Integer(v) => v.len() >= expected,
@@ -327,27 +364,39 @@ fn develop_sensor(
     let [top, right, bottom, left] = raw.crops;
     let width = raw
         .width
-        .checked_sub(left + right)
+        .checked_sub(left.checked_add(right).context("RAW 传感器裁剪范围溢出")?)
         .context("RAW 传感器裁剪范围无效")?;
     let height = raw
         .height
-        .checked_sub(top + bottom)
+        .checked_sub(top.checked_add(bottom).context("RAW 传感器裁剪范围溢出")?)
         .context("RAW 传感器裁剪范围无效")?;
     ensure!(width > 0 && height > 0, "RAW 传感器裁剪范围为空");
     let scale = limit.map_or(1.0, |n| (n as f64 / width.max(height) as f64).min(1.0));
     let ow = (width as f64 * scale).round().max(1.0) as u32;
     let oh = (height as f64 * scale).round().max(1.0) as u32;
+    if limit.is_none() {
+        // Account for the authoritative 16-bit surface, its byte preview and
+        // the temporary orientation/decoder buffers before processing pixels.
+        crate::deep_io::check_size(ow, oh, 3)?;
+    }
     let matrix = raw.cam_to_xyz_normalized();
     ensure!(
         matrix.iter().flatten().all(|v| v.is_finite()),
         "RAW 相机矩阵无效"
     );
+    let sensor =
+        raw_develop::Sensor::new(raw, settings.noise_reduction, settings.highlight_recovery)?;
     let neutral = raw.neutralwb();
     let mut wb = raw.wb_coeffs;
     for i in 0..4 {
+        if !sensor.is_active(i) {
+            wb[i] = 1.;
+            continue;
+        }
         if !wb[i].is_finite() || wb[i] <= 0.0 {
             wb[i] = neutral[i];
         }
+        ensure!(wb[i] > 0. && wb[i].is_finite(), "RAW 白平衡无效");
     }
     let green = wb[1];
     ensure!(green > 0.0 && green.is_finite(), "RAW 白平衡无效");
@@ -359,90 +408,135 @@ fn develop_sensor(
     wb[2] /= warm;
     wb[1] *= (1.0 - settings.tint / 300.0).max(0.1);
     let exposure = 2_f32.powf(settings.exposure);
-    let sample = |x: usize, y: usize, color: usize| -> f32 {
-        let idx = (y * raw.width + x) * raw.cpp + if raw.cpp == 3 { color.min(2) } else { 0 };
-        let value = match &raw.data {
-            rawloader::RawImageData::Integer(d) => f32::from(d[idx]),
-            rawloader::RawImageData::Float(d) => d[idx],
-        };
-        let black = f32::from(raw.blacklevels[color]);
-        let white = f32::from(raw.whitelevels[color]);
-        ((value - black) / (white - black).max(1.0)).max(0.0) * wb[color]
-    };
+    let sample = |x: usize, y: usize, color: usize| sensor.sample(x, y, color);
     let radius = raw.cfa.width.max(raw.cfa.height).max(2) as isize;
-    let mut pixels = zeroed_bytes(ow, oh, 4, "RAW 图像")?;
-    pixels
-        .par_chunks_exact_mut(ow as usize * 4)
-        .enumerate()
-        .for_each(|(row, line)| {
-            let sy = top
-                + ((row as f64 + 0.5) / scale)
-                    .floor()
-                    .min((height - 1) as f64) as usize;
-            for (x, p) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let sx = left + ((x as f64 + 0.5) / scale).floor().min((width - 1) as f64) as usize;
-                let mut camera = [0.0; 4];
-                for (color, c) in camera.iter_mut().enumerate() {
-                    if raw.cpp == 3 {
-                        if color < 3 {
-                            *c = sample(sx, sy, color);
-                        }
+    let develop_pixel = |x: usize, row: usize| {
+        let sy = top
+            + ((row as f64 + 0.5) / scale)
+                .floor()
+                .min((height - 1) as f64) as usize;
+        let sx = left + ((x as f64 + 0.5) / scale).floor().min((width - 1) as f64) as usize;
+        let mut camera = [0.0; 4];
+        for (color, c) in camera.iter_mut().enumerate() {
+            if !sensor.is_active(color) {
+                continue;
+            }
+            if raw.cpp == 3 {
+                if color < 3 {
+                    *c = sample(sx, sy, color);
+                }
+                continue;
+            }
+            if raw.cfa.color_at(sy, sx) == color {
+                *c = sample(sx, sy, color);
+                continue;
+            }
+            let mut weight = 0.0;
+            let mut total = 0.0;
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx == 0 && dy == 0 {
                         continue;
                     }
-                    if raw.cfa.color_at(sy, sx) == color {
-                        *c = sample(sx, sy, color);
+                    let nx = sx as isize + dx;
+                    let ny = sy as isize + dy;
+                    if nx < 0 || ny < 0 || nx >= raw.width as isize || ny >= raw.height as isize {
                         continue;
                     }
-                    let mut weight = 0.0;
-                    let mut total = 0.0;
-                    for dy in -radius..=radius {
-                        for dx in -radius..=radius {
-                            if dx == 0 && dy == 0 {
-                                continue;
-                            }
-                            let nx = sx as isize + dx;
-                            let ny = sy as isize + dy;
-                            if nx < 0
-                                || ny < 0
-                                || nx >= raw.width as isize
-                                || ny >= raw.height as isize
-                            {
-                                continue;
-                            }
-                            if raw.cfa.color_at(ny as usize, nx as usize) == color {
-                                let w = 1.0 / (dx * dx + dy * dy) as f32;
-                                weight += w;
-                                total += sample(nx as usize, ny as usize, color) * w;
-                            }
-                        }
+                    if raw.cfa.color_at(ny as usize, nx as usize) == color {
+                        let w = 1.0 / (dx * dx + dy * dy) as f32;
+                        weight += w;
+                        total += sample(nx as usize, ny as usize, color) * w;
                     }
-                    *c = if weight > 0.0 { total / weight } else { 0.0 };
                 }
-                let xyz = matrix.map(|m| m.iter().zip(camera).map(|(a, b)| a * b).sum::<f32>());
-                let rgb = [
-                    3.2404542 * xyz[0] - 1.5371385 * xyz[1] - 0.4985314 * xyz[2],
-                    -0.969266 * xyz[0] + 1.8760108 * xyz[1] + 0.041556 * xyz[2],
-                    0.0556434 * xyz[0] - 0.2040259 * xyz[1] + 1.0572252 * xyz[2],
-                ];
-                for i in 0..3 {
-                    let linear = (rgb[i] * exposure).max(0.0);
-                    let shoulder = linear / (1.0 + linear);
-                    let mixed = linear + (shoulder - linear) * settings.boost * 0.5;
-                    let srgb = if mixed <= 0.0031308 {
-                        mixed * 12.92
-                    } else {
-                        1.055 * mixed.powf(1.0 / 2.4) - 0.055
-                    };
-                    p[i] = (srgb.clamp(0.0, 1.0) * 255.0).round() as u8;
-                }
-                p[3] = 255;
+            }
+            *c = if weight > 0.0 { total / weight } else { 0.0 };
+        }
+        sensor.recover(sx, sy, &mut camera);
+        for color in 0..4 {
+            camera[color] *= wb[color];
+        }
+        let xyz = matrix.map(|m| m.iter().zip(camera).map(|(a, b)| a * b).sum::<f32>());
+        let rgb = [
+            3.2404542 * xyz[0] - 1.5371385 * xyz[1] - 0.4985314 * xyz[2],
+            -0.969266 * xyz[0] + 1.8760108 * xyz[1] + 0.041556 * xyz[2],
+            0.0556434 * xyz[0] - 0.2040259 * xyz[1] + 1.0572252 * xyz[2],
+        ];
+        let developed = rgb.map(|value| {
+            let linear = (value * exposure).max(0.0);
+            let shoulder = linear / (1.0 + linear);
+            let mixed = linear + (shoulder - linear) * settings.boost * 0.5;
+            if mixed <= 0.0031308 {
+                mixed * 12.92
+            } else {
+                1.055 * mixed.powf(1.0 / 2.4) - 0.055
             }
         });
-    let mut image = DynamicImage::ImageRgba8(
-        image::RgbaImage::from_raw(ow, oh, pixels).context("RAW 图像分配大小不匹配")?,
-    );
+        (developed, sx, sy)
+    };
+    let mut image = if limit.is_none() {
+        let length = (ow as usize)
+            .checked_mul(oh as usize)
+            .and_then(|n| n.checked_mul(4))
+            .context("RAW 16 位图像尺寸溢出")?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(length)
+            .context("RAW 16 位图像内存分配失败")?;
+        pixels.resize(length, 0_u16);
+        pixels
+            .par_chunks_exact_mut(ow as usize * 4)
+            .enumerate()
+            .for_each(|(row, line)| {
+                for (x, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let (developed, _, _) = develop_pixel(x, row);
+                    for c in 0..3 {
+                        // Preserve sensor-derived low bits before any 8-bit preview.
+                        pixel[c] = (developed[c].clamp(0., 1.) * 65535.).round() as u16;
+                    }
+                    pixel[3] = u16::MAX;
+                }
+            });
+        DynamicImage::ImageRgba16(
+            image::ImageBuffer::from_raw(ow, oh, pixels).context("RAW 16 位图像分配大小不匹配")?,
+        )
+    } else {
+        let mut pixels = zeroed_bytes(ow, oh, 4, "RAW 图像")?;
+        pixels
+            .par_chunks_exact_mut(ow as usize * 4)
+            .enumerate()
+            .for_each(|(row, line)| {
+                for (x, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let (developed, sx, sy) = develop_pixel(x, row);
+                    for c in 0..3 {
+                        pixel[c] = raw_develop::quantize(developed[c], sx, sy, c);
+                    }
+                    pixel[3] = 255;
+                }
+            });
+        DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(ow, oh, pixels).context("RAW 图像分配大小不匹配")?,
+        )
+    };
     if let Some(o) = image::metadata::Orientation::from_exif(raw.orientation.to_u16() as u8) {
         image.apply_orientation(o);
+    }
+    if let DynamicImage::ImageRgba16(image) = image {
+        let (width, height) = image.dimensions();
+        let deep = crate::deep_pixels::DeepRaster::from_u16(width, height, image.into_raw())
+            .map_err(anyhow::Error::msg)?;
+        let mut preview = zeroed_bytes(width, height, 4, "RAW 预览")?;
+        preview
+            .par_chunks_exact_mut(width as usize * 4)
+            .enumerate()
+            .for_each(|(y, line)| {
+                for (x, pixel) in line.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    *pixel = deep.preview_pixel(x as u32, y as u32);
+                }
+            });
+        let mut raster = Raster::from_rgba(width, height, preview);
+        raster.deep = Some(std::sync::Arc::new(deep));
+        return Ok(raster);
     }
     let image = image.into_rgba8();
     Ok(Raster::from_rgba(
@@ -458,13 +552,18 @@ pub fn export_png(raster: &Raster, path: &Path, resolution: f64) -> Result<()> {
         resolution.is_finite() && (1.0..=9600.0).contains(&resolution),
         "导出分辨率无效"
     );
-    let mut encoded = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut encoded).write_image(
-        &raster.to_rgba(),
-        raster.width,
-        raster.height,
-        image::ExtendedColorType::Rgba8,
-    )?;
+    let mut encoded = if raster.deep.is_some() {
+        crate::deep_io::encode_png(raster)?
+    } else {
+        let mut encoded = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut encoded).write_image(
+            &raster.to_rgba(),
+            raster.width,
+            raster.height,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        encoded
+    };
     let density = (resolution / 0.0254).round() as u32;
     let mut physical = Vec::new();
     physical.extend(density.to_be_bytes());
@@ -533,6 +632,9 @@ pub fn jpeg_preview(raster: &Raster, quality: u8, matte: [u8; 3]) -> Result<(Ras
 }
 pub fn export_tiff(raster: &Raster, path: &Path) -> Result<()> {
     size(raster.width, raster.height)?;
+    if raster.deep.is_some() {
+        return write_atomic(path, &crate::deep_io::encode_tiff(raster)?);
+    }
     let mut bytes = Cursor::new(Vec::new());
     image::codecs::tiff::TiffEncoder::new(&mut bytes).write_image(
         &raster.to_rgba(),
@@ -584,7 +686,7 @@ pub fn export_webp(raster: &Raster, path: &Path) -> Result<()> {
 }
 
 /// Export using a normalized extension (`png`, `jpg`, `jpeg`, `tif`, `tiff`,
-/// `bmp`, `gif` or `webp`). This keeps GUI, CLI and Agent exports in sync.
+/// `bmp`, `gif`, `webp` or `exr`). This keeps GUI, CLI and Agent exports in sync.
 pub fn export_raster(
     raster: &Raster,
     path: &Path,
@@ -600,6 +702,10 @@ pub fn export_raster(
         "bmp" => export_bmp(raster, path),
         "gif" => export_gif(raster, path),
         "webp" => export_webp(raster, path),
+        "exr" => {
+            size(raster.width, raster.height)?;
+            write_atomic(path, &crate::deep_io::encode_exr(raster)?)
+        }
         "pdf" => crate::pdf_io::export_pages(
             path,
             std::iter::once(Ok((
@@ -855,6 +961,266 @@ fn decode_wic(path: &Path) -> Result<Raster> {
 mod tests {
     use super::*;
     #[test]
+    fn raw_import_rejects_excess_components_before_sensor_allocation_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("异常分量.dng");
+        fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/raw/unsupported-components.dng"),
+        )
+        .unwrap();
+        let error = import(&path).err().unwrap().to_string();
+        assert!(error.contains("RAW 分量数量"), "{error}");
+        for fixture in [
+            include_bytes!("../tests/fixtures/raw/bayer.dng").as_slice(),
+            include_bytes!("../tests/fixtures/raw/linear-rgb.dng").as_slice(),
+        ] {
+            fs::write(&path, fixture).unwrap();
+            let document = import(&path).unwrap().document;
+            assert_eq!((document.width, document.height), (8, 8));
+            let image = document.layers[0].image.as_ref().unwrap();
+            assert_eq!(
+                image.deep.as_ref().unwrap().depth,
+                crate::deep_pixels::Depth::U16
+            );
+            assert_eq!(image.get(0, 0)[3], 255);
+            assert!(image.get(0, 0)[..3].iter().any(|&v| v > 0));
+        }
+    }
+
+    #[test]
+    fn raw_new_parameters_run_through_bayer_and_linear_dng_decoders() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("合成传感器.dng");
+        for fixture in [
+            include_bytes!("../tests/fixtures/raw/bayer.dng").as_slice(),
+            include_bytes!("../tests/fixtures/raw/linear-rgb.dng").as_slice(),
+        ] {
+            fs::write(&path, fixture).unwrap();
+            for settings in [
+                RawDevelopSettings::default(),
+                RawDevelopSettings {
+                    noise_reduction: 1.,
+                    ..Default::default()
+                },
+                RawDevelopSettings {
+                    highlight_recovery: true,
+                    ..Default::default()
+                },
+                RawDevelopSettings {
+                    noise_reduction: 0.5,
+                    highlight_recovery: true,
+                    ..Default::default()
+                },
+            ] {
+                let actual = develop_raw(&path, settings, None).unwrap();
+                assert_eq!((actual.width, actual.height), (8, 8));
+                let deep = actual
+                    .deep
+                    .as_ref()
+                    .expect("full RAW import keeps sensor precision");
+                assert_eq!(deep.depth, crate::deep_pixels::Depth::U16);
+                assert!(
+                    deep.to_bits()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|pixel| pixel[..3].iter().any(|&value| value % 257 != 0)),
+                    "RAW low bits must come directly from sensor development"
+                );
+                assert!(
+                    actual
+                        .to_rgba()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|p| p[3] == 255)
+                );
+                assert!(actual.to_rgba().iter().any(|&v| v > 0 && v < 255));
+                assert_eq!(develop_raw(&path, settings, None).unwrap(), actual);
+                let preview = develop_raw(&path, settings, Some(4)).unwrap();
+                assert_eq!((preview.width, preview.height), (4, 4));
+                assert!(preview.deep.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_orientation_preserves_full_sixteen_bit_samples_for_all_exif_transforms() {
+        for fixture in [
+            include_bytes!("../tests/fixtures/raw/bayer.dng").as_slice(),
+            include_bytes!("../tests/fixtures/raw/linear-rgb.dng").as_slice(),
+        ] {
+            let mut raw = rawloader::decode(&mut Cursor::new(fixture)).unwrap();
+            raw.crops = [0, 1, 2, 0];
+            raw.orientation = rawloader::Orientation::Normal;
+            let normal = develop_sensor(&raw, RawDevelopSettings::default(), None).unwrap();
+            assert_eq!((normal.width, normal.height), (7, 6));
+            let source = normal.deep.as_ref().unwrap();
+            assert!(source.to_bits().iter().any(|&sample| sample % 257 != 0));
+            for code in 1..=8 {
+                raw.orientation = rawloader::Orientation::from_u16(code);
+                let actual = develop_sensor(&raw, RawDevelopSettings::default(), None).unwrap();
+                let deep = actual.deep.as_ref().unwrap();
+                assert_eq!(deep.depth, crate::deep_pixels::Depth::U16);
+                let (transpose, horizontal, vertical) = raw.orientation.to_flips();
+                assert_eq!(
+                    (actual.width, actual.height),
+                    if transpose { (6, 7) } else { (7, 6) }
+                );
+                for y in 0..normal.height {
+                    for x in 0..normal.width {
+                        let tx = if horizontal { normal.width - x - 1 } else { x };
+                        let ty = if vertical { normal.height - y - 1 } else { y };
+                        let (tx, ty) = if transpose { (ty, tx) } else { (tx, ty) };
+                        assert_eq!(deep.get_bits(tx, ty), source.get_bits(x, y), "EXIF {code}");
+                    }
+                }
+                let preview = develop_sensor(&raw, RawDevelopSettings::default(), Some(8)).unwrap();
+                assert_eq!(
+                    (preview.width, preview.height),
+                    (actual.width, actual.height)
+                );
+                assert!(preview.deep.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn raw_inactive_camera_channel_and_invalid_crop_do_not_corrupt_development() {
+        let mut raw = rawloader::decode(&mut Cursor::new(include_bytes!(
+            "../tests/fixtures/raw/bayer.dng"
+        )))
+        .unwrap();
+        raw.wb_coeffs[3] = f32::NAN;
+        let raster = develop_sensor(&raw, RawDevelopSettings::default(), None).unwrap();
+        assert!(
+            raster
+                .to_rgba()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[..3].iter().any(|&v| v > 0))
+        );
+        raw.crops = [0, usize::MAX, 0, usize::MAX];
+        assert!(develop_sensor(&raw, RawDevelopSettings::default(), None).is_err());
+    }
+
+    #[test]
+    fn raw_preview_keys_cover_every_setting_and_invalid_controls_fail_before_decoding() {
+        let defaults = RawDevelopSettings::default();
+        for settings in [
+            RawDevelopSettings {
+                exposure: 1.,
+                ..defaults
+            },
+            RawDevelopSettings {
+                temperature: 6000.,
+                ..defaults
+            },
+            RawDevelopSettings {
+                tint: 1.,
+                ..defaults
+            },
+            RawDevelopSettings {
+                boost: 0.5,
+                ..defaults
+            },
+            RawDevelopSettings {
+                noise_reduction: 0.5,
+                ..defaults
+            },
+            RawDevelopSettings {
+                lens_correction: true,
+                ..defaults
+            },
+            RawDevelopSettings {
+                highlight_recovery: true,
+                ..defaults
+            },
+        ] {
+            assert_ne!(settings.key(), defaults.key());
+        }
+        let missing = Path::new("missing-raw-control-validation.dng");
+        for settings in [
+            RawDevelopSettings {
+                exposure: f32::NAN,
+                ..defaults
+            },
+            RawDevelopSettings {
+                temperature: f32::INFINITY,
+                ..defaults
+            },
+            RawDevelopSettings {
+                tint: 151.,
+                ..defaults
+            },
+            RawDevelopSettings {
+                boost: -0.1,
+                ..defaults
+            },
+            RawDevelopSettings {
+                noise_reduction: f32::NAN,
+                ..defaults
+            },
+            RawDevelopSettings {
+                noise_reduction: -0.01,
+                ..defaults
+            },
+            RawDevelopSettings {
+                noise_reduction: 1.01,
+                ..defaults
+            },
+        ] {
+            let error = develop_raw_worker(missing, settings, None)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "RAW 显影参数无效");
+        }
+        assert!(!RawDevelopSettings::supports_lens_correction());
+        let error = develop_raw_worker(
+            missing,
+            RawDevelopSettings {
+                lens_correction: true,
+                ..defaults
+            },
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("未提供镜头配置数据"), "{error}");
+    }
+
+    #[test]
+    fn high_precision_export_import_routes_preserve_depth_and_png_metadata() {
+        use crate::deep_pixels::DeepRaster;
+        let directory = tempfile::tempdir().unwrap();
+        let bits = vec![25001, 32769, 50001, 65535, 12345, 23456, 34567, 32768];
+        let raster = Raster::from_deep(DeepRaster::from_u16(2, 1, bits.clone()).unwrap());
+        for format in ["png", "tiff"] {
+            let path = directory.path().join(format!("低位精度.{format}"));
+            export_raster(&raster, &path, format, 300., 90, [255; 3]).unwrap();
+            let actual = decode_image(&path).unwrap();
+            assert_eq!(actual.deep.as_ref().unwrap().to_bits(), bits);
+            if format == "png" {
+                let bytes = fs::read(path).unwrap();
+                assert!(bytes.windows(4).any(|v| v == b"pHYs"));
+                assert!(bytes.windows(4).any(|v| v == b"sRGB"));
+            }
+        }
+        let path = directory.path().join("浮点亮部.exr");
+        let raster = Raster::from_deep(
+            DeepRaster::from_f32(1, 1, crate::deep_pixels::Depth::Hdr, &[2., 4., 8., 0.5]).unwrap(),
+        );
+        export_raster(&raster, &path, "exr", 72., 90, [255; 3]).unwrap();
+        let actual = decode_image(&path).unwrap();
+        assert_eq!(
+            actual.deep.unwrap().to_bits(),
+            raster.deep.unwrap().to_bits()
+        );
+    }
+
+    #[test]
     fn pixel_allocation_rejects_overflow_without_aborting() {
         assert!(zeroed_bytes(u32::MAX, u32::MAX, u64::MAX, "图像测试").is_err());
         assert_eq!(zeroed_bytes(2, 3, 4, "图像测试").unwrap(), [0; 24]);
@@ -985,11 +1351,17 @@ mod tests {
         let profile = moxcms::ColorProfile::new_gray_with_gamma(1.0)
             .encode()
             .unwrap();
-        let mut pixels = [128, 128, 128, 45];
-        convert_icc(&profile, &mut pixels).unwrap();
+        let source = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([128, 128, 128, 45]),
+        ));
+        let pixels = crate::deep_io::from_dynamic(source.clone(), Some(&profile))
+            .unwrap()
+            .get(0, 0);
         assert!(pixels[..3].iter().all(|p| p.abs_diff(188) <= 2));
         assert_eq!(pixels[3], 45);
-        assert!(convert_icc(b"broken-profile", &mut pixels).is_err());
+        assert!(crate::deep_io::from_dynamic(source, Some(b"broken-profile")).is_err());
     }
     #[test]
     fn jpeg_uses_selected_matte() {

@@ -294,6 +294,7 @@ impl GpuCanvas {
     pub fn supports(d: &Document) -> bool {
         d.layers.iter().all(|l| {
             l.adjustment.is_none()
+                && l.image.as_ref().is_none_or(|r| r.deep.is_none())
                 && l.effects.is_none()
                 && l.mask_source_id.is_none()
                 && (!l.is_group || l.mask.is_none())

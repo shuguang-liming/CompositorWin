@@ -37,6 +37,8 @@
 | 把素材组合成一张作品 | 图层、蒙版、混合模式，保留可继续编辑的 `.comp` 工程 |
 | 在画面上绘画、标注与排版 | 画笔、选区、文字、形状，以及撤销与重做 |
 | 调整照片的观感 | Camera Raw、调色与滤镜，预览后应用 |
+| 保留细腻渐变与亮部 | 16 位 PNG/TIFF、HDR/EXR 图层，保存工程后继续编辑 |
+| 交付印刷图片 | 自选 CMYK ICC、软打样、色域警告，导出 CMYK JPEG/TIFF/PDF |
 | 抠出主体，继续修边 | 内置 U²-Netp 离线主体分割，生成可编辑蒙版 |
 | 修改 PDF 页面或合并成册 | 按页转为图片，使用绘图工具修改，再选择页序导出 PDF |
 | 把重复步骤交给 Agent | CLI、JSONL 会话与当前窗口编辑，附操作技能和中文教学技能 |
@@ -50,13 +52,15 @@
 | **便携版** | [下载 ZIP](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.2/Compositor-Windows-0.0.2-x64.zip) · 解压后运行 `compositor.exe` |
 | **源代码** | [查看发布记录](https://github.com/shuguang-liming/CompositorWin/releases) · [构建说明](#开发) |
 
-当前版本为 **0.0.2**。PDF 页面图片化编辑自本版起提供；旧版 0.0.1 不包含此功能。
+当前公开版本为 **0.0.2**。PDF 页面图片化编辑自本版起提供；旧版 0.0.1 不包含此功能。当前分支正在跟进原版 1.5.3：本文的高位深、HDR、CMYK、新滤镜与交互改进属于待审 PR，现有 Release 下载尚未替换。详细进展见 [迁移对照](docs/UPSTREAM_1.5.3.md)。
 
 | 格式 | 打开 / 导入 | 保存 / 导出 |
 |:---|:---|:---|
 | `.comp` 工程 | 单文件工程，兼容旧版目录工程 | 单文件，保留图层、蒙版与可编辑文字 |
 | PNG、JPEG、TIFF、BMP、WebP、GIF | 支持 | 合成图像；JPEG 不保留透明，GIF 为单帧 |
-| PSD / PSB | 主要支持 8-bit RGB，复杂内容可能转换或栅格化 | 暂不支持 |
+| PNG / TIFF 16 位 | 保留 16 位原像素 | 可选 8 位或 16 位 |
+| OpenEXR / Radiance HDR | 保留 HDR 亮部，EXR 按线性 sRGB/Rec.709 色度读取 | OpenEXR；自定义 EXR 色度暂未转换 |
+| PSD / PSB | 支持 8-bit RGB / CMYK，复杂内容可能转换或栅格化；缺少有效 CMYK ICC 时提示近似转换 | 暂不支持 |
 | SVG | 栅格化导入 | 暂不支持矢量导出 |
 | PDF | 选择页码与 DPI，每页转为独立图片文档 | 当前页或按指定顺序合并的多页图片型 PDF |
 | 相机 RAW | 取决于相机数据库 | 通过普通图片格式导出处理结果 |
@@ -91,12 +95,16 @@ PDF 编辑与导出需要 0.0.2 及后续包含该功能的程序。如果菜单
 2. 在图层面板选择图层或蒙版，再用工具栏编辑。选区工具的 `Shift` 添加选区，`Alt` 减去选区。
 3. `Ctrl+Z` 撤销，`Ctrl+Shift+Z` 重做；滤镜预览通过“应用”提交，也可以取消。
 4. `Ctrl+S` 保存，`Ctrl+Shift+S` 另存为。`.comp` 是单个工程文件，内含图层、蒙版、可编辑文字与图片，分享或备份只需复制这一个文件。旧版文件夹工程仍可打开，保存时会另存为单文件，默认建议“原名-单文件.comp”。
-5. 在“文件”菜单导出 PNG、JPEG、TIFF，或通过“导出其他格式…”选择 BMP、WebP、GIF，得到合成图像；JPEG 不保留透明背景。
+5. 选择“文件 → 导出…（格式／尺寸／位深）”，选择 PNG、JPEG、TIFF、BMP、WebP、GIF、PDF 或 OpenEXR。可以调整输出尺寸；PNG/TIFF 可选 16 位，EXR 保留 HDR。JPEG 不保留透明背景。导出尺寸只影响成品，编辑工程保持原尺寸。
 6. 右上角“切换日间／切换夜间”按钮切换界面明暗；旁边的“主题”菜单可选择“跟随系统／日间模式／夜间模式”。默认跟随 Windows 应用主题，系统设置变化时自动更新，手动选择会保存。主题只影响界面，不改变图片和导出颜色。
 
 界面开启和关闭时有短暂淡入、淡出，工具按钮和标签切换也有过渡。关闭前仍会确认未保存的工程；在 Windows“辅助功能 → 视觉效果”中关闭“动画效果”时，这些过渡会立即完成。大图计算在后台执行，空闲时按事件重绘。
 
-导入支持 PNG、JPEG、TIFF、BMP、GIF、WebP、SVG、受支持的相机 RAW、PSD/PSB 和 HEIC/HEIF。PSD/PSB 主要支持 8-bit RGB 导入，复杂内容可能转换或栅格化，打开时显示转换报告；当前没有 PSD/PSB 导出。HEIC/HEIF 依赖兼容的 Windows 编解码器，部分图片需要 HEVC。RAW 支持范围取决于相机数据库。
+导入支持 PNG、JPEG、TIFF、BMP、GIF、WebP、SVG、OpenEXR、Radiance HDR、受支持的相机 RAW、PSD/PSB 和 HEIC/HEIF。可以导入普通图片文件夹，按自然文件名顺序读取直接子文件，不递归子目录。PSD/PSB 支持 8 位 RGB／CMYK，复杂内容可能转换或栅格化，打开时显示转换报告；缺少有效 CMYK ICC 时会提示颜色采用近似转换。当前没有 PSD/PSB 导出。HEIC/HEIF 依赖兼容的 Windows 编解码器，部分图片需要 HEVC。RAW 支持范围取决于相机数据库，正式导入保留 16 位颜色。
+
+16 位 PNG/TIFF 和 HDR 图层保留高精度原像素；图层菜单可转换 8 位、16 位或 HDR。转为 8 位会减少颜色精度并裁切超白亮部，可以撤销。EXR 按线性 sRGB/Rec.709 色度读取，自定义 EXR 色度暂未转换；带 ICC 且颜色超出 0–1 的浮点图像会明确提示转换限制。显示器预览为普通动态范围，高精度合成目前在 CPU 后台进行。
+
+印刷输出前在“视图”选择印刷厂提供的 CMYK ICC 配置，再按需打开软打样或色域警告；导出窗口选择 JPEG、TIFF 或 PDF 后勾选 CMYK。透明区域铺白，文件内嵌所选配置。这是图片型印刷输出，不是 PDF/X。RAW 打开时可调整传感器降噪和高光恢复，并记住上次设置；当前 RAW 解码器未提供镜头配置，自动镜头校正入口保持禁用。
 
 主体选择与移除背景使用内嵌 U²-Netp 离线模型，通过可编辑蒙版保留原始像素。细发丝、毛发、半透明对象和复杂主体可能需要手工修正。界面参考原 macOS 项目；字体、RAW、主体分割与部分视觉效果存在平台差异。大图及多图层受可用内存限制，请及时保存。
 
@@ -108,7 +116,7 @@ PDF 编辑与导出需要 0.0.2 及后续包含该功能的程序。如果菜单
 2. 选择清晰度：默认 **300 DPI**，还可选择 72、150 或 600 DPI。日常查看可用 150 DPI，需要文字与细线细节可用 300 DPI；较高 DPI 和更多页面会占用更多内存，页面过大时降低 DPI 或分批打开。
 3. 点击“打开页面”。每页成为一个独立标签页，可以用画笔、文字、形状、图层和蒙版修改。要把一页叠到现有画布上，使用“文件 → 导入为图层…”，每次选择一页。
 4. 按 `Ctrl+S` 将需要继续编辑的页面分别保存为 `.comp` 工程。保存工程不会写回原 PDF，也不会自动把所有标签页存进一个工程。
-5. 选择“文件 → 导出 PDF（可合并多页）…”，勾选要输出的已打开画布，用“上移／下移”调整顺序，再选择保存位置。既可导出一页，也可把多页或普通图片画布合成一个 PDF；只导出当前页时也可在“导出其他格式…”中选择 PDF。
+5. 选择“文件 → 导出 PDF（可合并多页）…”，勾选要输出的已打开画布，用“上移／下移”调整顺序，再选择保存位置。既可导出一页，也可把多页或普通图片画布合成一个 PDF；只导出当前页时也可在“导出…（格式／尺寸／位深）”中选择 PDF。
 
 导出为**图片型 PDF**，透明区域使用白色背景。原页面的可见内容转为像素；原有文字、矢量、链接、表单与数字签名结构不保留，导出后不再具有原 PDF 的文字搜索、链接或表单功能。新增文字可以在 `.comp` 工程中继续编辑，导出 PDF 时合并为页面图片。需要保留原件时，请使用新的导出文件名。
 
@@ -289,7 +297,7 @@ Python 仅用于这个调用示例，其他语言也可直接启动进程。控�
 - “教我用图层蒙版和 Camera Raw 做一张照片。”
 - “我只想学习操作，不要替我修改文件。”
 
-`Ctrl+S` 只保存可继续编辑的 `.comp` 工程；需要图片成品时使用 `文件 → 导出 PNG…`、`文件 → 导出 JPEG…`、`文件 → 导出 TIFF…` 或 `文件 → 导出其他格式…`。PNG、TIFF、BMP、WebP 可用于透明或高质量流程，JPEG 不保留透明，GIF 是单帧导出并受调色板限制。技能文档会以当前版本菜单实际列出的格式为准；如果后续版本增加格式，按导出菜单中的选项选择即可。
+`Ctrl+S` 只保存可继续编辑的 `.comp` 工程；需要图片成品时使用 `文件 → 导出…（格式／尺寸／位深）`，原有 PNG/JPEG/TIFF 快捷入口也保留。PNG/TIFF 支持 16 位，OpenEXR 保存 HDR；JPEG 不保留透明，GIF 是单帧导出并受调色板限制。CLI 的 JSONL `export` 方法可传 `bitDepth:16` 或 `cmykProfile`；一次性导出对应 `--bit-depth 16`、`--cmyk-profile <ICC路径>`。能力与参数以当前程序 `cli capabilities` 返回值为准。
 
 <details>
 <summary><strong>展开此前 1.0.x 版本的更新记录</strong></summary>
@@ -341,7 +349,11 @@ New-Item -ItemType Directory -Force build/validation/current | Out-Null
 
 `All` 依次运行 fmt、所有目标 check、严格 Clippy、测试和 Release 构建；EXE 在 `build/rust/release/compositor.exe`。也可以直接运行 `cargo check --locked --all-targets` 或 `cargo test --locked`。低内存机器使用 `-j 1` 限制编译并发。
 
+开发和测试配置默认关闭增量编译缓存，避免频繁切换构建累积大量磁盘占用。统一入口的全部实际子命令（含打包、运行库审计和许可证生成）将编译输出及进程级 `TEMP`／`TMP` 放在项目的 `build/` 下；将工程放在 D 盘即可让这些文件留在 D 盘，不修改 Windows 全局临时目录。直接运行 Cargo 时需自行设置临时目录。Rust 工具链和依赖缓存的位置分别由 `RUSTUP_HOME`、`CARGO_HOME` 决定。
+
 所有开发脚本已合并为根目录的 `project.ps1`，运行 `.\project.ps1 Help` 查看命令。`Build` 的 Release、All 和 Package 构建只为 Release 临时追加 `-C target-feature=+crt-static`，随后恢复原编译环境；check/test 使用原有参数与缓存。若直接调用 Cargo，需自行保留已有编译参数并追加静态 CRT 配置，再运行 `cargo build --locked --release --bin compositor`；发行前的运行库审计会拒绝直接或延迟依赖外部 CRT DLL 的 EXE。
+
+`vendor/wgpu-hal` 固定为 crates.io 的 27.0.4（归档 SHA256：`5b21cb61c57ee198bc4aff71aeadff4cbb80b927beb912506af9c780d64313ce`，上游提交 `af91efa93da2af9366b252ed7b9a089175f4874e`）。仅修正 DX12 的 tearing 能力判断：查询成功后仍须检查返回的 BOOL，驱动报告不支持时不向交换链传入该标志。Cargo 通过根目录 `[patch.crates-io]` 使用这份源码，不修改全局依赖缓存；原始 Apache/MIT 许可随源码保留，完整版权原文也已收录于根目录 `LICENSES.md`。该补丁不增加运行时文件，也不改变软件版本。微软接口要求见[Variable refresh rate displays](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/variable-refresh-rate-displays)。
 
 完成新 EXE 的实际 GUI 检查后，审计并打包到新名称：
 
@@ -369,7 +381,7 @@ Windows EXE 的图标和版本资源由 `build.rs` 调用 Windows SDK 的 `rc.ex
 | 编译缓存、临时文件与验证记录 | `build/`，不提交 Git |
 | 安装包与便携发行包 | `dist/`，不提交 Git |
 
-`.comp` 默认写入单文件容器 v1，内嵌清单仍为版本 11；兼容读取旧目录包版本 1–11。原 macOS 程序不直接读取 Windows 单文件容器。字段语义与 Agent 写入规则见 [PROJECT_FORMAT.md](docs/PROJECT_FORMAT.md)。原 macOS 工程仅供参考，普通构建和测试不编译或调用原 Swift/C 应用。可选 C oracle 重新生成工具需要显式指定原工程；测试使用已保存的参考数据。
+`.comp` 默认写入单文件容器 v1；普通工程使用清单 11，16 位像素使用 12，HDR 使用 13，启用形状平滑圆角时使用 14。可读清单 1–14 与原 macOS 目录包，保存时保留高位深资产；旧目录包需另存成单文件。原 macOS 程序不直接读取 Windows 单文件容器。字段语义与 Agent 写入规则见 [PROJECT_FORMAT.md](docs/PROJECT_FORMAT.md)，迁移状态与平台差异见 [原版 1.5.3 对照](docs/UPSTREAM_1.5.3.md)。原 macOS 工程仅供参考，普通构建和测试不编译或调用原 Swift/C 应用。可选 C oracle 重新生成工具需要显式指定原工程；测试使用已保存的参考数据。
 
 ## 模型开发
 

@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 pub(super) struct WarpSample {
     pub diameter: f64,
-    sampler: crate::render::LayerSampler,
+    sampler: Option<crate::render::LayerSampler>,
+    deep_source: Option<Arc<Raster>>,
     transform: Transform,
     working: Raster,
     hardness: f32,
@@ -15,6 +16,7 @@ pub(super) struct WarpSample {
     last: Option<[f64; 2]>,
     carried: Vec<[f32; 4]>,
     scratch: Vec<[u8; 4]>,
+    deep_scratch: Vec<[f32; 4]>,
 }
 impl WarpSample {
     pub fn new(
@@ -23,17 +25,29 @@ impl WarpSample {
         canvas: [u32; 2],
         settings: BrushSettings,
     ) -> Self {
+        let mut working = Raster::blank(canvas[0], canvas[1]);
+        if let Some(deep) = &source.deep {
+            // Internal working pixels are associated. Sparse tiles retain the source depth;
+            // projection back to the layer restores straight alpha.
+            working.deep = Some(Arc::new(crate::deep_pixels::DeepRaster::blank(
+                canvas[0], canvas[1], deep.depth,
+            )));
+        }
         Self {
             diameter: settings.diameter.max(2.),
-            sampler: crate::render::LayerSampler::new(&source, transform.sampling, transform.size),
+            sampler: source.deep.is_none().then(|| {
+                crate::render::LayerSampler::new(&source, transform.sampling, transform.size)
+            }),
+            deep_source: source.deep.as_ref().map(|_| source.clone()),
             transform,
-            working: Raster::blank(canvas[0], canvas[1]),
+            working,
             hardness: settings.hardness.clamp(0., 0.98) as f32,
             strength: settings.opacity.clamp(0.01, 1.) as f32,
             mode: settings.mode,
             last: None,
             carried: vec![],
             scratch: vec![],
+            deep_scratch: vec![],
         }
     }
     // Only tiles reached by a dab are projected. The immutable source is shared with history.
@@ -56,7 +70,19 @@ impl WarpSample {
                         let uv = self
                             .transform
                             .from_document([x as f64 + 0.5, y as f64 + 0.5]);
-                        let p = self.sampler.sample(uv);
+                        let p = if let Some(source) = &self.deep_source {
+                            let p = source.sample_f32(
+                                uv[0] * source.width as f64 - 0.5,
+                                uv[1] * source.height as f64 - 0.5,
+                                self.transform.sampling,
+                            );
+                            [p[0] * p[3], p[1] * p[3], p[2] * p[3], p[3]].map(f64::from)
+                        } else {
+                            self.sampler.as_ref().unwrap().sample(uv)
+                        };
+                        if self.deep_source.is_some() {
+                            self.working.set_f32(x, y, p.map(|v| v as f32));
+                        }
                         let i = (((y % TILE_SIZE) * TILE_SIZE + x % TILE_SIZE) * 4) as usize;
                         for c in 0..4 {
                             pixels[i + c] = (p[c] * 255.).round().clamp(0., 255.) as u8;
@@ -132,8 +158,8 @@ impl WarpSample {
         self.carried = vec![[0.; 4]; (side * side) as usize];
         for dy in -r..=r {
             for dx in -r..=r {
-                let p = self.get(cx + dx, cy + dy);
-                self.carried[((dy + r) * side + dx + r) as usize] = p.map(|v| v as f32);
+                self.carried[((dy + r) * side + dx + r) as usize] =
+                    self.get_working(cx + dx, cy + dy);
             }
         }
     }
@@ -142,6 +168,23 @@ impl WarpSample {
             [0; 4]
         } else {
             self.working.get(x as u32, y as u32)
+        }
+    }
+    fn get_working(&self, x: i64, y: i64) -> [f32; 4] {
+        if x < 0 || y < 0 {
+            [0.; 4]
+        } else if self.deep_source.is_some() {
+            self.working.get_f32(x as u32, y as u32).map(|v| v * 255.)
+        } else {
+            self.get(x, y).map(f32::from)
+        }
+    }
+    fn put_working(&mut self, x: u32, y: u32, pixel: [f32; 4]) {
+        if self.deep_source.is_some() {
+            self.working.set_f32(x, y, pixel.map(|v| v / 255.));
+        } else {
+            self.working
+                .set(x, y, pixel.map(|v| v.round().clamp(0., 255.) as u8));
         }
     }
     fn smudge(&mut self, center: [f64; 2]) {
@@ -166,14 +209,14 @@ impl WarpSample {
                 if weight <= 0. {
                     continue;
                 }
-                let under = self.get(x, y);
+                let under = self.get_working(x, y);
                 let tip = &mut self.carried[((dy + r) * side + dx + r) as usize];
-                let mut out = [0; 4];
+                let mut out = [0.; 4];
                 for c in 0..4 {
-                    tip[c] = under[c] as f32 + (tip[c] - under[c] as f32) * weight;
-                    out[c] = tip[c].round().clamp(0., 255.) as u8;
+                    tip[c] = under[c] + (tip[c] - under[c]) * weight;
+                    out[c] = tip[c];
                 }
-                self.working.set(x as u32, y as u32, out);
+                self.put_working(x as u32, y as u32, out);
             }
         }
     }
@@ -199,10 +242,20 @@ impl WarpSample {
         if cw < 2 || ch < 2 {
             return;
         }
-        self.scratch.resize(cw * ch, [0; 4]);
+        let deep = self.deep_source.is_some();
+        if deep {
+            self.deep_scratch.resize(cw * ch, [0.; 4]);
+        } else {
+            self.scratch.resize(cw * ch, [0; 4]);
+        }
         for y in 0..ch {
             for x in 0..cw {
-                self.scratch[y * cw + x] = self.get(left + x as i64, top + y as i64);
+                if deep {
+                    self.deep_scratch[y * cw + x] =
+                        self.get_working(left + x as i64, top + y as i64);
+                } else {
+                    self.scratch[y * cw + x] = self.get(left + x as i64, top + y as i64);
+                }
             }
         }
         let inv_r = 1. / (self.diameter / 2.) as f32;
@@ -222,21 +275,28 @@ impl WarpSample {
                 let iy = (sy as usize).min(ch - 2);
                 let fx = sx - ix as f32;
                 let fy = sy - iy as f32;
-                let p00 = self.scratch[iy * cw + ix];
-                let p10 = self.scratch[iy * cw + ix + 1];
-                let p01 = self.scratch[(iy + 1) * cw + ix];
-                let p11 = self.scratch[(iy + 1) * cw + ix + 1];
-                let mut out = [0; 4];
+                let pixel = |at: usize| {
+                    if deep {
+                        self.deep_scratch[at]
+                    } else {
+                        self.scratch[at].map(f32::from)
+                    }
+                };
+                let p00 = pixel(iy * cw + ix);
+                let p10 = pixel(iy * cw + ix + 1);
+                let p01 = pixel((iy + 1) * cw + ix);
+                let p11 = pixel((iy + 1) * cw + ix + 1);
+                let mut out = [0.; 4];
                 for c in 0..4 {
-                    let a = p00[c] as f32 + (p10[c] as f32 - p00[c] as f32) * fx;
-                    let b = p01[c] as f32 + (p11[c] as f32 - p01[c] as f32) * fx;
-                    out[c] = (a + (b - a) * fy).round().clamp(0., 255.) as u8;
+                    let a = p00[c] + (p10[c] - p00[c]) * fx;
+                    let b = p01[c] + (p11[c] - p01[c]) * fx;
+                    out[c] = a + (b - a) * fy;
                 }
-                self.working.set(x as u32, y as u32, out);
+                self.put_working(x as u32, y as u32, out);
             }
         }
     }
-    pub fn sample(&mut self, point: [f64; 2]) -> [u8; 4] {
+    fn premultiplied(&mut self, point: [f64; 2]) -> [f64; 4] {
         let x = point[0] - 0.5;
         let y = point[1] - 0.5;
         let ix = x.floor() as i64;
@@ -245,10 +305,10 @@ impl WarpSample {
         let fx = x - x.floor();
         let fy = y - y.floor();
         let corners = [
-            (self.get(ix, iy), (1. - fx) * (1. - fy)),
-            (self.get(ix + 1, iy), fx * (1. - fy)),
-            (self.get(ix, iy + 1), (1. - fx) * fy),
-            (self.get(ix + 1, iy + 1), fx * fy),
+            (self.get_working(ix, iy), (1. - fx) * (1. - fy)),
+            (self.get_working(ix + 1, iy), fx * (1. - fy)),
+            (self.get_working(ix, iy + 1), (1. - fx) * fy),
+            (self.get_working(ix + 1, iy + 1), fx * fy),
         ];
         let mut sums = [0.; 4];
         for (p, w) in corners {
@@ -256,6 +316,10 @@ impl WarpSample {
                 sums[c] += p[c] as f64 * w;
             }
         }
+        sums
+    }
+    pub fn sample(&mut self, point: [f64; 2]) -> [u8; 4] {
+        let sums = self.premultiplied(point);
         if sums[3] <= 0. {
             return [0; 4];
         }
@@ -264,6 +328,18 @@ impl WarpSample {
             (sums[1] * 255. / sums[3]).round().clamp(0., 255.) as u8,
             (sums[2] * 255. / sums[3]).round().clamp(0., 255.) as u8,
             sums[3].round().clamp(0., 255.) as u8,
+        ]
+    }
+    pub fn sample_f32(&mut self, point: [f64; 2]) -> [f32; 4] {
+        let sums = self.premultiplied(point);
+        if sums[3] <= 0. {
+            return [0.; 4];
+        }
+        [
+            (sums[0] / sums[3]) as f32,
+            (sums[1] / sums[3]) as f32,
+            (sums[2] / sums[3]) as f32,
+            (sums[3] / 255.).clamp(0., 1.) as f32,
         ]
     }
 }

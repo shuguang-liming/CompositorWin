@@ -25,7 +25,7 @@ pub(super) enum ImportTask {
     RawPreview {
         path: PathBuf,
         settings: image_io::RawDevelopSettings,
-        key: [u32; 4],
+        key: [u32; 7],
     },
     RawImport {
         path: PathBuf,
@@ -110,6 +110,9 @@ impl ImportTask {
 #[derive(Default)]
 pub(super) struct ImportQueue {
     sender: Option<mpsc::Sender<ImportTask>>,
+    completed: Option<mpsc::Sender<()>>,
+    #[cfg(test)]
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ImportQueue {
@@ -120,8 +123,9 @@ impl ImportQueue {
     ) -> Result<(), String> {
         if self.sender.is_none() {
             let (sender, receiver) = mpsc::channel::<ImportTask>();
+            let (completed, completion) = mpsc::channel::<()>();
             let replies = replies.clone();
-            std::thread::Builder::new()
+            let worker = std::thread::Builder::new()
                 .name("image-import".to_owned())
                 // PSD metadata and third-party codecs need more stack than
                 // the default Windows thread, especially on older drivers.
@@ -131,18 +135,42 @@ impl ImportQueue {
                         if replies.send(task.execute()).is_err() {
                             break;
                         }
+                        // The next codec must not allocate while the GUI still
+                        // owns an unchecked result in its event channel.
+                        if completion.recv().is_err() {
+                            break;
+                        }
                     }
                 })
                 .map_err(|error| format!("启动图像导入线程失败：{error}"))?;
             self.sender = Some(sender);
+            self.completed = Some(completed);
+            #[cfg(test)]
+            {
+                self.worker = Some(worker);
+            }
+            #[cfg(not(test))]
+            drop(worker);
         }
         let sender = self.sender.as_ref().expect("The import worker was started");
         if sender.send(task).is_err() {
             // A later request can create a new worker instead of leaving the
             // application permanently stuck with a disconnected sender.
             self.sender = None;
+            self.completed = None;
             return Err("图像导入线程已停止，请重新打开文件".to_owned());
         }
         Ok(())
+    }
+
+    pub(super) fn complete(&self) {
+        if let Some(completed) = &self.completed {
+            let _ = completed.send(());
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_worker_handle(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.worker.take()
     }
 }

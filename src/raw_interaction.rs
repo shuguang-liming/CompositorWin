@@ -106,27 +106,15 @@ fn raw_mut(settings: &mut Value) -> &mut Value {
     }
 }
 
-/// Neutralize the original pixel by inverting the renderer's linear-light temperature/tint gains.
+/// Neutralize the original pixel using the renderer's measured temperature/tint tables.
 /// Missing channels have no solution and leave the settings untouched.
 pub fn pick_white_balance(settings: &mut Value, sample: ColorSample) -> bool {
-    let [red, green, blue] = sample.rgb.map(|v| filters::srgb_to_linear(v as f64 / 255.));
-    if red <= 1e-4 || green <= 1e-4 || blue <= 1e-4 {
+    let Some([temperature, tint]) =
+        filters::neutralize_camera_raw_color(sample.rgb.map(|v| v as f64 / 255.))
+    else {
         return false;
-    }
-    let (a1, b1, c1) = (0.35 * red, 0.15 * red + 0.30 * green, green - red);
-    let (a2, b2, c2) = (-0.35 * blue, 0.15 * blue + 0.30 * green, green - blue);
-    let determinant = a1 * b2 - a2 * b1;
-    if determinant.abs() <= 1e-8 {
-        return false;
-    }
-    let temperature = (c1 * b2 - c2 * b1) / determinant * 100.;
-    let tint = (a1 * c2 - a2 * c1) / determinant * 100.;
-    if !temperature.is_finite() || !tint.is_finite() {
-        return false;
-    }
+    };
     let raw = raw_mut(settings);
-    let temperature = temperature.clamp(-100., 100.);
-    let tint = tint.clamp(-100., 100.);
     let changed = filters::number(raw, "temperature", 0.) != temperature
         || filters::number(raw, "tint", 0.) != tint
         || filters::string(raw, "whiteBalance", "Custom") != "Custom";
@@ -513,27 +501,44 @@ mod tests {
 
     #[test]
     fn white_balance_pick_neutralizes_real_rendered_channels_and_rejects_missing_channels() {
+        for color in [
+            [150, 140, 130, 255],
+            [130, 140, 150, 255],
+            [140, 150, 140, 255],
+        ] {
+            let mut settings =
+                json!({"cameraRaw":filters::camera_raw_defaults(),"kind":"Camera Raw Filter"});
+            settings["cameraRaw"]["whiteBalance"] = json!("Auto");
+            let source = Raster::solid(1, 1, color);
+            let sample = ColorSample::from_rgba(color).unwrap();
+            assert!(pick_white_balance(&mut settings, sample));
+            assert_eq!(settings["cameraRaw"]["whiteBalance"], "Custom");
+            let p = filters::apply_filter(&source, "Camera Raw Filter", &settings)
+                .unwrap()
+                .get(0, 0);
+            assert!(
+                p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() <= 1,
+                "{color:?} -> {p:?}"
+            );
+            assert_eq!(p[3], 255);
+            for key in ["temperature", "tint"] {
+                assert!((-100. ..=100.).contains(&settings["cameraRaw"][key].as_f64().unwrap()));
+            }
+            let balanced = settings.clone();
+            assert!(!pick_white_balance(&mut settings, sample));
+            assert_eq!(settings, balanced);
+        }
         let mut settings =
             json!({"cameraRaw":filters::camera_raw_defaults(),"kind":"Camera Raw Filter"});
-        settings["cameraRaw"]["whiteBalance"] = json!("Auto");
-        let source = Raster::solid(1, 1, [150, 140, 130, 255]);
-        let sample = ColorSample::from_rgba(source.get(0, 0)).unwrap();
-        assert!(pick_white_balance(&mut settings, sample));
-        assert_eq!(settings["cameraRaw"]["whiteBalance"], "Custom");
-        let p = filters::apply_filter(&source, "Camera Raw Filter", &settings)
-            .unwrap()
-            .get(0, 0);
-        assert!(
-            p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap() <= 1,
-            "{p:?}"
-        );
-        assert_eq!(p[3], 255);
-        assert!(!pick_white_balance(&mut settings, sample));
         let before = settings.clone();
-        assert!(!pick_white_balance(
-            &mut settings,
-            ColorSample::from_rgba([0, 100, 100, 255]).unwrap()
-        ));
+        for color in [[0, 100, 100, 255], [100, 0, 100, 255], [100, 100, 0, 255]] {
+            assert!(!pick_white_balance(
+                &mut settings,
+                ColorSample::from_rgba(color).unwrap()
+            ));
+            assert_eq!(settings, before);
+        }
+        assert!(ColorSample::from_rgba([100, 120, 140, 0]).is_none());
         assert_eq!(settings, before);
         assert!(pick_white_balance(
             &mut settings,

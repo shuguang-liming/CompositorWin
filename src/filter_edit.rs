@@ -9,6 +9,89 @@ use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn progressive_point(value: &Value) -> Option<[f64; 2]> {
+    let coordinate = |i| {
+        value
+            .get(i)
+            .or_else(|| value.get(["x", "y"][i]))
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+    };
+    Some([coordinate(0)?, coordinate(1)?])
+}
+
+/// Endpoints are document coordinates so previews, rotated layers and canvas gestures agree.
+pub fn progressive_line(
+    doc: &Document,
+    id: Uuid,
+    mask: bool,
+    settings: &Value,
+) -> Option<[[f64; 2]; 2]> {
+    let layer = doc.layer(id)?;
+    let placed = if mask {
+        layer.mask.as_ref()?.placement.unwrap_or(layer.transform)
+    } else {
+        layer.transform
+    };
+    if !placed.is_valid() {
+        return None;
+    }
+    let corners = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]].map(|uv| placed.to_document(uv));
+    let mut bounds = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for point in corners {
+        bounds[0] = bounds[0].min(point[0]);
+        bounds[1] = bounds[1].min(point[1]);
+        bounds[2] = bounds[2].max(point[0]);
+        bounds[3] = bounds[3].max(point[1]);
+    }
+    let visible = [
+        bounds[0].max(0.),
+        bounds[1].max(0.),
+        bounds[2].min(doc.width as f64),
+        bounds[3].min(doc.height as f64),
+    ];
+    if visible[2] > visible[0] && visible[3] > visible[1] {
+        bounds = visible;
+    }
+    let x = (bounds[0] + bounds[2]) / 2.;
+    Some([
+        progressive_point(&settings["progressiveStart"])
+            .unwrap_or([x, bounds[1] + (bounds[3] - bounds[1]) * 0.35]),
+        progressive_point(&settings["progressiveEnd"]).unwrap_or([x, bounds[3]]),
+    ])
+}
+
+/// Set a new dialog's line on the visible portion of its layer without moving an existing line.
+pub fn initialize_progressive_line(
+    doc: &Document,
+    id: Uuid,
+    mask: bool,
+    settings: &mut Value,
+) -> bool {
+    let Some(points) = progressive_line(doc, id, mask, settings) else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, point) in ["progressiveStart", "progressiveEnd"]
+        .into_iter()
+        .zip(points)
+    {
+        if progressive_point(&settings[key]).is_none() {
+            if !settings.is_object() {
+                *settings = serde_json::json!({});
+            }
+            settings[key] = serde_json::json!({"x":point[0],"y":point[1]});
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Applies one filter without recording history. Failed and unselected operations leave the document intact.
 pub fn apply(doc: &mut Document, id: Uuid, mask: bool, kind: &str, settings: &Value) -> Result<()> {
     let original = doc
@@ -43,6 +126,9 @@ pub fn apply(doc: &mut Document, id: Uuid, mask: bool, kind: &str, settings: &Va
             ) <= 0.)
         || (kind == "Gaussian Blur" && filters::number(&settings, "blurRadius", 10.) <= 0.01)
         || (kind == "Motion Blur" && filters::number(&settings, "motionDistance", 10.) <= 0.)
+        || (kind == "Progressive Blur"
+            && filters::number(&settings, "progressiveFrom", 0.) <= 0.01
+            && filters::number(&settings, "progressiveTo", 20.) <= 0.01)
     {
         return Ok(());
     }
@@ -114,6 +200,20 @@ pub fn apply(doc: &mut Document, id: Uuid, mask: bool, kind: &str, settings: &Va
             );
         }
     }
+    if kind == "Progressive Blur" {
+        let points = progressive_line(doc, id, mask, &settings)
+            .ok_or_else(|| anyhow::anyhow!("渐进模糊图层坐标无效"))?;
+        for (key, point) in ["_progressiveStartPixels", "_progressiveEndPixels"]
+            .into_iter()
+            .zip(points)
+        {
+            let uv = placed.from_document(point);
+            settings[key] = serde_json::json!([
+                uv[0] * prepared.width as f64,
+                uv[1] * prepared.height as f64
+            ]);
+        }
+    }
     let mut output = if fills_clear {
         empty_vignette(&prepared, placed, doc, &settings)
     } else if kind == "Bloom / Glow" {
@@ -177,6 +277,13 @@ fn blur_margin(kind: &str, settings: &mut Value) -> u32 {
             .clamp(0., 2000.);
             settings["motionDistance"] = distance.into();
             distance / 2. + 2.
+        }
+        "Progressive Blur" => {
+            let from = filters::number(settings, "progressiveFrom", 0.).clamp(0., 250.);
+            let to = filters::number(settings, "progressiveTo", 20.).clamp(0., 250.);
+            settings["progressiveFrom"] = from.into();
+            settings["progressiveTo"] = to.into();
+            from.max(to) * 3. + 2.
         }
         "Bloom / Glow" => {
             let radius = filters::number(settings, "bloomRadius", 24.).clamp(0., 150.);
@@ -261,6 +368,12 @@ fn grow(source: &Raster, placed: Transform, bounds: [i64; 4]) -> Result<(Raster,
     if bounds == [0, 0, source.width as i64, source.height as i64] {
         return Ok((source.clone(), placed));
     }
+    if let Some(deep) = &source.deep {
+        return Ok((
+            Raster::from_deep(deep.padded(width as u32, height as u32, left, top)),
+            result,
+        ));
+    }
     if source.pixels.is_empty() && source.tiles.is_empty() {
         return Ok((Raster::blank(width as u32, height as u32), result));
     }
@@ -281,10 +394,15 @@ fn grow(source: &Raster, placed: Transform, bounds: [i64; 4]) -> Result<(Raster,
 fn trim(image: Raster, placed: Transform) -> Result<(Raster, Transform)> {
     let width = image.width;
     let height = image.height;
-    let data = Arc::unwrap_or_clone(image.pixels);
+    let deep = image.deep.clone();
+    let data = image.to_rgba();
     let mut bounds = [width, height, 0, 0];
     for (i, pixel) in data.as_chunks::<4>().0.iter().enumerate() {
-        if pixel[3] > 0 {
+        if pixel[3] > 0
+            || deep
+                .as_ref()
+                .is_some_and(|d| d.get(i as u32 % width, i as u32 / width)[3] > 0.)
+        {
             let x = i as u32 % width;
             let y = i as u32 / width;
             bounds[0] = bounds[0].min(x);
@@ -294,10 +412,16 @@ fn trim(image: Raster, placed: Transform) -> Result<(Raster, Transform)> {
         }
     }
     if bounds[2] == 0 || bounds == [0, 0, width, height] {
-        return Ok((Raster::from_rgba(width, height, data), placed));
+        return Ok((image, placed));
     }
     let output_width = bounds[2] - bounds[0];
     let output_height = bounds[3] - bounds[1];
+    if let Some(deep) = deep {
+        return Ok((
+            Raster::from_deep(deep.crop(bounds[0], bounds[1], output_width, output_height)),
+            grid_transform(placed, width, height, bounds.map(i64::from))?,
+        ));
+    }
     let mut cropped = Vec::with_capacity(output_width as usize * output_height as usize * 4);
     for y in bounds[1]..bounds[3] {
         let row = (y as usize * width as usize + bounds[0] as usize) * 4;
@@ -317,6 +441,52 @@ fn blend_selected(
     canvas_width: u32,
     canvas_height: u32,
 ) -> bool {
+    if let Some(deep) = output.deep.as_ref().or(original.deep.as_ref()) {
+        let depth = deep.depth;
+        let mut result = crate::deep_pixels::DeepRaster::blank(output.width, output.height, depth);
+        let mut changed = false;
+        for y in 0..output.height {
+            for x in 0..output.width {
+                let point = placed.to_document([
+                    (x as f64 + 0.5) / output.width as f64,
+                    (y as f64 + 0.5) / output.height as f64,
+                ]);
+                let amount = if point[0] >= 0.
+                    && point[1] >= 0.
+                    && point[0] < canvas_width as f64
+                    && point[1] < canvas_height as f64
+                {
+                    selection.get(point[0].floor() as u32, point[1].floor() as u32) as f32 / 255.
+                } else {
+                    0.
+                };
+                let a = original.get_f32(x, y);
+                let b = output.get_f32(x, y);
+                if amount == 0. {
+                    if let Some(d) = &original.deep {
+                        result.set_bits(x, y, d.get_bits(x, y));
+                    } else {
+                        result.set(x, y, a);
+                    }
+                    continue;
+                }
+                let alpha = a[3] * (1. - amount) + b[3] * amount;
+                let out = std::array::from_fn(|c| {
+                    if c == 3 {
+                        alpha
+                    } else if alpha > 0. {
+                        (a[c] * a[3] * (1. - amount) + b[c] * b[3] * amount) / alpha
+                    } else {
+                        0.
+                    }
+                });
+                result.set(x, y, out);
+                changed |= out != a;
+            }
+        }
+        *output = Raster::from_deep(result);
+        return changed;
+    }
     let mut changed = false;
     let width = output.width;
     let height = output.height;
@@ -365,6 +535,18 @@ fn blend_selected(
 
 /// Screen a blurred premultiplied light field over the source, including its visible coverage.
 fn bloom(source: &Raster, settings: &Value) -> Raster {
+    if let Some(deep) = &source.deep {
+        let result = deep
+            .run_8bit(false, |mut p| {
+                pixels::unpremultiply(&mut p);
+                let out = bloom(&Raster::from_rgba(source.width, source.height, p), settings);
+                let mut p = out.to_rgba();
+                pixels::premultiply(&mut p);
+                Ok(p)
+            })
+            .expect("bloom retains image dimensions");
+        return Raster::from_deep(result);
+    }
     let mut pixels = source.to_rgba();
     pixels::premultiply(&mut pixels);
     let mut light = pixels.clone();
@@ -479,6 +661,68 @@ mod tests {
         render,
     };
     use serde_json::json;
+    #[test]
+    fn deep_filter_selection_undo_and_grown_blur_preserve_authoritative_pixels() {
+        let source = Raster::from_deep(
+            crate::deep_pixels::DeepRaster::from_u16(
+                3,
+                1,
+                vec![
+                    30001, 20001, 10001, 65535, 30002, 20002, 10002, 65535, 30003, 20003, 10003,
+                    65535,
+                ],
+            )
+            .unwrap(),
+        );
+        let (mut doc, id) = document(source, [3, 1]);
+        doc.selection = Some(crate::selection::marquee(
+            3,
+            1,
+            [1., 0., 1., 1.],
+            false,
+            false,
+        ));
+        let before = doc.clone();
+        apply(&mut doc, id, false, "Invert", &Value::Null).unwrap();
+        let out = doc
+            .layer(id)
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .deep
+            .as_ref()
+            .unwrap();
+        assert_eq!(out.get_bits(0, 0), [30001, 20001, 10001, 65535]);
+        assert_eq!(out.get_bits(1, 0), [35533, 45533, 55533, 65535]);
+        assert_eq!(out.get_bits(2, 0), [30003, 20003, 10003, 65535]);
+        let mut history = History::default();
+        history.record("Invert", before.clone(), &doc);
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc, before);
+        doc.selection = None;
+        apply(
+            &mut doc,
+            id,
+            false,
+            "Gaussian Blur",
+            &json!({"blurRadius":1.}),
+        )
+        .unwrap();
+        let out = doc.layer(id).unwrap().image.as_ref().unwrap();
+        assert!(out.deep.is_some());
+        assert!(out.width > 3 && out.height > 1);
+        assert!(
+            out.deep
+                .as_ref()
+                .unwrap()
+                .to_bits()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[3] > 0 && p[3] < 65535)
+        );
+    }
 
     fn document(image: Raster, canvas: [u32; 2]) -> (Document, Uuid) {
         let layer = Layer::raster("Filter sample", image);
@@ -500,6 +744,125 @@ mod tests {
             (uv[0] * image.width as f64).floor() as u32,
             (uv[1] * image.height as f64).floor() as u32,
         )
+    }
+
+    #[test]
+    fn progressive_default_line_and_document_mapping_survive_rotation_flip_and_growth() {
+        let (mut doc, id) = document(Raster::solid(40, 20, [255; 4]), [120, 100]);
+        let mut settings = filters::default_settings("Progressive Blur");
+        assert!(initialize_progressive_line(&doc, id, false, &mut settings));
+        assert_eq!(
+            progressive_line(&doc, id, false, &settings),
+            Some([[20., 7.], [20., 20.]])
+        );
+        assert!(!initialize_progressive_line(&doc, id, false, &mut settings));
+        let mut placed = Transform::new(30., 25., 60., 30.);
+        placed.rotation = 37.;
+        placed.flip_x = true;
+        doc.layer_mut(id).unwrap().transform = placed;
+        let points = [[0.2, 0.25], [0.8, 0.9]].map(|uv| placed.to_document(uv));
+        settings["progressiveStart"] = serde_json::json!(points[0]);
+        settings["progressiveEnd"] = serde_json::json!({"x":points[1][0],"y":points[1][1]});
+        let margin = blur_margin("Progressive Blur", &mut settings);
+        assert_eq!(margin, 62);
+        let (prepared, grown) = grow(
+            doc.layer(id).unwrap().image.as_ref().unwrap(),
+            placed,
+            [-62, -62, 102, 82],
+        )
+        .unwrap();
+        let line = progressive_line(&doc, id, false, &settings).unwrap();
+        for (i, point) in line.into_iter().enumerate() {
+            let uv = grown.from_document(point);
+            let expected = [[8. + 62., 5. + 62.], [32. + 62., 18. + 62.]][i];
+            assert!((uv[0] * prepared.width as f64 - expected[0]).abs() < 1e-8);
+            assert!((uv[1] * prepared.height as f64 - expected[1]).abs() < 1e-8);
+        }
+    }
+
+    #[test]
+    fn progressive_apply_handles_selection_padding_and_history_as_one_change() {
+        let mut image = Raster::blank(30, 20);
+        for y in 0..20 {
+            for x in 0..15 {
+                image.set(x, y, [255; 4]);
+            }
+        }
+        let (mut doc, id) = document(image, [100, 80]);
+        doc.layer_mut(id).unwrap().transform = Transform::new(30., 25., 30., 20.);
+        let before = doc.clone();
+        let mut history = History::default();
+        let settings = serde_json::json!({"progressiveTo":3,
+            "progressiveStart":{"x":45,"y":25},"progressiveEnd":{"x":45,"y":45}});
+        apply(&mut doc, id, false, "Progressive Blur", &settings).unwrap();
+        assert!(at(&doc, id, [37.5, 46.5])[3] > 0);
+        assert_eq!(at(&doc, id, [37.5, 25.5]), [255; 4]);
+        assert!(history.record("Progressive Blur", before.clone(), &doc));
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc, before);
+        doc.selection = Some(crate::selection::marquee(
+            100,
+            80,
+            [30., 35., 30., 10.],
+            false,
+            false,
+        ));
+        apply(&mut doc, id, false, "Progressive Blur", &settings).unwrap();
+        assert_eq!(at(&doc, id, [37.5, 30.5]), [255; 4]);
+        assert_eq!(at(&doc, id, [37.5, 46.5]), [0; 4]);
+        assert!(at(&doc, id, [37.5, 44.5])[3] < 255);
+    }
+
+    #[test]
+    fn progressive_zero_is_identity_and_mask_uses_its_independent_document_placement() {
+        let (mut doc, id) = document(Raster::solid(20, 12, [100, 150, 200, 255]), [80, 80]);
+        let before = doc.clone();
+        apply(
+            &mut doc,
+            id,
+            false,
+            "Progressive Blur",
+            &serde_json::json!({"progressiveFrom":0,"progressiveTo":0}),
+        )
+        .unwrap();
+        assert_eq!(doc, before);
+        let mut placed = Transform::new(25., 30., 12., 20.);
+        placed.rotation = 90.;
+        let image = Raster::from_rgba(
+            12,
+            20,
+            (0..240)
+                .flat_map(|i| {
+                    let v = if i % 12 < 6 { 255 } else { 0 };
+                    [v, v, v, 255]
+                })
+                .collect(),
+        );
+        doc.layer_mut(id).unwrap().mask = Some(Mask {
+            raster: Arc::new(image),
+            placement: Some(placed),
+            enabled: true,
+            linked: false,
+        });
+        let start = placed.to_document([0.5, 0.]);
+        let end = placed.to_document([0.5, 1.]);
+        apply(
+            &mut doc,
+            id,
+            true,
+            "Progressive Blur",
+            &serde_json::json!({"progressiveTo":4,
+            "progressiveStart":start,"progressiveEnd":end}),
+        )
+        .unwrap();
+        let mask = doc.layer(id).unwrap().mask.as_ref().unwrap();
+        assert_eq!(mask.placement, Some(placed));
+        assert_eq!([mask.raster.width, mask.raster.height], [12, 20]);
+        assert!(mask.raster.get(5, 19)[0] < mask.raster.get(5, 0)[0]);
+        assert!(Arc::ptr_eq(
+            doc.layer(id).unwrap().image.as_ref().unwrap(),
+            before.layer(id).unwrap().image.as_ref().unwrap()
+        ));
     }
 
     #[test]

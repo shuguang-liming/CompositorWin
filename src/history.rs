@@ -120,6 +120,16 @@ impl History {
                     bytes += t.len();
                 }
             }
+            if let Some(deep) = &r.deep {
+                if seen.insert(Arc::as_ptr(&deep.base) as usize) {
+                    bytes += deep.base.capacity() * 2;
+                }
+                for tile in deep.tiles.values() {
+                    if seen.insert(Arc::as_ptr(tile) as usize) {
+                        bytes += tile.capacity() * 2;
+                    }
+                }
+            }
             bytes
         }
         fn visit(d: &Document, seen: &mut HashSet<usize>) -> usize {
@@ -231,5 +241,49 @@ mod tests {
         Arc::make_mut(d.layers[0].image.as_mut().unwrap()).set(0, 0, [0; 4]);
         h.record("Paint", a, &d);
         assert_eq!(h.retained_bytes(&d), 128 * 128 * 4);
+    }
+    #[test]
+    fn sub_byte_change_is_undoable_and_counts_retained_deep_tiles_once() {
+        let mut doc = Document::new(2, 1);
+        doc.active_mut().unwrap().image = Some(Arc::new(Raster::from_deep(
+            crate::deep_pixels::DeepRaster::from_u16(
+                2,
+                1,
+                vec![30001, 30001, 30001, 65535, 30002, 30002, 30002, 65535],
+            )
+            .unwrap(),
+        )));
+        let before = doc.clone();
+        let mut history = History::default();
+        Arc::make_mut(doc.active_mut().unwrap().image.as_mut().unwrap()).set_f32(
+            0,
+            0,
+            [30002f32 / 65535., 30002f32 / 65535., 30002f32 / 65535., 1.],
+        );
+        history.record("Precision", before.clone(), &doc);
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc, before);
+        assert!(history.redo(&mut doc));
+        assert_eq!(
+            doc.active()
+                .unwrap()
+                .image
+                .as_ref()
+                .unwrap()
+                .deep
+                .as_ref()
+                .unwrap()
+                .get_bits(1, 0),
+            [30002, 30002, 30002, 65535]
+        );
+        assert_eq!(history.retained_bytes(&doc), 0);
+        let second = doc.clone();
+        Arc::make_mut(doc.active_mut().unwrap().image.as_mut().unwrap()).set_f32(
+            0,
+            0,
+            [30003f32 / 65535., 30003f32 / 65535., 30003f32 / 65535., 1.],
+        );
+        history.record("Precision", second, &doc);
+        assert!(history.retained_bytes(&doc) >= 128 * 128 * 8);
     }
 }

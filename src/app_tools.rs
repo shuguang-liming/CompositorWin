@@ -87,39 +87,6 @@ impl EditorApp {
                     self.shape_kind = kind.into();
                 }
             }
-            if self.shape_kind == "Rectangle" {
-                ui.label("半径");
-                let mut slider = self.corner_radius.min(200.);
-                if ui
-                    .add(egui::Slider::new(&mut slider, 0. ..=200.).show_value(false))
-                    .changed()
-                {
-                    self.corner_radius = slider.round();
-                }
-                ui.add_sized(
-                    [48., 26.],
-                    egui::DragValue::new(&mut self.corner_radius)
-                        .range(0. ..=5000.)
-                        .speed(1.),
-                );
-                ui.label("px");
-            } else if self.shape_kind == "Line" {
-                ui.label("宽度");
-                let mut slider = self.line_width.min(100.);
-                if ui
-                    .add(egui::Slider::new(&mut slider, 1. ..=100.).show_value(false))
-                    .changed()
-                {
-                    self.line_width = slider.round();
-                }
-                ui.add_sized(
-                    [48., 26.],
-                    egui::DragValue::new(&mut self.line_width)
-                        .range(1. ..=5000.)
-                        .speed(1.),
-                );
-                ui.label("px");
-            }
             ui.label("填充");
             let (rect, response) = ui.allocate_exact_size(Vec2::new(36., 18.), Sense::click());
             ui.painter().rect_filled(
@@ -141,6 +108,41 @@ impl EditorApp {
             if response.on_hover_text("使用前景色填充形状").clicked() {
                 self.finish_color_picker(false);
                 self.color_picker = Some(crate::palette::ColorPicker::new(false, self.foreground));
+            }
+            if self.shape_kind == "Rectangle" {
+                ui.label("半径");
+                let mut slider = self.corner_radius.min(200.);
+                if ui
+                    .add(egui::Slider::new(&mut slider, 0. ..=200.).show_value(false))
+                    .changed()
+                {
+                    self.corner_radius = slider.round();
+                }
+                ui.add_sized(
+                    [48., 26.],
+                    egui::DragValue::new(&mut self.corner_radius)
+                        .range(0. ..=5000.)
+                        .speed(1.),
+                );
+                ui.label("px");
+                ui.checkbox(&mut self.shape_smoothing, "平滑圆角")
+                    .on_hover_text("让圆角与直边更平滑地衔接；空间不足时自动降低平滑度");
+            } else if self.shape_kind == "Line" {
+                ui.label("宽度");
+                let mut slider = self.line_width.min(100.);
+                if ui
+                    .add(egui::Slider::new(&mut slider, 1. ..=100.).show_value(false))
+                    .changed()
+                {
+                    self.line_width = slider.round();
+                }
+                ui.add_sized(
+                    [48., 26.],
+                    egui::DragValue::new(&mut self.line_width)
+                        .range(1. ..=5000.)
+                        .speed(1.),
+                );
+                ui.label("px");
             }
         });
     }

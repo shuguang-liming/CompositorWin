@@ -1,5 +1,51 @@
 use super::*;
+use crate::canvas_units::{self, CanvasBackground, CanvasUnit};
 use crate::chrome::capsule;
+
+#[derive(Clone)]
+struct NewCanvasSettings {
+    unit: CanvasUnit,
+    background: CanvasBackground,
+    dimensions: [String; 2],
+    pixel_size: [u32; 2],
+}
+
+impl NewCanvasSettings {
+    fn new(size: [u32; 2], resolution: f64) -> Self {
+        let mut settings = Self {
+            unit: CanvasUnit::Pixels,
+            background: CanvasBackground::Transparent,
+            dimensions: [String::new(), String::new()],
+            pixel_size: size,
+        };
+        settings.set_pixels(size, resolution);
+        settings
+    }
+
+    fn size(&self, resolution: f64) -> Option<[u32; 2]> {
+        if !canvas_units::valid_resolution(resolution) {
+            return None;
+        }
+        let size = [
+            self.unit.pixels(&self.dimensions[0], resolution)?,
+            self.unit.pixels(&self.dimensions[1], resolution)?,
+        ];
+        Document::valid_size(size[0], size[1]).then_some(size)
+    }
+
+    fn set_pixels(&mut self, size: [u32; 2], resolution: f64) {
+        self.pixel_size = size;
+        self.dimensions = size.map(|pixels| self.unit.text(pixels, resolution));
+    }
+
+    fn switch_unit(&mut self, resolution: f64) {
+        let size = self.size(resolution);
+        self.unit = self.unit.next();
+        if let Some(size) = size {
+            self.set_pixels(size, resolution);
+        }
+    }
+}
 
 impl EditorApp {
     pub(super) fn original_welcome_ui(&mut self, ui: &mut egui::Ui) {
@@ -8,6 +54,16 @@ impl EditorApp {
             if let Some(size) = clipboard_dimensions() {
                 self.new_size = size;
             }
+        }
+        // A new placeholder starts with pixels and transparency even when the
+        // previous document used print units. No print preferences leak into it.
+        let settings_key = egui::Id::new(("new-canvas-settings", self.session().id));
+        let mut settings = ui
+            .ctx()
+            .data(|data| data.get_temp::<NewCanvasSettings>(settings_key))
+            .unwrap_or_else(|| NewCanvasSettings::new(self.new_size, self.new_resolution));
+        if settings.pixel_size != self.new_size {
+            settings.set_pixels(self.new_size, self.new_resolution);
         }
         let mut create = false;
         let width = ui.available_width().min(500.);
@@ -35,8 +91,15 @@ impl EditorApp {
                                 ("YouTube 缩略图", [1080, 608]),
                                 ("A4", [2480, 3508]),
                             ] {
-                                if ui.selectable_label(self.new_size == size, label).clicked() {
+                                if ui
+                                    .selectable_label(
+                                        settings.size(self.new_resolution) == Some(size),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
                                     self.new_size = size;
+                                    settings.set_pixels(size, self.new_resolution);
                                     ui.close();
                                 }
                             }
@@ -45,7 +108,7 @@ impl EditorApp {
                                 ui.label("分辨率");
                                 ui.add(
                                     egui::DragValue::new(&mut self.new_resolution)
-                                        .range(1. ..=12000.)
+                                        .range(1. ..=9600.)
                                         .suffix(" ppi"),
                                 );
                             });
@@ -57,17 +120,64 @@ impl EditorApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 16.;
                     let field_width = (ui.available_width() - 47.) / 2.;
-                    dimension(ui, "宽度", &mut self.new_size[0], field_width);
+                    dimension(
+                        ui,
+                        "宽度",
+                        &mut settings.dimensions[0],
+                        settings.unit,
+                        field_width,
+                    );
                     ui.label(egui::RichText::new("×").color(ui.visuals().weak_text_color()));
-                    dimension(ui, "高度", &mut self.new_size[1], field_width);
+                    dimension(
+                        ui,
+                        "高度",
+                        &mut settings.dimensions[1],
+                        settings.unit,
+                        field_width,
+                    );
                 });
-                let valid = Document::valid_size(self.new_size[0], self.new_size[1]);
-                if valid {
-                    ui.weak("透明画布 · sRGB");
-                } else {
+                let size = settings.size(self.new_resolution);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.;
+                    if capsule(ui, settings.background.label(), false)
+                        .on_hover_text("点击切换透明、白色或黑色背景")
+                        .clicked()
+                    {
+                        settings.background = settings.background.next();
+                    }
+                    ui.weak("·");
+                    if capsule(ui, settings.unit.label(), false)
+                        .on_hover_text("点击切换 px、in、cm、mm；画布像素尺寸保持不变")
+                        .clicked()
+                    {
+                        settings.switch_unit(self.new_resolution);
+                    }
+                    ui.weak("·");
+                    let size_help = size.map_or_else(String::new, |[width, height]| {
+                        format!("；当前画布为 {width} × {height} 像素")
+                    });
+                    if capsule(ui, &format!("{:.0} ppi", self.new_resolution), false)
+                        .on_hover_text(format!(
+                            "点击切换 72／300 ppi；更多菜单可自定分辨率{size_help}"
+                        ))
+                        .clicked()
+                    {
+                        self.new_resolution = if self.new_resolution == 300. {
+                            72.
+                        } else {
+                            300.
+                        };
+                    }
+                });
+                let valid = settings.size(self.new_resolution).is_some();
+                if !valid {
                     ui.colored_label(
                         Color32::from_rgb(232, 161, 70),
-                        "请输入有效的整数像素尺寸。",
+                        if settings.unit == CanvasUnit::Pixels {
+                            "请输入有效的整数像素尺寸，分辨率为 1–9600 ppi。"
+                        } else {
+                            "当前尺寸或分辨率超出画布上限，请减小尺寸或 ppi。"
+                        },
                     );
                 }
                 ui.horizontal(|ui| {
@@ -87,6 +197,14 @@ impl EditorApp {
                 });
             });
         });
+        let size = settings.size(self.new_resolution);
+        if let Some(size) = size {
+            settings.pixel_size = size;
+            self.new_size = size;
+        }
+        let background = settings.background;
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(settings_key, settings));
         let ready = self.is_welcome()
             && self.pending_io == 0
             && self.dialog.is_none()
@@ -94,13 +212,14 @@ impl EditorApp {
             && !self.pdf_ui.is_open()
             && !egui::Popup::is_any_open(ui.ctx());
         if ready
-            && Document::valid_size(self.new_size[0], self.new_size[1])
+            && let Some([width, height]) = size
             && (create
                 || ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter)))
         {
-            let mut document = Document::new(self.new_size[0], self.new_size[1]);
-            document.resolution = self.new_resolution;
-            self.install_canvas_session(Session::new(document, None));
+            match canvas_units::new_document(width, height, self.new_resolution, background) {
+                Ok(document) => self.install_canvas_session(Session::new(document, None)),
+                Err(error) => self.message = Some(error.to_string()),
+            }
         }
     }
 }
@@ -203,7 +322,7 @@ fn dimensions_from_header(bytes: &[u8], png: bool) -> Option<[u32; 2]> {
     Document::valid_size(size[0], size[1]).then_some(size)
 }
 
-fn dimension(ui: &mut egui::Ui, title: &str, value: &mut u32, width: f32) {
+fn dimension(ui: &mut egui::Ui, title: &str, value: &mut String, unit: CanvasUnit, width: f32) {
     ui.allocate_ui_with_layout(
         Vec2::new(width, 72.),
         egui::Layout::top_down(egui::Align::Min),
@@ -218,9 +337,11 @@ fn dimension(ui: &mut egui::Ui, title: &str, value: &mut u32, width: f32) {
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [width - 48., 24.],
-                            egui::DragValue::new(value).range(1..=30000).speed(1.),
+                            egui::TextEdit::singleline(value)
+                                .char_limit(24)
+                                .desired_width(width - 48.),
                         );
-                        ui.weak("px");
+                        ui.weak(unit.symbol());
                     });
                 });
         },
@@ -229,7 +350,98 @@ fn dimension(ui: &mut egui::Ui, title: &str, value: &mut u32, width: f32) {
 
 #[cfg(test)]
 mod tests {
-    use super::dimensions_from_header;
+    use super::*;
+
+    #[test]
+    fn new_canvas_print_fields_follow_dpi_and_switch_units_without_pixel_drift() {
+        let mut settings = NewCanvasSettings::new([2550, 3300], 300.);
+        assert_eq!(settings.unit, CanvasUnit::Pixels);
+        assert_eq!(settings.background, CanvasBackground::Transparent);
+        settings.switch_unit(300.);
+        assert_eq!(settings.unit, CanvasUnit::Inches);
+        assert_eq!(settings.dimensions, ["8.5", "11"]);
+        assert_eq!(settings.size(300.), Some([2550, 3300]));
+        assert_eq!(settings.size(72.), Some([612, 792]));
+        for expected in [
+            CanvasUnit::Centimeters,
+            CanvasUnit::Millimeters,
+            CanvasUnit::Pixels,
+        ] {
+            settings.switch_unit(300.);
+            assert_eq!(settings.unit, expected);
+            assert_eq!(settings.size(300.), Some([2550, 3300]));
+        }
+        assert_eq!(settings.dimensions, ["2550", "3300"]);
+        settings.switch_unit(300.);
+        settings.set_pixels([2480, 3508], 300.);
+        assert_eq!(settings.size(300.), Some([2480, 3508]));
+    }
+
+    #[test]
+    fn welcome_rejects_invalid_fields_and_does_not_reuse_print_background_defaults() {
+        let mut settings = NewCanvasSettings::new([1920, 1080], 72.);
+        settings.dimensions[0] = "19.5".into();
+        assert_eq!(settings.size(72.), None);
+        settings.dimensions = ["30000".into(), "30000".into()];
+        assert_eq!(settings.size(72.), None);
+        settings.set_pixels([1920, 1080], 72.);
+        assert_eq!(settings.size(9601.), None);
+        settings.unit = CanvasUnit::Inches;
+        settings.background = CanvasBackground::Black;
+        let fresh = NewCanvasSettings::new([1920, 1080], 72.);
+        assert_eq!(fresh.unit, CanvasUnit::Pixels);
+        assert_eq!(fresh.background, CanvasBackground::Transparent);
+        assert_eq!(fresh.size(72.), Some([1920, 1080]));
+    }
+
+    #[test]
+    fn welcome_enter_creates_selected_print_resolution_and_background() {
+        let mut app = EditorApp::create(None, None);
+        app.tabs = vec![Session::new(Document::new(8, 8), None)];
+        app.tabs[0].placeholder = true;
+        app.current = 0;
+        app.new_size = [40, 30];
+        app.new_resolution = 300.;
+        app.welcome_clipboard_checked = true;
+        let context = egui::Context::default();
+        let mut settings = NewCanvasSettings::new(app.new_size, app.new_resolution);
+        settings.switch_unit(300.);
+        settings.background = CanvasBackground::White;
+        let settings_key = egui::Id::new(("new-canvas-settings", app.session().id));
+        context.data_mut(|data| data.insert_temp(settings_key, settings));
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
+                events: vec![egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.original_welcome_ui(ui);
+                });
+            },
+        );
+        assert!(!app.is_welcome());
+        let document = &app.session().doc;
+        assert_eq!([document.width, document.height], [40, 30]);
+        assert_eq!(document.resolution, 300.);
+        assert_eq!(
+            document
+                .active()
+                .unwrap()
+                .image
+                .as_ref()
+                .unwrap()
+                .get(39, 29),
+            [255; 4]
+        );
+    }
 
     #[test]
     fn top_down_dib_keeps_image_dimensions() {

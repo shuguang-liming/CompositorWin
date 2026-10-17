@@ -1,4 +1,4 @@
-//! Single-file projects, v1–11 directory compatibility, and recoverable replacement.
+//! Single-file projects, legacy directory compatibility, and recoverable replacement.
 use crate::model::{
     BlendMode, Document, Guide, Layer, MAX_PIXELS, MAX_SIDE, Mask, Raster, Transform,
     document_pixel_budget,
@@ -20,6 +20,7 @@ use uuid::Uuid;
 const MANIFEST_LIMIT: u64 = 4 * 1024 * 1024;
 const ASSET_LIMIT: u64 = 512 * 1024 * 1024;
 const CURRENT_VERSION: u32 = 11;
+const MAX_READ_VERSION: u32 = 14;
 const CONTAINER_MAGIC: &[u8; 8] = b"COMP\r\n\x1a\n";
 const CONTAINER_VERSION: u32 = 1;
 const CONTAINER_HEADER_SIZE: u64 = 64;
@@ -270,6 +271,18 @@ fn id_name(id: Uuid, mask: bool) -> String {
         if mask { ".mask" } else { "" }
     )
 }
+fn image_name(layer: &Layer) -> String {
+    if layer
+        .image
+        .as_ref()
+        .and_then(|r| r.deep.as_ref())
+        .is_some_and(|r| r.depth == crate::deep_pixels::Depth::Hdr)
+    {
+        format!("{}.exr", layer.id.to_string().to_uppercase())
+    } else {
+        id_name(layer.id, false)
+    }
+}
 fn is_plain_metadata(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -358,12 +371,18 @@ impl ContainerReader {
                     (id, true)
                 } else {
                     (
-                        name.strip_suffix(".png").context("项目容器资产名称无效")?,
+                        name.strip_suffix(".png")
+                            .or_else(|| name.strip_suffix(".exr"))
+                            .context("项目容器资产名称无效")?,
                         false,
                     )
                 };
                 let id = Uuid::parse_str(id).context("项目容器资产 ID 无效")?;
-                ensure!(name == id_name(id, mask), "项目容器资产名称无效");
+                ensure!(
+                    name == id_name(id, mask)
+                        || (!mask && name == format!("{}.exr", id.to_string().to_uppercase())),
+                    "项目容器资产名称无效"
+                );
                 ASSET_LIMIT
             };
             ensure!(
@@ -491,7 +510,7 @@ fn decode_png(data: Vec<u8>, mask: bool, budget: &mut u64) -> Result<Raster> {
     );
     let width = u32::from_be_bytes(data[16..20].try_into()?);
     let height = u32::from_be_bytes(data[20..24].try_into()?);
-    ensure!(data[24] <= 8, "项目 PNG 位深最多为 8-bit");
+    ensure!(data[24] <= 16, "项目 PNG 位深超出 16-bit");
     ensure!(
         !mask || (data[24] == 8 && data[25] == 0),
         "图层蒙版必须是无 Alpha 通道的 8-bit 灰度 PNG"
@@ -501,8 +520,9 @@ fn decode_png(data: Vec<u8>, mask: bool, budget: &mut u64) -> Result<Raster> {
         "嵌入图像尺寸无效"
     );
     let area = u64::from(width) * u64::from(height);
-    ensure!(area <= *budget, "项目超出栅格内存预算");
-    *budget -= area;
+    let cost = if data[24] == 16 { 3 } else { 1 };
+    ensure!(area * cost <= *budget, "项目超出栅格内存预算");
+    *budget -= area * cost;
     // APNG frames would otherwise be silently discarded by the raster decoder.
     let mut offset = 8;
     while offset + 12 <= data.len() {
@@ -522,10 +542,9 @@ fn decode_png(data: Vec<u8>, mask: bool, budget: &mut u64) -> Result<Raster> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
-    limits.max_alloc = Some(area * 8 + 1024 * 1024);
+    limits.max_alloc = Some(area * 16 + 1024 * 1024);
     reader.limits(limits);
-    let decoded = reader.decode()?.into_rgba8();
-    Ok(Raster::from_rgba(width, height, decoded.into_raw()))
+    crate::deep_io::from_dynamic(reader.decode()?, None)
 }
 
 pub fn load(path: &Path) -> Result<Document> {
@@ -548,8 +567,8 @@ fn load_contents(path: &Path) -> Result<Document> {
     );
     let version = header["version"].as_u64().context("缺少项目版本")?;
     ensure!(
-        (1..=11).contains(&version),
-        "不支持项目格式版本 {version}；支持的版本为 1–11"
+        (1..=u64::from(MAX_READ_VERSION)).contains(&version),
+        "不支持项目格式版本 {version}；最高支持版本为 {MAX_READ_VERSION}"
     );
     let mut manifest: Manifest = serde_json::from_slice(&metadata).context("项目清单已损坏")?;
     for layer in &mut manifest.layers {
@@ -571,7 +590,22 @@ fn load_contents(path: &Path) -> Result<Document> {
             .map(|name| {
                 source
                     .read(&format!("images/{name}"))
-                    .and_then(|data| decode_png(data, false, &mut image_budget))
+                    .and_then(|data| {
+                        if name.ends_with(".exr") {
+                            let raster =
+                                crate::deep_io::decode_exr_budgeted(&data, image_budget / 3)?;
+                            let cost = u64::from(raster.width) * u64::from(raster.height) * 3;
+                            ensure!(cost <= image_budget, "项目超出栅格内存预算");
+                            image_budget -= cost;
+                            Ok(raster)
+                        } else {
+                            ensure!(
+                                manifest.version >= 12 || data.get(24) != Some(&16),
+                                "16-bit 图层要求项目版本至少为 12"
+                            );
+                            decode_png(data, false, &mut image_budget)
+                        }
+                    })
                     .map(Arc::new)
             })
             .transpose()?;
@@ -624,7 +658,28 @@ fn load_contents(path: &Path) -> Result<Document> {
 fn manifest(document: &Document) -> Manifest {
     Manifest {
         format: "com.compositor.project".to_owned(),
-        version: CURRENT_VERSION,
+        version: if document.layers.iter().any(|layer| {
+            layer
+                .shape
+                .as_ref()
+                .is_some_and(|style| style["smoothing"] == true)
+        }) {
+            14
+        } else {
+            document
+                .layers
+                .iter()
+                .filter_map(|layer| layer.image.as_ref()?.deep.as_ref())
+                .map(|deep| {
+                    if deep.depth == crate::deep_pixels::Depth::Hdr {
+                        13
+                    } else {
+                        12
+                    }
+                })
+                .max()
+                .unwrap_or(CURRENT_VERSION)
+        },
         color_space: "sRGB".to_owned(),
         document_id: document.id,
         width: document.width,
@@ -641,7 +696,7 @@ fn manifest(document: &Document) -> Manifest {
                 name: l.name.clone(),
                 is_visible: l.visible,
                 transform: l.transform,
-                image_file: l.image.as_ref().map(|_| id_name(l.id, false)),
+                image_file: l.image.as_ref().map(|_| image_name(l)),
                 parent_id: l.parent_id,
                 is_group: l.is_group,
                 opacity: l.opacity,
@@ -670,13 +725,20 @@ pub fn validate_document(document: &Document) -> Result<()> {
             (true, layer.mask.as_ref().map(|m| &m.raster)),
         ] {
             if let Some(r) = r {
+                if let Some(deep) = &r.deep {
+                    ensure!(
+                        deep.width == r.width && deep.height == r.height,
+                        "高位深像素尺寸与预览不一致"
+                    );
+                    deep.validate().map_err(anyhow::Error::msg)?;
+                }
                 ensure!(
                     r.width > 0 && r.height > 0 && r.width <= MAX_SIDE && r.height <= MAX_SIDE,
                     "栅格尺寸无效"
                 );
                 let pixels = u64::from(r.width) * u64::from(r.height);
                 let used = if is_mask { &mut masks } else { &mut images };
-                *used += pixels;
+                *used += pixels * if r.deep.is_some() { 3 } else { 1 };
                 ensure!(*used <= document_pixel_budget(), "超出文档像素预算");
                 ensure!(
                     r.pixels.is_empty()
@@ -694,6 +756,7 @@ pub fn validate_document(document: &Document) -> Result<()> {
                     );
                 }
                 if is_mask {
+                    ensure!(r.deep.is_none(), "图层蒙版只支持 8-bit");
                     for y in 0..r.height {
                         for x in 0..r.width {
                             let p = r.get(x, y);
@@ -786,9 +849,20 @@ fn write_container(document: &Document, metadata: &[u8], path: &Path) -> Result<
             write_container_entry(
                 &mut file,
                 &mut entries,
-                format!("images/{}", id_name(layer.id, false)),
+                format!("images/{}", image_name(layer)),
                 ASSET_LIMIT,
-                |writer| encode_png(image, writer, false),
+                |writer| {
+                    if image
+                        .deep
+                        .as_ref()
+                        .is_some_and(|deep| deep.depth == crate::deep_pixels::Depth::Hdr)
+                    {
+                        writer.write_all(&crate::deep_io::encode_exr(image)?)?;
+                        Ok(())
+                    } else {
+                        encode_png(image, writer, false)
+                    }
+                },
             )?;
         }
         if let Some(mask) = &layer.mask {
@@ -1113,6 +1187,11 @@ fn journal_component_matches(left: &str, right: &str) -> bool {
     }
 }
 fn encode_png(r: &Raster, writer: impl Write, mask: bool) -> Result<()> {
+    if !mask && r.deep.is_some() {
+        let mut writer = writer;
+        writer.write_all(&crate::deep_io::encode_png(r)?)?;
+        return Ok(());
+    }
     let encoder = image::codecs::png::PngEncoder::new(writer);
     if mask {
         let mut gray = Vec::with_capacity((u64::from(r.width) * u64::from(r.height)) as usize);
@@ -1248,7 +1327,10 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         m.format == "com.compositor.project" && m.color_space == "sRGB",
         "项目标识符或色彩空间无效"
     );
-    ensure!((1..=11).contains(&m.version), "不支持此项目版本");
+    ensure!(
+        (1..=MAX_READ_VERSION).contains(&m.version),
+        "不支持此项目版本"
+    );
     ensure!(
         Document::valid_size(m.width, m.height),
         "项目画布无效或超出尺寸限制"
@@ -1295,7 +1377,9 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         ensure!(
             l.image_file
                 .as_ref()
-                .is_none_or(|f| *f == id_name(l.id, false)),
+                .is_none_or(|f| *f == id_name(l.id, false)
+                    || (m.version >= 13
+                        && *f == format!("{}.exr", l.id.to_string().to_uppercase()))),
             "图像文件名无效"
         );
         ensure!(
@@ -1363,6 +1447,10 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         }
         if let Some(s) = &l.shape {
             validate_shape(s)?;
+            ensure!(
+                m.version >= 14 || s["smoothing"] != true,
+                "平滑圆角要求项目版本至少为 14"
+            );
         }
     }
     ensure!(
@@ -1503,6 +1591,9 @@ fn validate_shape(s: &Value) -> Result<()> {
         "形状类型无效"
     );
     colors(s)?;
+    if let Some(smoothing) = s.get("smoothing").filter(|v| !v.is_null()) {
+        ensure!(smoothing.is_boolean(), "平滑圆角必须为布尔值");
+    }
     range(s, "cornerRadius", 0.0, 300_000.0)?;
     range(s, "lineWidth", 0.01, 300_000.0)?;
     for key in ["start", "end"] {
@@ -2287,6 +2378,115 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         assert_ne!(fingerprint(&path).unwrap(), saved);
         assert!(load(&path).is_err());
+    }
+
+    #[test]
+    fn newer_8bit_projects_and_smoothing_have_explicit_version_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut document = Document::new(8, 8);
+        for version in 12..=14 {
+            let path = temp.path().join(format!("upstream-{version}.comp"));
+            write_legacy_fixture(&document, &path, version);
+            assert_eq!(load(&path).unwrap(), document);
+        }
+        crate::edit::add_shape_with_smoothing(
+            &mut document,
+            crate::edit::ShapeKind::Rectangle,
+            [0., 0., 8., 8.],
+            [100, 180, 230, 255],
+            2.,
+            1.,
+            None,
+            true,
+        )
+        .unwrap();
+        let metadata = manifest(&document);
+        assert_eq!(metadata.version, 14);
+        validate_manifest(&metadata).unwrap();
+        for version in 1..=13 {
+            let mut older = manifest(&document);
+            older.version = version;
+            assert!(validate_manifest(&older).is_err());
+        }
+        let path = temp.path().join("smoothed.comp");
+        save(&document, &path).unwrap();
+        assert_eq!(read_manifest(&path)["version"], 14);
+        assert_eq!(load(&path).unwrap(), document);
+    }
+
+    #[test]
+    fn high_precision_assets_keep_low_bits_and_reject_older_manifest_claims() {
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(
+                bytemuck::cast_slice(&[10_001u16, 22_222, 33_333, 65_535]),
+                1,
+                1,
+                image::ExtendedColorType::Rgba16,
+            )
+            .unwrap();
+        let mut budget = 100;
+        let decoded = decode_png(bytes, false, &mut budget).unwrap();
+        assert_eq!(
+            decoded.deep.as_ref().unwrap().get_bits(0, 0),
+            [10_001, 22_222, 33_333, 65_535]
+        );
+        assert_eq!(budget, 97);
+        let mut document = Document::new(8, 8);
+        document.layers[0].shape = Some(serde_json::json!({
+            "kind": "Rectangle", "smoothing": "true"
+        }));
+        assert!(validate_document(&document).is_err());
+        let mut metadata = manifest(&Document::new(8, 8));
+        metadata.version = 12;
+        metadata.layers[0].image_file = Some(format!(
+            "{}.exr",
+            metadata.layers[0].id.to_string().to_uppercase()
+        ));
+        assert!(validate_manifest(&metadata).is_err());
+    }
+
+    #[test]
+    fn deep_and_hdr_single_file_projects_round_trip_edits_and_manifest_versions() {
+        use crate::deep_pixels::{DeepRaster, Depth};
+        let temp = tempfile::tempdir().unwrap();
+        for depth in [Depth::U16, Depth::Hdr] {
+            let mut doc = Document::new(4, 2);
+            let pixels = DeepRaster::solid(
+                4,
+                2,
+                depth,
+                [
+                    0.1234,
+                    0.5678,
+                    if depth == Depth::Hdr { 4. } else { 0.9 },
+                    1.,
+                ],
+            );
+            let mut raster = Raster::from_deep(pixels);
+            raster.set(1, 1, [80, 90, 100, 255]);
+            let expected = raster.deep.as_ref().unwrap().to_bits();
+            doc.layers[0].image = Some(Arc::new(raster));
+            let path = temp.path().join(format!("{depth:?}.comp"));
+            save(&doc, &path).unwrap();
+            assert!(path.is_file());
+            assert_eq!(
+                read_manifest(&path)["version"],
+                if depth == Depth::Hdr { 13 } else { 12 }
+            );
+            let loaded = load(&path).unwrap();
+            assert_eq!(
+                loaded.layers[0]
+                    .image
+                    .as_ref()
+                    .unwrap()
+                    .deep
+                    .as_ref()
+                    .unwrap()
+                    .to_bits(),
+                expected
+            );
+        }
     }
 
     #[test]

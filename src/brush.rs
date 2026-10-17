@@ -1,4 +1,6 @@
-use crate::model::{Document, Layer, MAX_PIXELS, Mask, Raster, Selection, TILE_SIZE, Transform};
+use crate::model::{
+    Document, Layer, MAX_PIXELS, Mask, Raster, Sampling, Selection, TILE_SIZE, Transform,
+};
 use anyhow::{Result, ensure};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -8,7 +10,7 @@ use uuid::Uuid;
 #[path = "content_fill.rs"]
 mod content_fill;
 #[path = "healing.rs"]
-mod healing;
+pub(crate) mod healing;
 #[path = "warp.rs"]
 mod warp;
 pub use content_fill::content_fill;
@@ -490,6 +492,55 @@ impl BrushStroke {
                     let covered = self.coverage.entry((x, y)).or_default();
                     *covered = 1. - (1. - *covered) * (1. - weight);
                     let amount = *covered * self.settings.opacity.clamp(0., 1.) * select;
+                    if self.raster.deep.is_some()
+                        && !self.mask
+                        && !matches!(self.settings.mode, BrushMode::Heal(_))
+                    {
+                        let base = self.base_pixel_f32(x, y);
+                        let pixel = match self.settings.mode {
+                            BrushMode::Paint => {
+                                over_f32(base, self.settings.color.map(|v| v as f32 / 255.), amount)
+                            }
+                            BrushMode::Erase => {
+                                let mut pixel = base;
+                                pixel[3] *= 1. - amount as f32;
+                                pixel
+                            }
+                            BrushMode::Clone { offset } => {
+                                let point = [docp[0] + offset[0], docp[1] + offset[1]];
+                                let point = if self.clone_document_sample {
+                                    [point[0] - 0.5, point[1] - 0.5]
+                                } else {
+                                    let unit = self.original.transform.from_document(point);
+                                    [
+                                        unit[0] * self.source.width as f64 - 0.5,
+                                        unit[1] * self.source.height as f64 - 0.5,
+                                    ]
+                                };
+                                over_f32(
+                                    base,
+                                    self.source.sample_f32(point[0], point[1], Sampling::Smooth),
+                                    amount,
+                                )
+                            }
+                            BrushMode::Blur { .. } => interpolate_f32(
+                                base,
+                                self.blur.as_mut().unwrap().sample_f32(docp),
+                                amount,
+                            ),
+                            _ => unreachable!("高位深绘画模式已在入口筛选"),
+                        };
+                        if pixel != base {
+                            self.raster.set_f32(x, y, pixel);
+                            self.bounds = Some(match self.bounds {
+                                Some(b) => {
+                                    [b[0].min(x), b[1].min(y), b[2].max(x + 1), b[3].max(y + 1)]
+                                }
+                                None => [x, y, x + 1, y + 1],
+                            });
+                        }
+                        continue;
+                    }
                     let base = self.base_pixel(x, y);
                     let pixel = match self.settings.mode {
                         BrushMode::Paint => over(base, self.settings.color, amount),
@@ -654,6 +705,21 @@ impl BrushStroke {
         })
     }
 
+    fn base_pixel_f32(&self, x: u32, y: u32) -> [f32; 4] {
+        let point = self.transform.to_document([
+            (x as f64 + 0.5) / self.raster.width as f64,
+            (y as f64 + 0.5) / self.raster.height as f64,
+        ]);
+        let unit = self.original.transform.from_document(point);
+        self.original.image.as_ref().map_or([0.; 4], |source| {
+            source.sample_f32(
+                unit[0] * source.width as f64 - 0.5,
+                unit[1] * source.height as f64 - 0.5,
+                Sampling::Smooth,
+            )
+        })
+    }
+
     // WarpStroke operates in document pixels; its final clone replaces native pixels through a hard
     // tip four pixels wider than the working brush. Selection is applied here, once, after warping.
     fn project_warp(&mut self, warp: &mut WarpSample, points: &[[f64; 2]]) -> Result<()> {
@@ -735,9 +801,17 @@ impl BrushStroke {
                 (x as f64 + 0.5) / self.raster.width as f64,
                 (y as f64 + 0.5) / self.raster.height as f64,
             ]);
-            let pixel = interpolate(self.base_pixel(x, y), warp.sample(p), selection);
-            if pixel != self.raster.get(x, y) {
-                self.raster.set(x, y, pixel);
+            if self.raster.deep.is_some() {
+                let pixel =
+                    interpolate_f32(self.base_pixel_f32(x, y), warp.sample_f32(p), selection);
+                if pixel != self.raster.get_f32(x, y) {
+                    self.raster.set_f32(x, y, pixel);
+                }
+            } else {
+                let pixel = interpolate(self.base_pixel(x, y), warp.sample(p), selection);
+                if pixel != self.raster.get(x, y) {
+                    self.raster.set(x, y, pixel);
+                }
             }
             self.bounds = Some(match self.bounds {
                 Some(b) => [b[0].min(x), b[1].min(y), b[2].max(x + 1), b[3].max(y + 1)],
@@ -826,6 +900,9 @@ impl BrushStroke {
                     }
                 }
             }
+        }
+        if let Some(deep) = &self.raster.deep {
+            grown.deep = Some(Arc::new(deep.padded(nw as u32, nh as u32, left, top)));
         }
         let center = t.to_document([
             ((left + right) as f64 / 2.) / w,
@@ -935,6 +1012,37 @@ pub fn interpolate(a: [u8; 4], b: [u8; 4], t: f64) -> [u8; 4] {
     p[3] = (alpha * 255.).round() as u8;
     p
 }
+
+fn over_f32(base: [f32; 4], source: [f32; 4], coverage: f64) -> [f32; 4] {
+    let source_alpha = source[3] * coverage.clamp(0., 1.) as f32;
+    let under_alpha = base[3] * (1. - source_alpha);
+    let alpha = source_alpha + under_alpha;
+    if alpha <= 0. {
+        return [0.; 4];
+    }
+    [
+        (source[0] * source_alpha + base[0] * under_alpha) / alpha,
+        (source[1] * source_alpha + base[1] * under_alpha) / alpha,
+        (source[2] * source_alpha + base[2] * under_alpha) / alpha,
+        alpha,
+    ]
+}
+
+fn interpolate_f32(a: [f32; 4], b: [f32; 4], t: f64) -> [f32; 4] {
+    let t = t.clamp(0., 1.) as f32;
+    let aa = a[3] * (1. - t);
+    let ba = b[3] * t;
+    let alpha = aa + ba;
+    if alpha <= 0. {
+        return [0.; 4];
+    }
+    [
+        (a[0] * aa + b[0] * ba) / alpha,
+        (a[1] * aa + b[1] * ba) / alpha,
+        (a[2] * aa + b[2] * ba) / alpha,
+        alpha,
+    ]
+}
 pub fn sample(r: &Raster, x: f64, y: f64) -> [u8; 4] {
     if !x.is_finite() || !y.is_finite() {
         return [0; 4];
@@ -1020,7 +1128,7 @@ impl BlurSample {
             output: HashMap::new(),
         }
     }
-    fn sample(&mut self, document_point: [f64; 2]) -> [u8; 4] {
+    fn premultiplied(&mut self, document_point: [f64; 2]) -> [f64; 4] {
         let unit = self.transform.from_document(document_point);
         let x = (unit[0] * self.source.width as f64 - 0.5) / self.step;
         let y = (unit[1] * self.source.height as f64 - 0.5) / self.step;
@@ -1042,6 +1150,10 @@ impl BlurSample {
                 }
             }
         }
+        out
+    }
+    fn sample(&mut self, document_point: [f64; 2]) -> [u8; 4] {
+        let out = self.premultiplied(document_point);
         if out[3] <= 0. {
             return [0; 4];
         }
@@ -1050,6 +1162,18 @@ impl BlurSample {
             (out[1] / out[3] * 255.).round().clamp(0., 255.) as u8,
             (out[2] / out[3] * 255.).round().clamp(0., 255.) as u8,
             out[3].round().clamp(0., 255.) as u8,
+        ]
+    }
+    fn sample_f32(&mut self, document_point: [f64; 2]) -> [f32; 4] {
+        let out = self.premultiplied(document_point);
+        if out[3] <= 0. {
+            return [0.; 4];
+        }
+        [
+            (out[0] / out[3]) as f32,
+            (out[1] / out[3]) as f32,
+            (out[2] / out[3]) as f32,
+            (out[3] / 255.).clamp(0., 1.) as f32,
         ]
     }
     fn pixel(&mut self, x: i32, y: i32) -> [f64; 4] {
@@ -1115,15 +1239,21 @@ impl BlurSample {
                     && x < self.source.width as i64
                     && y < self.source.height as i64
                 {
-                    self.source.get(x as u32, y as u32)
+                    if self.source.deep.is_some() {
+                        self.source
+                            .get_f32(x as u32, y as u32)
+                            .map(|v| v as f64 * 255.)
+                    } else {
+                        self.source.get(x as u32, y as u32).map(f64::from)
+                    }
                 } else {
-                    self.background
+                    self.background.map(f64::from)
                 };
-                let alpha = p[3] as f64 / 255.;
+                let alpha = p[3] / 255.;
                 for c in 0..3 {
-                    out[c] += p[c] as f64 * alpha * weight;
+                    out[c] += p[c] * alpha * weight;
                 }
-                out[3] += p[3] as f64 * weight;
+                out[3] += p[3] * weight;
             }
         }
         out
@@ -1220,6 +1350,20 @@ pub fn gradient(
                     s.get(p[0] as u32, p[1] as u32) as f64 / 255.
                 }
             });
+            if selection == 0. {
+                continue;
+            }
+            if raster.deep.is_some() && !mask {
+                let color = std::array::from_fn(|c| {
+                    (from[c] as f64 * (1. - u) + to[c] as f64 * u) as f32 / 255.
+                });
+                let base = raster.get_f32(x, y);
+                let out = over_f32(base, color, opacity * selection);
+                if out != base {
+                    raster.set_f32(x, y, out);
+                }
+                continue;
+            }
             let out = over(raster.get(x, y), color, opacity * selection);
             raster.set(
                 x,
@@ -1253,12 +1397,12 @@ pub fn content_aware_fill(image: &Raster, selection: &Selection) -> Result<Raste
     let coverage = selection.canvas_coverage();
     crate::pixels::premultiply(&mut data);
     ensure!(
-        content_fill(
+        content_fill::try_content_fill(
             &mut data,
             &coverage,
             image.width as usize,
             image.height as usize
-        ),
+        )?,
         "内容识别填充需要选区外完整、不透明的源像素块"
     );
     crate::pixels::unpremultiply(&mut data);
@@ -1376,6 +1520,188 @@ pub fn add_mask(doc: &mut Document, id: Uuid, revealing: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sixteen_bit_gradient_keeps_sub_byte_steps_on_blank_layers() {
+        let mut document = Document::new(256, 8);
+        let id = document.active_layer_id.unwrap();
+        document.active_mut().unwrap().image = Some(Arc::new(Raster::from_deep(
+            crate::deep_pixels::DeepRaster::blank(256, 8, crate::deep_pixels::Depth::U16),
+        )));
+        gradient(
+            &mut document,
+            id,
+            false,
+            [0.5, 4.],
+            [255.5, 4.],
+            [0, 0, 0, 255],
+            [16, 16, 16, 255],
+            GradientShape::Linear,
+            1.,
+        )
+        .unwrap();
+        let deep = document
+            .active()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .deep
+            .as_ref()
+            .unwrap();
+        let values: HashSet<_> = (0..256).map(|x| deep.get_bits(x, 4)[0]).collect();
+        assert_eq!(values.len(), 256);
+        assert_eq!(deep.get_bits(0, 4), [0, 0, 0, 65535]);
+        assert_eq!(deep.get_bits(255, 4), [4112, 4112, 4112, 65535]);
+    }
+
+    #[test]
+    fn deep_blur_smudge_and_liquify_modify_fine_steps_without_quantizing_the_stroke() {
+        let width = 256;
+        let height = 16;
+        let bits: Vec<u16> = (0..width * height)
+            .flat_map(|i| {
+                let x = i % width;
+                let ripple = if x % 2 == 0 { 50. } else { -50. };
+                let value = (25700. + 1028. * x as f32 / 255. + ripple).round() as u16;
+                [value, value, value, 65535]
+            })
+            .collect();
+        let source = Arc::new(Raster::from_deep(
+            crate::deep_pixels::DeepRaster::from_u16(width, height, bits).unwrap(),
+        ));
+        let source_bits = source.deep.as_ref().unwrap().to_bits();
+        for mode in [
+            BrushMode::Blur { radius: 2. },
+            BrushMode::Smudge,
+            BrushMode::Liquify,
+        ] {
+            let mut document = Document::new(width, height);
+            let id = document.active_layer_id.unwrap();
+            document.active_mut().unwrap().image = Some(source.clone());
+            let points: Vec<_> = (80..=172).step_by(4).map(|x| [x as f64, 8.]).collect();
+            paint(
+                &mut document,
+                id,
+                false,
+                &points,
+                BrushSettings {
+                    diameter: 8.,
+                    hardness: 0.5,
+                    mode,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            let output = document.active().unwrap().image.as_ref().unwrap();
+            let deep = output.deep.as_ref().unwrap();
+            let values: Vec<_> = (90..160).map(|x| deep.get_bits(x, 8)[0]).collect();
+            let fine = values.iter().filter(|&&v| v % 257 != 0).count();
+            let changed = (90..160)
+                .filter(|&x| deep.get_bits(x, 8) != source.deep.as_ref().unwrap().get_bits(x, 8))
+                .count();
+            assert!(fine * 5 > values.len() * 4, "{mode:?}: {fine} fine steps");
+            assert!(changed > 30, "{mode:?}: {changed} changed pixels");
+            assert_eq!(
+                deep.get_bits(10, 8),
+                source.deep.as_ref().unwrap().get_bits(10, 8)
+            );
+            assert_eq!(source.deep.as_ref().unwrap().to_bits(), source_bits);
+        }
+    }
+
+    #[test]
+    fn hdr_blur_and_warp_keep_bright_colors_and_straight_alpha_in_edited_pixels() {
+        use crate::deep_pixels::{DeepRaster, Depth};
+        let samples: Vec<_> = (0..32 * 16)
+            .flat_map(|i| [2. + (i % 32) as f32 / 16., 4., 8., 0.5])
+            .collect();
+        let source = Arc::new(Raster::from_deep(
+            DeepRaster::from_f32(32, 16, Depth::Hdr, &samples).unwrap(),
+        ));
+        for mode in [
+            BrushMode::Blur { radius: 2. },
+            BrushMode::Smudge,
+            BrushMode::Liquify,
+        ] {
+            let mut document = Document::new(32, 16);
+            let id = document.active_layer_id.unwrap();
+            document.active_mut().unwrap().image = Some(source.clone());
+            paint(
+                &mut document,
+                id,
+                false,
+                &[[8., 8.], [16., 8.]],
+                BrushSettings {
+                    diameter: 8.,
+                    mode,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            let output = document.active().unwrap().image.as_ref().unwrap();
+            let value = output.get_f32(15, 8);
+            assert!(
+                value[0] > 1.5 && value[1] > 3.9 && value[2] > 7.9,
+                "{mode:?}: {value:?}"
+            );
+            assert!((value[3] - 0.5).abs() < 0.001, "{mode:?}: {value:?}");
+            assert_eq!(
+                output.deep.as_ref().unwrap().get_bits(0, 0),
+                source.deep.as_ref().unwrap().get_bits(0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn growing_a_deep_paint_layer_keeps_original_low_bits_and_history_source() {
+        use crate::deep_pixels::DeepRaster;
+        let bits: Vec<_> = (0..8 * 8)
+            .flat_map(|i| [25001 + i, 32769 + i, 50001 - i, 65535])
+            .collect();
+        let source = Arc::new(Raster::from_deep(
+            DeepRaster::from_u16(8, 8, bits.clone()).unwrap(),
+        ));
+        let mut document = Document::new(32, 32);
+        let id = document.active_layer_id.unwrap();
+        let layer = document.active_mut().unwrap();
+        layer.image = Some(source.clone());
+        layer.transform = Transform::new(8., 8., 8., 8.);
+        paint(
+            &mut document,
+            id,
+            false,
+            &[[4., 12.]],
+            BrushSettings {
+                diameter: 3.,
+                color: [255, 0, 0, 255],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let layer = document.active().unwrap();
+        let output = layer.image.as_ref().unwrap();
+        let deep = output.deep.as_ref().unwrap();
+        assert!(output.width > 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let unit = layer
+                    .transform
+                    .from_document([x as f64 + 8.5, y as f64 + 8.5]);
+                let dx = (unit[0] * output.width as f64 - 0.5).round() as u32;
+                let dy = (unit[1] * output.height as f64 - 0.5).round() as u32;
+                assert_eq!(
+                    deep.get_bits(dx, dy),
+                    source.deep.as_ref().unwrap().get_bits(x, y)
+                );
+            }
+        }
+        assert_eq!(source.deep.as_ref().unwrap().to_bits(), bits);
+    }
+
     #[test]
     fn soft_dabs_across_tile_edges_preserve_coverage_selection_and_history() {
         let (width, height) = (259, 131);
