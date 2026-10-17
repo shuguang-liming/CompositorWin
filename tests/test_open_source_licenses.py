@@ -1,5 +1,6 @@
 """Byte preservation and fail-closed checks for embedded license packaging."""
 import contextlib
+import argparse
 import hashlib
 import importlib.util
 import io
@@ -43,12 +44,46 @@ class EmbeddedLicenseTests(unittest.TestCase):
         self.assertIn("installer-licenses/NSIS-3.11-COPYING.txt", self.originals)
 
     def test_current_application_row_does_not_repeat_historical_self_notice(self):
-        self.assertEqual(self.index["components"][0]["version"], "0.0.1")
+        application = self.index["components"][0]
+        package = GENERATOR.tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]
+        self.assertEqual(application["name"], "CompositorWin")
+        self.assertEqual(application["version"], package["version"])
+        self.assertEqual(application["license"], "Apache-2.0")
+        self.assertEqual(application["repository"], "https://github.com/shuguang-liming/CompositorWin")
+        self.assertEqual(self.originals["CompositorWin-LICENSE.md"], (ROOT / "LICENSE.md").read_bytes())
+        self.assertEqual([self.index["originals"][source]["path"] for source in application["originals"]], ["CompositorWin-LICENSE.md"])
+        original = self.index["components"][1]
+        self.assertEqual(original["license"], "MIT")
+        self.assertEqual([self.index["originals"][source]["path"] for source in original["originals"]], ["LICENSE"])
+        self.assertIn(b"Copyright (c) 2026 Wonder Assembly LLC", self.originals["LICENSE"])
         self.assertFalse(any(component["name"] == "compositor-windows" for component in self.index["components"]))
         self.assertIn(b'"name": "compositor-windows"', self.originals["THIRD-PARTY-NOTICES.json"])
 
+    def test_different_bundled_application_license_is_rejected(self):
+        summary, originals = GENERATOR.BUNDLE.verify_bundle(ROOT / "LICENSES.md")
+        originals["CompositorWin-LICENSE.md"] += b"changed"
+        with patch.object(GENERATOR.BUNDLE, "verify_bundle", return_value=(summary, originals)), patch.object(GENERATOR, "source_ranges", return_value=[{"path": name, "offset": 0, "bytes": len(text), "sha256": hashlib.sha256(text).hexdigest()} for name, text in originals.items()]):
+            with self.assertRaisesRegex(ValueError, "bundled application license differs"):
+                GENERATOR.generate(ROOT / "LICENSES.md")
+
+    def test_recreated_bundle_keeps_application_and_upstream_originals(self):
+        license_directory = self.directory / "third-party-licenses"
+        license_directory.mkdir()
+        for name, raw in self.originals.items():
+            if name.startswith("third-party-licenses/"):
+                (license_directory / name.removeprefix("third-party-licenses/")).write_bytes(raw)
+        notices = self.directory / "THIRD-PARTY-NOTICES.json"
+        notices.write_bytes(self.originals["THIRD-PARTY-NOTICES.json"])
+        output = self.directory / "LICENSES.md"
+        GENERATOR.BUNDLE.create_bundle(argparse.Namespace(source_bundle=ROOT / "LICENSES.md", notices=notices, license_dir=license_directory, output=output))
+        _, restored = GENERATOR.BUNDLE.verify_bundle(output)
+        self.assertEqual(restored, self.originals)
+        _, index, _, _ = GENERATOR.generate(output)
+        self.assertEqual(index["components"][0]["license"], "Apache-2.0")
+        self.assertEqual(index["components"][1]["license"], "MIT")
+
     def test_every_dependency_points_to_its_actual_license_originals(self):
-        for component in self.index["components"][3:]:
+        for component in self.index["components"][4:]:
             prefix = f"third-party-licenses/{component['name']}-{component['version']}-"
             sources = [self.index["originals"][source]["path"] for source in component["originals"]]
             self.assertTrue(sources)
@@ -99,6 +134,8 @@ class EmbeddedLicenseTests(unittest.TestCase):
         self.assertEqual(created.returncode, 0, created.stderr)
         original = target.read_bytes()
         self.assertLess(len(original), 2048)
+        self.assertIn("CompositorWin 主程序：Apache-2.0".encode(), original)
+        self.assertIn("原 Compositor 项目：MIT".encode(), original)
         self.assertEqual(self.run_cli("--check", "--verify-package-index", target).returncode, 0)
         self.assertNotEqual(self.run_cli("--check", "--write-package-index", target).returncode, 0)
         self.assertEqual(target.read_bytes(), original)

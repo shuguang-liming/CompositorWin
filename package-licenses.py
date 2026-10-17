@@ -84,6 +84,7 @@ def create_bundle(args):
         "LICENSE": source_originals["LICENSE"],
         "LICENSE-U2NET.txt": source_originals["LICENSE-U2NET.txt"],
         "THIRD-PARTY-NOTICES.json": args.notices.read_bytes(),
+        "CompositorWin-LICENSE.md": (Path(__file__).resolve().parent / "LICENSE.md").read_bytes(),
     }
     # Installer stubs/plugins accompany the app, outside the Cargo dependency graph.
     originals.update({name: raw for name, raw in source_originals.items()
@@ -95,6 +96,10 @@ def create_bundle(args):
         "# Compositor Windows 许可证与第三方声明\n\n"
         "本文件汇集应用、模型、第三方依赖和字体的原始许可证、版权声明及组件来源。"
         "各组件适用各自许可证；合并文件不改变任何许可条款。\n\n"
+        "CompositorWin 主程序及 Windows 移植新增代码采用 Apache License 2.0，"
+        "完整条款同时见根目录 LICENSE.md 和下方 CompositorWin-LICENSE.md。"
+        "原 Compositor 项目（Copyright (c) 2026 Wonder Assembly LLC）保留 MIT 许可，"
+        "其原文见下方 LICENSE；模型、依赖与字体分别保留各自许可。\n\n"
         "下方原文保留原始字节和换行，每段标注原文件名、大小及 SHA256。"
         "使用编辑器搜索组件名或文件名即可定位。\n\n"
         "原项目：https://github.com/robbietilton/Compositor\n\n"
