@@ -2,6 +2,8 @@
 
 核对日期：2026-10-17。原版为 [Compositor v1.5.3](https://github.com/robbietilton/Compositor/tree/v1.5.3)，本地源码位于 `D:\Desktop\Compositor To Win`；Windows 工程位于 `D:\Desktop\CompositorWin`。生产实现使用 Rust／WGSL，不编译或加载原版 Swift／C；原版 C 只用于开发时生成参照数据。
 
+Windows 当前版本为 **0.0.3**，下载见 [v0.0.3 发布页](https://github.com/shuguang-liming/CompositorWin/releases/tag/v0.0.3)。本版加入 16 位与 HDR 图层、CMYK 印刷输出、Camera Raw 大图改进、扫描线与渐进模糊、平滑圆角、命令搜索及导航小地图；下表逐项说明范围。原版 1.5.3 与 Windows 0.0.3 使用各自的版本号。
+
 本文区分“已写入生产路径”“已运行模块验证”和“最终应用验收”。“已接入”表示功能代码与调用已经落盘；本轮整仓检查、715 项测试、另两项显卡测试、Release、CLI 和便携包验证已经完成，实际范围及 GUI／安装验收状态见文末。模块通过不等同于全部交互均已验收。
 
 ## 对照依据
@@ -71,9 +73,9 @@ Windows 默认仍保存为一个 `.comp` 文件，容器版本仍为 1；读取�
 | RAW 完整导入 U16 | `upstream-153-raw-u16-20261017/`：当前生产模块隔离集成 4 项通过，合成 Bayer／线性 RGB DNG、4 组参数、非 257 倍数低位、7×6 图上 8 种 EXIF 方向逐 u16 一致，预览保持 8-bit | 无真实相机样片；最终整仓检查已通过，见文末统一记录 |
 | DeepPixels | `deep-pixels-1.5.3-20261017/`：10 项独立生产模块通过；原版 split／merge 四组逐 u16 一致，覆盖 Alpha／混通道／全部有限 half／细线面积缩小／HDR | 最终整仓包含 deep_pipeline 5 项通过，Release CLI 另验 PNG／TIFF 低位与 HDR 往返，见文末 |
 
-## 最终集成验证（2026-10-17）
+## 发布前功能集成验证（2026-10-17）
 
-以下证据位于 `D:\Desktop\CompositorWin\build\validation\`，验证记录与缓存不随源码或软件分发。应用版本仍为 0.0.2；这里的 1.5.3 指原版功能对照版本。
+以下证据位于 `D:\Desktop\CompositorWin\build\validation\`，验证记录与缓存不随源码或软件分发。下表记录版本号调整前、标识为 0.0.2 的功能集成基线，保留其实际测试结果；其中 EXE、ZIP、安装包的体积和 SHA256 仅对应该次基线产物，不用于核验 0.0.3 正式包。当前应用版本为 0.0.3，正式下载及校验信息以 [v0.0.3 发布页](https://github.com/shuguang-liming/CompositorWin/releases/tag/v0.0.3) 为准；这里的 1.5.3 指原版功能对照版本。
 
 | 范围 | 实际结果与证据 |
 | --- | --- |
@@ -90,6 +92,6 @@ Windows 默认仍保存为一个 `.comp` 文件，容器版本仍为 1；读取�
 
 GUI 手动记录还包含这些具体边界：Camera Raw 中切换直方图／矢量示波、自动白平衡显示 -81／-3、曝光 2.56、100% 原图以及取消；统一导出模态内 Ctrl+N／Ctrl+O 未穿透创建或打开文档，标签数保持不变。实际保存的 `gui-export-16.png` 为 22,679 字节、128×64、PNG IHDR 16-bit RGBA，SHA256 `f683ae599451b986d41a6447ed78a73a0749ddf50d156e7890262ed738ac8d9d`，随后 Ctrl+O 重开显示棋盘。导航器在默认关闭、800% 启用、1953.1% 拖动小地图及回到 100% 后隐藏的流程中观察正常。形状控件的填充位于半径前，半径 20／平滑启用时实际拖出 289×137 蓝色矩形，并另存 `gui-final-edit.comp`。
 
-本轮候选便携包和生产 setup 已生成且绑定同一 Release 身份；实际安装验收的 71 项结果属于随机 QA 身份，不替换用户现有正式安装。最终 `pr-split-20261017/program/final-compiled-input-check-05.json` 的编译输入 SHA256 仍为 `ddb6e8a7dfd28484e206d1a338dd65d97e426b5533d3115c4916fd1cf5268842`，与 All05 一致。多图层长列表中键、缩放反向光标、CMYK GUI、真实相机 RAW 和每个模态的拖放未逐项手动复测，只按对应自动测试、CLI 或模块记录陈述覆盖；本记录不声称全部手工验收。
+上述基线候选便携包和生产 setup 已生成且绑定同一 Release 身份；实际安装验收的 71 项结果属于随机 QA 身份，未覆盖用户已有正式安装。该次 `pr-split-20261017/program/final-compiled-input-check-05.json` 的编译输入 SHA256 为 `ddb6e8a7dfd28484e206d1a338dd65d97e426b5533d3115c4916fd1cf5268842`，与 All05 一致。0.0.3 的版本调整与正式打包使用独立发布记录，不将基线产物哈希沿用为新版哈希。多图层长列表中键、缩放反向光标、CMYK GUI、真实相机 RAW 和每个模态的拖放未逐项手动复测，只按对应自动测试、CLI 或模块记录陈述覆盖；本记录不声称全部手工验收。
 
 实测主机为 Windows 11 x64（build 26200），不是 Win10。真实 Win10 专业版 22H2 机器目前不可用，因此 Win10 实机、真实相机 RAW 画质和所有交互场景尚未得到完整验收；不把导入表检查、模块测试或本机观察外推为这些环境的通过记录。

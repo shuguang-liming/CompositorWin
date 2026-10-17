@@ -48,11 +48,20 @@
 
 | 选择 | 获取方式 |
 |:---|:---|
-| **安装版** | [下载 Setup EXE](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.2/Compositor-Windows-0.0.2-Setup-x64.exe) · 当前用户安装，支持覆盖升级与卸载 |
-| **便携版** | [下载 ZIP](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.2/Compositor-Windows-0.0.2-x64.zip) · 解压后运行 `compositor.exe` |
+| **安装版** | [下载 Setup EXE](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.3/Compositor-Windows-0.0.3-Setup-x64.exe) · 当前用户安装，支持覆盖升级与卸载 |
+| **便携版** | [下载 ZIP](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.3/Compositor-Windows-0.0.3-x64.zip) · 解压后运行 `compositor.exe` |
 | **源代码** | [查看发布记录](https://github.com/shuguang-liming/CompositorWin/releases) · [构建说明](#开发) |
 
-当前公开版本为 **0.0.2**。PDF 页面图片化编辑自本版起提供；旧版 0.0.1 不包含此功能。当前分支正在跟进原版 1.5.3：本文的高位深、HDR、CMYK、新滤镜与交互改进属于待审 PR，现有 Release 下载尚未替换。详细进展见 [迁移对照](docs/UPSTREAM_1.5.3.md)。
+当前版本为 **0.0.3**，已接入原版 1.5.3 的图像编辑与交互改进；1.5.3 是原项目版本，Windows 版使用独立版本号。PDF 页面图片化编辑自 0.0.2 起提供，旧版 0.0.1 不包含此功能。完整功能与限制见 [迁移对照](docs/UPSTREAM_1.5.3.md)。
+
+### 0.0.3 更新内容
+
+1. 支持 16 位 PNG/TIFF 和 HDR/EXR 图层，编辑、保存和导出时保留更多颜色与亮部细节。
+2. 新增 CMYK 软打样、色域警告和 JPEG/TIFF/PDF 印刷输出，支持导入 8 位 CMYK PSD/PSB。
+3. 改善 Camera Raw 大图处理，保持原图分辨率预览，加快直方图统计；RAW 导入增加传感器降噪和高光恢复。
+4. 新增扫描线、渐进模糊和平滑圆角，更新修复与内容填充算法。
+5. 新增命令搜索、画布单独显示、重复上次滤镜、90° 旋转、导航小地图和图片文件夹导入。
+6. 改善 Windows 图形初始化和显卡异常恢复，同步补齐 CLI 与 Agent 技能；主程序采用 Apache-2.0，开发脚本统一为 `project.ps1`。
 
 | 格式 | 打开 / 导入 | 保存 / 导出 |
 |:---|:---|:---|
@@ -73,7 +82,7 @@
 <!-- USER-GUIDE-BEGIN -->
 # Compositor Windows 简体中文版
 
-当前版本：**0.0.2**。本版增加 PDF 页面图片化编辑与导出，文末保留此前 1.0.x 的更新记录。
+当前版本：**0.0.3**。本版增加高位深、HDR、CMYK、新滤镜和导航工具，保留 0.0.2 起提供的 PDF 页面图片化编辑与导出；文末保留此前 1.0.x 的更新记录。
 
 PDF 编辑与导出需要 0.0.2 及后续包含该功能的程序。如果菜单中没有 PDF 相关选项，请先确认运行的是新版 `compositor.exe`。
 
@@ -81,13 +90,13 @@ PDF 编辑与导出需要 0.0.2 及后续包含该功能的程序。如果菜单
 
 ## 使用
 
-可以运行 `Compositor-Windows-0.0.2-Setup-x64.exe` 安装，也可以解压发行 ZIP，直接双击 `compositor.exe`。需要 Windows 10 22H2/Windows 11 x64。程序优先使用 Direct3D 12 或 Vulkan；如果旧驱动无法创建 WGPU 设备，会自动切换 OpenGL 界面和 CPU 合成，避免启动后立即退出。正式发行程序静态链接 MSVC 和 Universal C 运行库，无需另行安装 Visual C++ 运行库。普通使用无需 Rust、Python 或独立 ONNX Runtime。
+可以运行 `Compositor-Windows-0.0.3-Setup-x64.exe` 安装，也可以解压发行 ZIP，直接双击 `compositor.exe`。需要 Windows 10 22H2/Windows 11 x64。程序优先使用 Direct3D 12 或 Vulkan；如果旧驱动无法创建 WGPU 设备，会自动切换 OpenGL 界面和 CPU 合成，避免启动后立即退出。正式发行程序静态链接 MSVC 和 Universal C 运行库，无需另行安装 Visual C++ 运行库。普通使用无需 Rust、Python 或独立 ONNX Runtime。
 
 安装版仅安装到当前用户的 `%LOCALAPPDATA%\Programs\Compositor`，无需管理员权限，并提供桌面、开始菜单快捷方式。在 Windows“设置 → 应用”中卸载 Compositor，或运行安装目录里的卸载器。卸载只处理安装器登记的本软件文件、快捷方式和注册项；用户的 `.comp` 工程、设置及额外文件保留，其他目录不作清理。
 
 发生启动、显卡初始化或图片读取异常时，可查看程序目录下的 `preferences/diagnostics.log`。日志仅保存在本地，限制文件大小，不会自动上传；可能包含图片路径、尺寸和显卡信息，分享前可先检查内容。
 
-如果已安装此前的 1.0.x 版本，请先保存工程并卸载旧版，再安装 0.0.2；卸载会保留用户工程、设置和自行添加的文件。安装器会拒绝将较高版本号直接覆盖为较低版本号。
+如果已安装此前的 1.0.x 版本，请先保存工程并卸载旧版，再安装 0.0.3；卸载会保留用户工程、设置和自行添加的文件。安装器会拒绝将较高版本号直接覆盖为较低版本号。
 
 更新安装版时，先保存工程并关闭 Compositor，再双击新版安装 EXE。安装器识别已有版本，在原位置升级，保留工程、设置和自行添加的文件；同版可重新安装，旧版安装包会拒绝降级。如果程序文件正在使用或被修改，会在覆盖前停止，按提示处理后重新运行新版安装包。升级完成后使用新的卸载器。便携版更新时解压新版 ZIP，保留自己的工程和 `preferences` 设置。
 
