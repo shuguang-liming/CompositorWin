@@ -22,6 +22,10 @@ pub struct PdfPage {
     pub raster: Raster,
     pub size: PdfPageSize,
     pub index: u32,
+    /// Resolution the Windows renderer actually produced. It normally equals
+    /// the requested DPI, but some display stacks cap very large destinations;
+    /// keeping this value preserves the page's physical size in that case.
+    pub effective_dpi: f64,
 }
 
 fn validate_page_size(size: PdfPageSize) -> Result<()> {
@@ -52,6 +56,42 @@ fn raster_dimensions(size: PdfPageSize, dpi: u32) -> Result<(u32, u32)> {
         "PDF 页面像素尺寸过大，请降低 DPI"
     );
     Ok(dimensions)
+}
+
+/// Windows' PDF renderer generally returns exactly the requested pixel size.
+/// A few display stacks cap very large destinations instead, so accept a
+/// uniformly scaled result and report the resolution it actually represents.
+/// A non-uniform result would distort the page and remains an error.
+fn rendered_resolution(
+    requested_dpi: u32,
+    requested: (u32, u32),
+    actual: (u32, u32),
+) -> Result<f64> {
+    ensure!(
+        requested.0 > 0 && requested.1 > 0 && actual.0 > 0 && actual.1 > 0,
+        "PDF 渲染图像尺寸无效"
+    );
+    let scale_x = f64::from(actual.0) / f64::from(requested.0);
+    let scale_y = f64::from(actual.1) / f64::from(requested.1);
+    let largest = scale_x.max(scale_y);
+    ensure!(
+        (scale_x - scale_y).abs() <= largest * 0.02 && largest <= 4.,
+        "PDF 渲染尺寸与请求尺寸不一致（请求 {}×{}，实际 {}×{}）",
+        requested.0,
+        requested.1,
+        actual.0,
+        actual.1
+    );
+    let effective_dpi = f64::from(requested_dpi) * (scale_x + scale_y) / 2.;
+    ensure!(
+        (1. ..=9_600.).contains(&effective_dpi),
+        "PDF 渲染尺寸与请求尺寸不一致（请求 {}×{}，实际 {}×{}）",
+        requested.0,
+        requested.1,
+        actual.0,
+        actual.1
+    );
+    Ok(effective_dpi)
 }
 
 fn file_byte_budget() -> usize {
@@ -111,12 +151,13 @@ pub fn render_pages(path: &Path, indices: &[u32], dpi: u32) -> Result<Vec<PdfPag
                 .try_reserve_exact(dimensions.len())
                 .context("分配 PDF 页面列表失败")?;
             for (index, size, width, height) in dimensions {
-                let raster = native::render(&document, index, width, height)
+                let (raster, effective_dpi) = native::render(&document, index, width, height, dpi)
                     .with_context(|| format!("读取 PDF 第 {} 页", index + 1))?;
                 pages.push(PdfPage {
                     raster,
                     size,
                     index,
+                    effective_dpi,
                 });
             }
             Ok(pages)
@@ -393,9 +434,10 @@ mod native {
         index: u32,
         width: u32,
         height: u32,
-    ) -> Result<Raster> {
+        requested_dpi: u32,
+    ) -> Result<(Raster, f64)> {
         let page = document.GetPage(index)?;
-        let result = (|| -> Result<Raster> {
+        let result = (|| -> Result<(Raster, f64)> {
             let options = PdfPageRenderOptions::new()?;
             options.SetDestinationWidth(width)?;
             options.SetDestinationHeight(height)?;
@@ -425,17 +467,19 @@ mod native {
             encoded.resize(count as usize, 0);
             reader.ReadBytes(&mut encoded)?;
             let mut decoder = image::codecs::png::PngDecoder::new(Cursor::new(encoded))?;
-            ensure!(
-                decoder.dimensions() == (width, height),
-                "PDF 渲染尺寸与请求尺寸不一致"
-            );
+            let (actual_width, actual_height) = decoder.dimensions();
+            let effective_dpi =
+                super::rendered_resolution(requested_dpi, (width, height), decoder.dimensions())?;
             let mut limits = image::Limits::default();
-            limits.max_image_width = Some(width);
-            limits.max_image_height = Some(height);
-            limits.max_alloc = Some(u64::from(width) * u64::from(height) * 8);
+            limits.max_image_width = Some(actual_width);
+            limits.max_image_height = Some(actual_height);
+            limits.max_alloc = Some(u64::from(actual_width) * u64::from(actual_height) * 8);
             decoder.set_limits(limits)?;
             let image = image::DynamicImage::from_decoder(decoder)?.into_rgba8();
-            Ok(Raster::from_rgba(width, height, image.into_raw()))
+            Ok((
+                Raster::from_rgba(actual_width, actual_height, image.into_raw()),
+                effective_dpi,
+            ))
         })();
         let _ = page.Close();
         result
@@ -446,6 +490,29 @@ mod native {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn rendered_resolution_accepts_exact_and_uniformly_capped_output() {
+        assert_eq!(
+            rendered_resolution(300, (1200, 1600), (1200, 1600)).unwrap(),
+            300.
+        );
+        // A renderer cap returns a uniformly smaller bitmap; keep the physical
+        // page size by lowering the effective resolution.
+        let capped = rendered_resolution(600, (28_083, 19_866), (16_384, 11_592)).unwrap();
+        assert!((capped - 600. * 16_384. / 28_083.).abs() < 0.5, "{capped}");
+        // A one-pixel rounding difference is still uniform enough.
+        let rounded = rendered_resolution(150, (1000, 707), (1000, 708)).unwrap();
+        assert!((rounded - 150. * 1.000_71).abs() < 0.1, "{rounded}");
+    }
+
+    #[test]
+    fn rendered_resolution_rejects_distorted_or_impossible_output() {
+        assert!(rendered_resolution(150, (1000, 700), (700, 1000)).is_err());
+        assert!(rendered_resolution(150, (1000, 700), (500, 700)).is_err());
+        assert!(rendered_resolution(150, (0, 700), (10, 10)).is_err());
+        assert!(rendered_resolution(150, (1000, 700), (5000, 3500)).is_err());
+    }
 
     #[test]
     fn page_dimensions_validate_dpi_and_memory_bounds() {

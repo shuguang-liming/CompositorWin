@@ -113,10 +113,18 @@ impl EditorApp {
             );
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             let mut sessions = Vec::new();
+            let mut reduced = Vec::new();
             for page in pages {
                 let name = format!("{stem} - 第 {} 页", page.index + 1);
                 let mut doc = Document::new(page.raster.width, page.raster.height);
-                doc.resolution = f64::from(dpi);
+                doc.resolution = page.effective_dpi;
+                if page.effective_dpi + 0.5 < f64::from(dpi) {
+                    reduced.push(format!(
+                        "第 {} 页 {:.0} DPI",
+                        page.index + 1,
+                        page.effective_dpi
+                    ));
+                }
                 let layer = Layer::raster(&name, page.raster);
                 doc.active_layer_id = Some(layer.id);
                 doc.layers = vec![layer];
@@ -125,11 +133,19 @@ impl EditorApp {
                 session.pdf_size = Some((
                     session.doc.width,
                     session.doc.height,
-                    f64::from(dpi),
+                    page.effective_dpi,
                     page.size,
                 ));
                 sessions.push(session);
             }
+            let reduced_note = if reduced.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "；页面过大，Windows 已按较低清晰度渲染（{}），尺寸与页序不变",
+                    reduced.join("、")
+                )
+            };
             // Check the entire batch before adding any tabs; an oversized PDF
             // must leave the existing workspace intact.
             self.check_workspace_documents(
@@ -142,7 +158,11 @@ impl EditorApp {
                     path.clone(),
                     image_io::ImportResult {
                         document: session.doc,
-                        conversions: vec![],
+                        conversions: if reduced_note.is_empty() {
+                            vec![]
+                        } else {
+                            vec![reduced_note.trim_start_matches('；').to_string()]
+                        },
                     },
                     Some(target),
                 );
@@ -151,9 +171,9 @@ impl EditorApp {
                     self.install_canvas_session(session);
                 }
                 self.remember(&path);
-                self.message = Some(
-                    "PDF 页面已打开，可使用绘图工具编辑；Ctrl+S 保存可编辑的 .comp 项目".into(),
-                );
+                self.message = Some(format!(
+                    "PDF 页面已打开，可使用绘图工具编辑；Ctrl+S 保存可编辑的 .comp 项目{reduced_note}"
+                ));
             }
             Ok(())
         })();
