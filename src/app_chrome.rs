@@ -75,6 +75,7 @@ impl EditorApp {
                     command,
                     Command::New
                         | Command::Open
+                        | Command::OpenPdf
                         | Command::Import
                         | Command::ImportFolder
                         | Command::Close

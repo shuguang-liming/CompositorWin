@@ -53,6 +53,21 @@ function Resolve-ProjectPath([string]$Root, [string]$RelativePath) {
     return $full
 }
 
+# The Cargo target directory may be a junction that shares a warm dependency
+# cache with another workspace. Build products inside it are consumed as plain
+# files and verified by hash, so allow that documented cache link while still
+# requiring the output to stay inside this repository.
+function Resolve-ProjectBuildPath([string]$Root, [string]$RelativePath) {
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or [System.IO.Path]::IsPathRooted($RelativePath) -or $RelativePath.Contains(':')) {
+        throw "Build output requires a relative file path: $RelativePath"
+    }
+    $full = [System.IO.Path]::GetFullPath((Join-Path $Root $RelativePath))
+    $prefix = $Root + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw "Path leaves repository: $RelativePath" }
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Build output is missing: $RelativePath" }
+    return $full
+}
+
 function Write-ProjectJson([object]$Value, [string]$Path) {
     $json = ConvertTo-Json -InputObject $Value -Depth 12
     [System.IO.File]::WriteAllText($Path, $json + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
@@ -165,8 +180,17 @@ function Invoke-Cargo([string[]]$Arguments) {
             Set-Item -LiteralPath "Env:$($crtFlags.variable)" -Value $crtFlags.value
             Write-Output "Release CRT: -C target-feature=+crt-static via $($crtFlags.variable); restored after this invocation."
         }
-        & $cargo @actual
-        $code = $LASTEXITCODE
+        # Windows PowerShell 5.1 turns native stderr into error records; a
+        # dependency warning must not abort the build before its exit code is
+        # read. The exit code remains the sole pass/fail signal.
+        $nativeErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $cargo @actual
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $nativeErrorAction
+        }
     }
     finally {
         foreach ($name in $savedFlags.Keys) {
@@ -283,7 +307,10 @@ if ($executableVersion.ProductVersion -ne $appVersion -or $executableVersion.Fil
     $executableVersion.FileBuildPart -ne [int]$versionParts[2] -or $executableVersion.FilePrivatePart -ne 0) {
     throw 'The portable executable version differs from Cargo.toml; package the new Release before creating its installer.'
 }
-$manifest = @(Get-Content -LiteralPath (Join-Path $payload 'package-files.json') -Raw | ConvertFrom-Json)
+$manifest = Get-Content -LiteralPath (Join-Path $payload 'package-files.json') -Raw | ConvertFrom-Json
+# Windows PowerShell 5.1 emits a JSON array as one pipeline object; wrapping
+# the variable keeps the per-file entries instead of one array-valued row.
+$manifest = @($manifest)
 $fileRecords = @()
 $defines = @(('!define APP_VERSION "' + $appVersion + '"'), ('!define WINDOWS_VERSION "' + $windowsVersion + '"'))
 foreach ($name in $files.Keys) {
@@ -364,6 +391,121 @@ Write-ProjectJson $report (Join-Path $record "installer-$mode.json")
 $report | ConvertTo-Json -Depth 8
 }
 
+function Test-ProjectPdf {
+[CmdletBinding()]
+param(
+    [string]$ExePath = 'build/rust/release/compositor.exe',
+    [string]$OutputDirectory = ''
+)
+$ErrorActionPreference = 'Stop'
+$root = Get-ProjectRoot
+$executable = if ([IO.Path]::IsPathRooted($ExePath)) { (Get-Item -LiteralPath $ExePath).FullName } else { Resolve-ProjectBuildPath $root $ExePath }
+if (-not $OutputDirectory) { $OutputDirectory = 'build/validation/pdf-' + [Guid]::NewGuid().ToString('N') }
+$output = Resolve-ProjectPath $root $OutputDirectory
+if (Test-Path -LiteralPath $output) { throw 'PDF verification retains existing evidence; choose a fresh output directory.' }
+[IO.Directory]::CreateDirectory($output) | Out-Null
+$steps = New-Object 'System.Collections.Generic.List[object]'
+$report = [ordered]@{
+    status = 'failed'; checkedUtc = (Get-Date).ToUniversalTime().ToString('o')
+    executable = $executable; executableSha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash
+    steps = $steps
+}
+function Invoke-PdfCli([string[]]$CliArguments) {
+    $text = (& $executable cli @CliArguments | Out-String)
+    $code = $LASTEXITCODE
+    $evidence = '{0:D2}-{1}.json' -f ($steps.Count + 1), $CliArguments[0]
+    [IO.File]::WriteAllText((Join-Path $output $evidence), $text, (New-Object Text.UTF8Encoding($false)))
+    $response = $text | ConvertFrom-Json
+    $steps.Add([pscustomobject]@{ command = $CliArguments[0]; exitCode = $code; ok = $response.ok; evidence = $evidence })
+    if ($code -ne 0 -or $response.ok -ne $true) { throw "PDF verification failed: $($CliArguments[0]); see $evidence" }
+    return $response.result
+}
+function Assert-PdfPixel([string]$ImagePath, [int]$X, [int]$Y, [int[]]$Expected) {
+    $bitmap = [Drawing.Bitmap]::new($ImagePath)
+    try {
+        $pixel = $bitmap.GetPixel($X, $Y)
+        $actual = @([int]$pixel.R, [int]$pixel.G, [int]$pixel.B)
+        for ($channel = 0; $channel -lt 3; $channel++) {
+            if ([Math]::Abs($actual[$channel] - $Expected[$channel]) -gt 8) {
+                throw "PDF pixel mismatch at ${X},${Y}: $($actual -join ',')"
+            }
+        }
+    } finally { $bitmap.Dispose() }
+}
+try {
+    $capabilities = Invoke-PdfCli @('capabilities')
+    if ('pdf-info' -notin $capabilities.methods -or 'pdf-open' -notin $capabilities.methods -or
+        'pdf' -notin $capabilities.exportFormats -or $capabilities.pdf.editing -ne 'rasterized_pages') {
+        throw 'The packaged application does not support PDF import, editing and export.'
+    }
+    $report.applicationVersion = $capabilities.applicationVersion
+    # A standard two-page vector/text PDF exercises more than our image-only exporter.
+    $first = "1 0 0 rg 0 0 144 72 re f`n0 0 0 rg BT /F1 10 Tf 8 52 Td (PDF import page one) Tj ET`n"
+    $second = "0 1 0 rg 0 0 72 144 re f`n0 0 0 rg BT /F1 10 Tf 8 120 Td (Page two) Tj ET`n"
+    $objects = @(
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Count 2 /Kids [3 0 R 5 0 R] >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 144 72] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>',
+        "<< /Length $($first.Length) >>`nstream`n${first}endstream",
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 144] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>',
+        "<< /Length $($second.Length) >>`nstream`n${second}endstream",
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+    )
+    $pdf = [Text.StringBuilder]::new("%PDF-1.4`n")
+    $offsets = New-Object 'System.Collections.Generic.List[int]'
+    for ($index = 0; $index -lt $objects.Count; $index++) {
+        $offsets.Add($pdf.Length)
+        [void]$pdf.Append("$($index + 1) 0 obj`n$($objects[$index])`nendobj`n")
+    }
+    $xref = $pdf.Length
+    [void]$pdf.Append("xref`n0 8`n0000000000 65535 f `n")
+    foreach ($offset in $offsets) { [void]$pdf.Append(('{0:D10} 00000 n ' -f $offset) + "`n") }
+    [void]$pdf.Append("trailer`n<< /Size 8 /Root 1 0 R >>`nstartxref`n$xref`n%%EOF`n")
+    $source = Join-Path $output '中文 两页矢量.PDF'
+    [IO.File]::WriteAllBytes($source, [Text.Encoding]::ASCII.GetBytes($pdf.ToString()))
+    $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    $info = Invoke-PdfCli @('pdf-info', $source)
+    if ($info.pageCount -ne 2) { throw 'PDF page discovery failed.' }
+    Add-Type -AssemblyName System.Drawing
+    foreach ($page in 1..2) {
+        $projectPath = Join-Path $output "page-$page.comp"
+        $opened = Invoke-PdfCli @('pdf-open', $source, '--page', $page.ToString(), '--dpi', '72', '--output', $projectPath)
+        $expectedSize = if ($page -eq 1) { @(144, 72) } else { @(72, 144) }
+        if ($opened.saved.document.width -ne $expectedSize[0] -or $opened.saved.document.height -ne $expectedSize[1]) {
+            throw "PDF page $page has incorrect dimensions or orientation."
+        }
+        $imagePath = Join-Path $output "page-$page.png"
+        $null = Invoke-PdfCli @('export', $projectPath, '--output', $imagePath)
+        $expectedColor = if ($page -eq 1) { @(255, 0, 0) } else { @(0, 255, 0) }
+        Assert-PdfPixel $imagePath 10 10 $expectedColor
+    }
+    $operations = Join-Path $output 'operations.json'
+    [IO.File]::WriteAllText($operations, '[{"op":"add_shape","kind":"rectangle","rect":[20,10,30,30],"color":[0,0,255,255]}]', (New-Object Text.UTF8Encoding($false)))
+    $edited = Join-Path $output '编辑后.comp'
+    $null = Invoke-PdfCli @('apply', (Join-Path $output 'page-1.comp'), '--operations', ('@' + $operations), '--output', $edited)
+    $inspected = Invoke-PdfCli @('inspect', $edited)
+    if ($inspected.document.layerCount -ne 2) { throw 'PDF edits were not preserved in the saved project.' }
+    $exported = Join-Path $output '编辑后.pdf'
+    $null = Invoke-PdfCli @('export', $edited, '--output', $exported)
+    $reopened = Join-Path $output '重新导入.comp'
+    $null = Invoke-PdfCli @('pdf-open', $exported, '--page', '1', '--dpi', '72', '--output', $reopened)
+    $proof = Join-Path $output '重新导入.png'
+    $null = Invoke-PdfCli @('export', $reopened, '--output', $proof)
+    Assert-PdfPixel $proof 35 25 @(0, 0, 255)
+    Assert-PdfPixel $proof 80 25 @(255, 0, 0)
+    if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $sourceHash) { throw 'PDF import modified the original file.' }
+    $report.status = 'passed'
+    $report.scenarios = @('two-page vector/text PDF', 'Unicode uppercase PDF path', 'page order and orientation',
+        'editable project roundtrip', 'new shape preserved', 'PDF export and reimport', 'independent pixel checks', 'source preserved')
+} catch {
+    $report.error = $_.Exception.Message
+    throw
+} finally {
+    Write-ProjectJson $report (Join-Path $output 'result.json')
+}
+$report | ConvertTo-Json -Depth 8
+}
+
 # Former verify-package.ps1
 function Test-ProjectPackage {
 [CmdletBinding()]
@@ -400,7 +542,7 @@ $expected['package-files.json'] = [pscustomobject]@{
 }
 $actualFiles = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File)
 if ($actualFiles.Count -ne $expected.Count) { throw 'Unrecorded files exist in the package directory.' }
-$releaseHash = (Get-FileHash -LiteralPath (Resolve-ProjectPath $root 'build/rust/release/compositor.exe') -Algorithm SHA256).Hash
+$releaseHash = (Get-FileHash -LiteralPath (Resolve-ProjectBuildPath $root 'build/rust/release/compositor.exe') -Algorithm SHA256).Hash
 if ($expected['compositor.exe'].sha256 -ne $releaseHash) { throw 'The package does not contain the validated Release executable.' }
 $runtime = Get-Content -LiteralPath (Join-Path $packageRoot 'runtime-imports.json') -Raw | ConvertFrom-Json
 if ($runtime.executable.sha256 -ne $releaseHash) { throw 'The PE dependency audit describes a different executable.' }
@@ -437,10 +579,12 @@ if ($checked.Count -ne $expected.Count) { throw 'The ZIP omits packaged files.' 
 $licenseResult = Invoke-ProjectPython -Name 'generate-open-source-licenses' -RepositoryRoot $root -Arguments @('--check', '--verify-exe', (Join-Path $packageRoot 'compositor.exe'), '--verify-package-index', (Join-Path $packageRoot 'LICENSES.md'))
 if ($LASTEXITCODE -ne 0) { throw 'Embedded license original-text or package index verification failed.' }
 $licenseSummary = ($licenseResult -join [Environment]::NewLine) | ConvertFrom-Json
+$pdfVerification = Test-ProjectPdf -ExePath (Join-Path $packageRoot 'compositor.exe') | ConvertFrom-Json
 $report = [pscustomobject]@{
     status = 'passed'; checkedUtc = (Get-Date).ToUniversalTime().ToString('o')
     package = $packageRelative; manifestFiles = $manifest.Count; zipFiles = $checked.Count
     embeddedLicenses = $licenseSummary
+    pdfVerification = $pdfVerification
     executableSha256 = $releaseHash
     archiveBytes = (Get-Item -LiteralPath $archivePath).Length
     archiveSha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
@@ -448,7 +592,7 @@ $report = [pscustomobject]@{
 $reportFile = Resolve-ProjectPath $root $ReportPath
 [System.IO.Directory]::CreateDirectory((Split-Path -Parent $reportFile)) | Out-Null
 Write-ProjectJson $report $reportFile
-$report | ConvertTo-Json
+$report | ConvertTo-Json -Depth 12
 }
 
 # Former verify-windows-compatibility.ps1
@@ -1593,6 +1737,7 @@ function Invoke-ProjectCommand {
     $powershellCommands = @{
         Build = 'Invoke-ProjectBuild'; PackageInstaller = 'Invoke-ProjectInstaller'
         VerifyPackage = 'Test-ProjectPackage'; VerifyWindowsCompatibility = 'Test-ProjectWindowsCompatibility'
+        VerifyPdf = 'Test-ProjectPdf'
     }
     if ($Name -eq 'Help') {
         @'
@@ -1603,6 +1748,7 @@ CompositorWin development tools (one source script)
   project.ps1 PackageInstaller -CompilerPath MAKENSIS [-PackageName NAME]
                    [-InstallerName NAME] [-RecordDirectory PATH] [-QaName NAME]
   project.ps1 VerifyPackage [-RepositoryRoot PATH] [-PackageName NAME] [-ReportPath PATH]
+  project.ps1 VerifyPdf [-ExePath PATH] [-OutputDirectory PATH]
   project.ps1 VerifyWindowsCompatibility [-ExePath PATH] [-OutputDirectory PATH]
                    [-StartupTimeoutSeconds 30] [-CloseTimeoutSeconds 20] [-KeepProcesses]
   project.ps1 AuditRuntime [--exe PATH] [--validation PATH] [--validation-log PATH]
