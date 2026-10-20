@@ -195,6 +195,12 @@ fn entries() -> &'static [Entry] {
             ("新建画布…", "文件", "New|New Canvas|Create", New),
             ("打开…", "文件", "Open|Open Image|Open Project", Open),
             (
+                "打开 PDF…",
+                "文件",
+                "Open PDF|Import PDF|打开PDF|导入PDF|PDF 页面|PDF 导入",
+                OpenPdf,
+            ),
+            (
                 "导入为图层…",
                 "文件",
                 "Import|Import Image|Import Layer",
@@ -722,6 +728,22 @@ mod tests {
             match_score(&normalized("旋转"), &normalized("旋转画布")).unwrap()
                 < match_score(&normalized("旋转"), &normalized("顺时针旋转画布")).unwrap()
         );
+    }
+
+    #[test]
+    fn pdf_import_queries_find_open_instead_of_export() {
+        for query in ["打开PDF", "导入PDF", "Open PDF", "Import PDF"] {
+            let matches = results(query);
+            let first = matches.first().map(|&index| &entries()[index]);
+            assert_eq!(
+                first.map(|entry| entry.title.as_str()),
+                Some("打开 PDF…"),
+                "{query} must find the PDF import action first"
+            );
+            assert!(
+                matches!(first.unwrap().action, Action::Command(command) if !matches!(command, Command::ExportPdf))
+            );
+        }
     }
 
     #[test]

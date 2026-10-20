@@ -450,6 +450,7 @@ enum Dialog {
 enum Command {
     New,
     Open,
+    OpenPdf,
     Import,
     ImportFolder,
     Save,
@@ -3438,6 +3439,7 @@ impl EditorApp {
                         for (label, c) in [
                             ("新建…     Ctrl+N", Command::New),
                             ("打开…     Ctrl+O", Command::Open),
+                            ("打开 PDF…", Command::OpenPdf),
                             ("导入为图层…", Command::Import),
                             ("导入图像文件夹…", Command::ImportFolder),
                             ("保存       Ctrl+S", Command::Save),
@@ -4065,6 +4067,15 @@ impl EditorApp {
                     placeholder.placeholder = true;
                     self.tabs.push(placeholder);
                     self.activate_tab(self.tabs.len() - 1);
+                }
+            }
+            Command::OpenPdf => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("打开 PDF 页面")
+                    .add_filter("PDF 文档", &["pdf"])
+                    .pick_file()
+                {
+                    self.open(path, false);
                 }
             }
             Command::Open | Command::Import => {

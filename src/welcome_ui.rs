@@ -188,6 +188,12 @@ impl EditorApp {
                     if capsule(ui, "导入图像", false).clicked() {
                         self.command(Command::Import);
                     }
+                    if capsule(ui, "打开 PDF", false)
+                        .on_hover_text("选择 PDF 页码和清晰度，再使用绘图工具编辑")
+                        .clicked()
+                    {
+                        self.command(Command::OpenPdf);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         create |= ui
                             .add_enabled_ui(valid, |ui| capsule(ui, "创建画布", true))

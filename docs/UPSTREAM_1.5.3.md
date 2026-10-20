@@ -2,7 +2,7 @@
 
 核对日期：2026-10-17。原版为 [Compositor v1.5.3](https://github.com/robbietilton/Compositor/tree/v1.5.3)，本地源码位于 `D:\Desktop\Compositor To Win`；Windows 工程位于 `D:\Desktop\CompositorWin`。生产实现使用 Rust／WGSL，不编译或加载原版 Swift／C；原版 C 只用于开发时生成参照数据。
 
-Windows 当前版本为 **0.0.3**，下载见 [v0.0.3 发布页](https://github.com/shuguang-liming/CompositorWin/releases/tag/v0.0.3)。本版加入 16 位与 HDR 图层、CMYK 印刷输出、Camera Raw 大图改进、扫描线与渐进模糊、平滑圆角、命令搜索及导航小地图；下表逐项说明范围。原版 1.5.3 与 Windows 0.0.3 使用各自的版本号。
+Windows 当前版本为 **0.0.4**，下载见 [v0.0.4 发布页](https://github.com/shuguang-liming/CompositorWin/releases/tag/v0.0.4)。0.0.4 补充明确的 PDF 导入入口；下文保留 0.0.3 迁移验收记录及其产物身份。0.0.3 加入 16 位与 HDR 图层、CMYK 印刷输出、Camera Raw 大图改进、扫描线与渐进模糊、平滑圆角、命令搜索及导航小地图；下表逐项说明范围。原版 1.5.3 与 Windows 版使用各自的版本号。
 
 本文区分“已写入生产路径”“已运行模块验证”和“最终应用验收”。“已接入”表示功能代码与调用已经落盘；本轮整仓检查、715 项测试、另两项显卡测试、Release、CLI 和便携包验证已经完成，实际范围及 GUI／安装验收状态见文末。模块通过不等同于全部交互均已验收。
 

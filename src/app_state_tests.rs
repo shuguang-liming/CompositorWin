@@ -4509,6 +4509,92 @@ fn pdf_pages_open_as_separate_editable_tabs_with_names_sizes_and_resolution() {
     assert_eq!(session.doc, before);
 }
 
+#[cfg(windows)]
+#[test]
+fn pdf_file_import_runs_through_page_dialog_and_opens_editable_tabs() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("中文 两页.PDF");
+    crate::pdf_io::export_pages(
+        &path,
+        [(72, 36, [255, 0, 0, 255]), (36, 72, [0, 255, 0, 255])]
+            .into_iter()
+            .map(|(width, height, color)| {
+                Ok((
+                    Raster::solid(width, height, color),
+                    crate::pdf_io::PdfPageSize {
+                        width_points: f64::from(width),
+                        height_points: f64::from(height),
+                    },
+                ))
+            }),
+    )
+    .unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let mut app = headless_app();
+    let ctx = egui::Context::default();
+    assert!(app.command_available(Command::OpenPdf));
+    app.open(path.clone(), false);
+    assert_eq!(app.pending_io, 1);
+    finish_gui_background_event(&mut app, &ctx);
+    dialog_frame(&mut app, &ctx, vec![]);
+    assert!(app.pdf_ui.is_open());
+    assert!(app.is_welcome());
+    assert!(!app.command_available(Command::OpenPdf));
+    click_dialog_button(&mut app, &ctx, "打开页面");
+    assert_eq!(app.pending_io, 1);
+    finish_gui_background_event(&mut app, &ctx);
+    assert_eq!(app.pending_io, 0);
+    assert_eq!(app.tabs.len(), 2);
+    assert!(!app.pdf_ui.is_open());
+    for (index, session) in app.tabs.iter().enumerate() {
+        assert!(!session.placeholder);
+        assert!(session.title().contains(&format!("第 {} 页", index + 1)));
+        assert_eq!(session.doc.resolution, 300.);
+        assert_eq!(
+            [session.doc.width, session.doc.height],
+            if index == 0 { [300, 150] } else { [150, 300] }
+        );
+        assert_eq!(
+            session
+                .doc
+                .active()
+                .unwrap()
+                .image
+                .as_ref()
+                .unwrap()
+                .get(20, 20),
+            if index == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 255, 0, 255]
+            }
+        );
+    }
+    let before = app.session().doc.clone();
+    app.tool = Tool::Brush;
+    app.diameter = 8.;
+    app.hardness = 1.;
+    app.opacity = 1.;
+    app.foreground = [0, 0, 255, 255];
+    app.begin_brush([20.5, 20.5]);
+    app.finish_brush(before.clone(), [20.5, 20.5]);
+    assert!(app.session().history.is_modified());
+    assert_eq!(
+        app.session()
+            .doc
+            .active()
+            .unwrap()
+            .image
+            .as_ref()
+            .unwrap()
+            .get(20, 20),
+        [0, 0, 255, 255]
+    );
+    app.command(Command::Undo);
+    assert_eq!(app.session().doc, before);
+    assert_eq!(std::fs::read(path).unwrap(), original);
+}
+
 #[test]
 fn pdf_multiple_pages_are_rejected_atomically_for_import_as_layer() {
     let mut app = headless_app();
@@ -4695,6 +4781,7 @@ fn closing_last_clean_tab_restores_welcome_and_command_guards() {
     assert!(!app.command_available(Command::Save));
     assert!(!app.command_available(Command::ExportPng));
     assert!(app.command_available(Command::Open));
+    assert!(app.command_available(Command::OpenPdf));
     assert!(app.command_available(Command::Paste));
 }
 

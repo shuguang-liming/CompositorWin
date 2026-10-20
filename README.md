@@ -48,11 +48,17 @@
 
 | 选择 | 获取方式 |
 |:---|:---|
-| **安装版** | [下载 Setup EXE](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.3/Compositor-Windows-0.0.3-Setup-x64.exe) · 当前用户安装，支持覆盖升级与卸载 |
-| **便携版** | [下载 ZIP](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.3/Compositor-Windows-0.0.3-x64.zip) · 解压后运行 `compositor.exe` |
+| **安装版** | [下载 Setup EXE](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.4/Compositor-Windows-0.0.4-Setup-x64.exe) · 当前用户安装，支持覆盖升级与卸载 |
+| **便携版** | [下载 ZIP](https://github.com/shuguang-liming/CompositorWin/releases/download/v0.0.4/Compositor-Windows-0.0.4-x64.zip) · 解压后运行 `compositor.exe` |
 | **源代码** | [查看发布记录](https://github.com/shuguang-liming/CompositorWin/releases) · [构建说明](#开发) |
 
-当前版本为 **0.0.3**，已接入原版 1.5.3 的图像编辑与交互改进；1.5.3 是原项目版本，Windows 版使用独立版本号。PDF 页面图片化编辑自 0.0.2 起提供，旧版 0.0.1 不包含此功能。完整功能与限制见 [迁移对照](docs/UPSTREAM_1.5.3.md)。
+当前版本为 **0.0.4**，保留原版 1.5.3 的图像编辑与交互改进；1.5.3 是原项目版本，Windows 版使用独立版本号。PDF 页面图片化编辑自 0.0.2 起提供，0.0.4 新增明确的“打开 PDF”入口；旧版 0.0.1 不包含此功能。完整功能与限制见 [迁移对照](docs/UPSTREAM_1.5.3.md)。
+
+### 0.0.4 更新内容
+
+1. 文件菜单和欢迎页新增“打开 PDF”，选择页码和清晰度后即可使用绘图工具修改页面。
+2. 搜索“打开 PDF”“导入 PDF”或“Open PDF”可以直接找到导入入口。
+3. 更新 PDF 使用说明，并将“导入、修改、保存、导出、重新打开”的完整检查加入发行包验证。
 
 ### 0.0.3 更新内容
 
@@ -82,21 +88,21 @@
 <!-- USER-GUIDE-BEGIN -->
 # Compositor Windows 简体中文版
 
-当前版本：**0.0.3**。本版增加高位深、HDR、CMYK、新滤镜和导航工具，保留 0.0.2 起提供的 PDF 页面图片化编辑与导出；文末保留此前 1.0.x 的更新记录。
+当前版本：**0.0.4**。文件菜单和欢迎页均可直接“打开 PDF”，支持选页、绘图修改和重新导出；保留高位深、HDR、CMYK、新滤镜和导航工具。文末保留此前 1.0.x 的更新记录。
 
-PDF 编辑与导出需要 0.0.2 及后续包含该功能的程序。如果菜单中没有 PDF 相关选项，请先确认运行的是新版 `compositor.exe`。
+PDF 编辑与导出自 0.0.2 起提供。0.0.4 可选择“文件 → 打开 PDF…”或欢迎页“打开 PDF”；0.0.2／0.0.3 可用“文件 → 打开…”选中 PDF。如果只有导出相关提示，请在 `compositor.exe` 的“属性 → 详细信息”核对产品版本，并用新版安装包升级或运行新版便携目录中的 `compositor.exe`。
 
 支持图层、蒙版、绘画、选区、文字、形状、调色和滤镜的桌面图像编辑器，使用 Rust、egui 和 wgpu。
 
 ## 使用
 
-可以运行 `Compositor-Windows-0.0.3-Setup-x64.exe` 安装，也可以解压发行 ZIP，直接双击 `compositor.exe`。需要 Windows 10 22H2/Windows 11 x64。程序优先使用 Direct3D 12 或 Vulkan；如果旧驱动无法创建 WGPU 设备，会自动切换 OpenGL 界面和 CPU 合成，避免启动后立即退出。正式发行程序静态链接 MSVC 和 Universal C 运行库，无需另行安装 Visual C++ 运行库。普通使用无需 Rust、Python 或独立 ONNX Runtime。
+可以运行 `Compositor-Windows-0.0.4-Setup-x64.exe` 安装，也可以解压发行 ZIP，直接双击 `compositor.exe`。需要 Windows 10 22H2/Windows 11 x64。程序优先使用 Direct3D 12 或 Vulkan；如果旧驱动无法创建 WGPU 设备，会自动切换 OpenGL 界面和 CPU 合成，避免启动后立即退出。正式发行程序静态链接 MSVC 和 Universal C 运行库，无需另行安装 Visual C++ 运行库。普通使用无需 Rust、Python 或独立 ONNX Runtime。
 
 安装版仅安装到当前用户的 `%LOCALAPPDATA%\Programs\Compositor`，无需管理员权限，并提供桌面、开始菜单快捷方式。在 Windows“设置 → 应用”中卸载 Compositor，或运行安装目录里的卸载器。卸载只处理安装器登记的本软件文件、快捷方式和注册项；用户的 `.comp` 工程、设置及额外文件保留，其他目录不作清理。
 
 发生启动、显卡初始化或图片读取异常时，可查看程序目录下的 `preferences/diagnostics.log`。日志仅保存在本地，限制文件大小，不会自动上传；可能包含图片路径、尺寸和显卡信息，分享前可先检查内容。
 
-如果已安装此前的 1.0.x 版本，请先保存工程并卸载旧版，再安装 0.0.3；卸载会保留用户工程、设置和自行添加的文件。安装器会拒绝将较高版本号直接覆盖为较低版本号。
+如果已安装此前的 1.0.x 版本，请先保存工程并卸载旧版，再安装 0.0.4；卸载会保留用户工程、设置和自行添加的文件。安装器会拒绝将较高版本号直接覆盖为较低版本号。
 
 更新安装版时，先保存工程并关闭 Compositor，再双击新版安装 EXE。安装器识别已有版本，在原位置升级，保留工程、设置和自行添加的文件；同版可重新安装，旧版安装包会拒绝降级。如果程序文件正在使用或被修改，会在覆盖前停止，按提示处理后重新运行新版安装包。升级完成后使用新的卸载器。便携版更新时解压新版 ZIP，保留自己的工程和 `preferences` 设置。
 
@@ -121,7 +127,7 @@ PDF 编辑与导出需要 0.0.2 及后续包含该功能的程序。如果菜单
 
 页面会先转为图片，再使用现有绘图工具编辑。
 
-1. 选择“文件 → 打开…”并选中 PDF，也可以把 PDF 拖进软件。在“打开 PDF 页面”对话框填写页码，例如 `1,3-5`。页码从 1 开始，选中的页面按原文档顺序打开。
+1. 选择“文件 → 打开 PDF…”或欢迎页“打开 PDF”，选中 PDF；也可使用 `Ctrl+O` 或拖放。在“打开 PDF 页面”对话框填写页码，例如 `1,3-5`。页码从 1 开始，选中的页面按原文档顺序打开。
 2. 选择清晰度：默认 **300 DPI**，还可选择 72、150 或 600 DPI。日常查看可用 150 DPI，需要文字与细线细节可用 300 DPI；较高 DPI 和更多页面会占用更多内存，页面过大时降低 DPI 或分批打开。
 3. 点击“打开页面”。每页成为一个独立标签页，可以用画笔、文字、形状、图层和蒙版修改。要把一页叠到现有画布上，使用“文件 → 导入为图层…”，每次选择一页。
 4. 按 `Ctrl+S` 将需要继续编辑的页面分别保存为 `.comp` 工程。保存工程不会写回原 PDF，也不会自动把所有标签页存进一个工程。
@@ -370,10 +376,11 @@ New-Item -ItemType Directory -Force build/validation/current | Out-Null
 .\project.ps1 AuditRuntime
 .\project.ps1 Build -Action Package -Offline -Jobs 1 -PackageName Compositor-Windows-next
 .\project.ps1 VerifyPackage -PackageName Compositor-Windows-next
+.\project.ps1 VerifyPdf -ExePath dist/Compositor-Windows-next/compositor.exe
 .\project.ps1 PackageInstaller -CompilerPath 'D:\Tools\nsis-3.11\makensis.exe' -PackageName Compositor-Windows-next -InstallerName Compositor-Windows-next-Setup-x64.exe
 ```
 
-发行包写入 `dist/`，已存在的同名包会保留。打包从本 README 提取使用说明，校验软件内压缩保存的完整许可原文，并生成简短的 `LICENSES.md` 入口说明；在线许可证在“帮助 → 开源软件许可证”中查看。安装包使用官方 NSIS 3.11 便携编译器；上方路径替换为本机 `makensis.exe`，不需要把编译器分发给用户。先验证便携包，再生成 `dist/Compositor-Windows-Setup-x64.exe`。安装脚本固定当前用户目录，卸载按登记文件验证归属后逐个移除，保留修改后的文件和用户数据。
+发行包写入 `dist/`，已存在的同名包会保留。`VerifyPackage` 自动检查包内程序的 PDF 导入、编辑、工程保存、PDF 导出及重新导入；也可用 `VerifyPdf` 单独检查指定 EXE，结果保存在 `build/validation/`。打包从本 README 提取使用说明，校验软件内压缩保存的完整许可原文，并生成简短的 `LICENSES.md` 入口说明；在线许可证在“帮助 → 开源软件许可证”中查看。安装包使用官方 NSIS 3.11 便携编译器；上方路径替换为本机 `makensis.exe`，不需要把编译器分发给用户。先验证便携包，再生成 `dist/Compositor-Windows-Setup-x64.exe`。安装脚本固定当前用户目录，卸载按登记文件验证归属后逐个移除，保留修改后的文件和用户数据。
 
 Windows EXE 的图标和版本资源由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编译，无新增运行依赖。原版高清图标与多尺寸 ICO 在 `assets/`，需要重新生成时运行 `.\project.ps1 GenerateIcon`（仅此开发步骤需要 Pillow）。许可资源校验运行 `.\project.ps1 GenerateLicenses --check`。Python 工具已内嵌在统一脚本中，相关子命令仍需要 Python 3.11+；可用全局参数 `-PythonPath` 指定解释器。构建记录与临时文件统一写入 `build/`，发行包写入 `dist/`，均被 Git 忽略。现有发行程序与源码检查记录是不同交付身份，不将旧程序测试当作新构建验证。
 
