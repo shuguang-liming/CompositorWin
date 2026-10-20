@@ -136,18 +136,26 @@ pub fn import(path: &Path) -> Result<ImportResult> {
         let mut page = crate::pdf_io::render_pages(path, &[0], 300)?;
         let page = page.pop().context("PDF 没有可导入页面")?;
         let mut document = Document::new(page.raster.width, page.raster.height);
-        document.resolution = 300.;
+        document.resolution = page.effective_dpi;
         let layer = Layer::raster(
             path.file_stem().unwrap_or_default().to_string_lossy(),
             page.raster,
         );
         document.active_layer_id = Some(layer.id);
         document.layers = vec![layer];
+        let resolution = if (page.effective_dpi - 300.).abs() < 0.5 {
+            "300 DPI".to_string()
+        } else {
+            format!(
+                "{:.0} DPI（请求 300 DPI，页面过大受系统渲染上限限制）",
+                page.effective_dpi
+            )
+        };
         return Ok(ImportResult {
             document,
-            conversions: vec![
-                "PDF 已按 300 DPI 转为图片；文字、链接和表单不再保留为 PDF 对象".into(),
-            ],
+            conversions: vec![format!(
+                "PDF 已按 {resolution} 转为图片；文字、链接和表单不再保留为 PDF 对象"
+            )],
         });
     }
     if path.is_dir() || ext(path) == "comp" {

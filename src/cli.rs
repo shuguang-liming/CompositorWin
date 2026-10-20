@@ -297,7 +297,15 @@ fn import_for_session(
         .next()
         .context("PDF 页面未返回图像")?;
     let mut document = Document::new(rendered.raster.width, rendered.raster.height);
-    document.resolution = f64::from(dpi);
+    document.resolution = rendered.effective_dpi;
+    let resolved = if (rendered.effective_dpi - f64::from(dpi)).abs() < 0.5 {
+        format!("{dpi} DPI")
+    } else {
+        format!(
+            "{:.0} DPI（请求 {dpi} DPI，页面过大受系统渲染上限限制）",
+            rendered.effective_dpi
+        )
+    };
     let name = format!(
         "{} · 第 {page} 页",
         p.path.file_stem().unwrap_or_default().to_string_lossy()
@@ -309,7 +317,7 @@ fn import_for_session(
         image_io::ImportResult {
             document,
             conversions: vec![format!(
-                "PDF 共 {count} 页；仅将明确选择的第 {page} 页按 {dpi} DPI 转为图片。其余页面未导入；原文字、矢量、表单与签名结构不保留，请逐页处理并另存 .comp 工程。"
+                "PDF 共 {count} 页；仅将明确选择的第 {page} 页按 {resolved} 转为图片。其余页面未导入；原文字、矢量、表单与签名结构不保留，请逐页处理并另存 .comp 工程。"
             )],
         },
         Some(rendered.size),

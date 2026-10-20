@@ -265,8 +265,8 @@ pub struct PsdLimits {
 impl Default for PsdLimits {
     fn default() -> Self {
         Self {
-            max_side: 30_000,
-            max_surface_pixels: 200_000_000,
+            max_side: crate::model::MAX_SIDE,
+            max_surface_pixels: crate::model::MAX_PIXELS,
             document_pixels: 800_000_000,
         }
     }
@@ -737,13 +737,16 @@ pub fn decode(bytes: &[u8], limits: PsdLimits) -> Result<PsdFile> {
     let width = c.u32()?;
     let depth = c.u16()?;
     let mode = c.u16()?;
+    ensure!(width > 0 && height > 0, "Photoshop 画布尺寸无效");
     ensure!(
-        width > 0
-            && height > 0
-            && width <= limits.max_side
-            && height <= limits.max_side
-            && u64::from(width) * u64::from(height) <= limits.max_surface_pixels,
-        "Photoshop 画布超出内存限制"
+        width <= limits.max_side && height <= limits.max_side,
+        "Photoshop 画布 {width}×{height} 单边超过 {} 像素上限；请在 Photoshop 中缩小画布或分块导出后重试",
+        limits.max_side
+    );
+    ensure!(
+        u64::from(width) * u64::from(height) <= limits.max_surface_pixels,
+        "Photoshop 画布 {width}×{height} 像素总量超过 {} 像素上限；请在 Photoshop 中缩小画布或分块导出后重试",
+        limits.max_surface_pixels
     );
     ensure!(depth == 8, "仅支持 8-bit Photoshop 文件");
     ensure!(mode == 3 || mode == 4, "仅支持 RGB 或 CMYK Photoshop 文件");
@@ -1362,6 +1365,28 @@ mod tests {
             let p = decode(&b, PsdLimits::default()).unwrap();
             assert_eq!(p.merged.unwrap().data, [255, 20, 40, 255, 10, 30, 50, 255]);
         }
+    }
+    #[test]
+    fn canvas_limits_name_the_side_and_total_pixel_reasons() {
+        fn header(width: u32, height: u32) -> Vec<u8> {
+            let mut bytes = b"8BPS".to_vec();
+            bytes.extend(1_u16.to_be_bytes());
+            bytes.extend([0; 6]);
+            bytes.extend(3_u16.to_be_bytes());
+            bytes.extend(height.to_be_bytes());
+            bytes.extend(width.to_be_bytes());
+            bytes.extend(8_u16.to_be_bytes());
+            bytes.extend(3_u16.to_be_bytes());
+            bytes
+        }
+        let side = decode(&header(30_001, 100), PsdLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(side.contains("单边超过"), "{side}");
+        let total = decode(&header(20_000, 10_001), PsdLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(total.contains("像素总量超过"), "{total}");
     }
     #[test]
     fn truncated_header_is_error() {

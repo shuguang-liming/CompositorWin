@@ -1259,6 +1259,7 @@ fn queued_conversion_pixels_limit_plain_and_pdf_imports_without_partial_changes(
                             height_points: 32.,
                         },
                         index: 0,
+                        effective_dpi: 72.,
                     }],
                 );
             } else {
@@ -4489,6 +4490,7 @@ fn pdf_pages_open_as_separate_editable_tabs_with_names_sizes_and_resolution() {
             raster: Raster::solid(300, 150, [index as u8 * 80, 30, 200, 255]),
             size,
             index,
+            effective_dpi: 300.,
         })
         .collect();
     app.install_pdf_pages(PathBuf::from("样例.pdf"), None, 300, pages);
@@ -4609,6 +4611,7 @@ fn pdf_multiple_pages_are_rejected_atomically_for_import_as_layer() {
                 height_points: 20.,
             },
             index,
+            effective_dpi: 72.,
         })
         .collect();
     app.install_pdf_pages(PathBuf::from("two.pdf"), Some(target), 72, pages);
